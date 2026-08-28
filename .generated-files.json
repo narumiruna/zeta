@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "paths": [
+    "Tests/CompatibilityFixtures/v1/canonical-json/values.json",
+    "Tests/CompatibilityFixtures/v1/events/agent-events.jsonl",
+    "Tests/CompatibilityFixtures/v1/migrations/auth-settings.json",
+    "Tests/CompatibilityFixtures/v1/protocol/cbor-vectors.json",
+    "Tests/CompatibilityFixtures/v1/protocol/framed-hello.bin",
+    "Tests/CompatibilityFixtures/v1/providers/requests.json",
+    "Tests/CompatibilityFixtures/v1/providers/streams.jsonl",
+    "Tests/CompatibilityFixtures/v1/rpc/transcript.jsonl",
+    "Tests/CompatibilityFixtures/v1/sessions/agent-core-v4.jsonl",
+    "Tests/CompatibilityFixtures/v1/sessions/coding-agent-v3.jsonl",
+    "Tests/CompatibilityFixtures/v1/sqlite/current-schema.sqlite3",
+    "Tests/CompatibilityFixtures/v1/terminal/ansi-render.json",
+    "Tests/CompatibilityFixtures/v1/tools/results.json",
+    "Tests/CompatibilityFixtures/manifest.json",
+    "docs/compatibility/compatibility-inventory.json",
+    "Sources/ZetaAI/Resources/model-catalog.json",
+    "Sources/ZetaAI/Resources/model-catalog.manifest.json",
+    "docs/api/symbols.md"
+  ]
+}

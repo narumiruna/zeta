@@ -1,0 +1,17 @@
+{
+  "name": "all-capabilities-example",
+  "version": "1.0.0",
+  "protocolVersion": 1,
+  "executable": ".build/release/AllCapabilitiesPlugin",
+  "capabilities": [
+    "tools",
+    "commands",
+    "flags",
+    "events",
+    "providers",
+    "authentication",
+    "resources",
+    "sessions",
+    "ui"
+  ]
+}

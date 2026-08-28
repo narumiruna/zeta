@@ -1,0 +1,27 @@
+[
+  {
+    "name": "ordered-json",
+    "iterations": 1000,
+    "milliseconds": 1.521874999999966
+  },
+  {
+    "name": "cbor",
+    "iterations": 1000,
+    "milliseconds": 4.253792000000033
+  },
+  {
+    "name": "tui-render",
+    "iterations": 1000,
+    "milliseconds": 156.899333
+  },
+  {
+    "name": "model-catalog",
+    "iterations": 10,
+    "milliseconds": 15.138332999999989
+  },
+  {
+    "name": "plugin-envelope",
+    "iterations": 10000,
+    "milliseconds": 16.16270899999995
+  }
+]

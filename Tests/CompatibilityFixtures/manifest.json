@@ -1,0 +1,75 @@
+{
+  "schemaVersion": 1,
+  "fixtureSet": "compatibility-seed-v1",
+  "sourceCommit": "56700d42ed65a94a80af7376adb19a9298065164",
+  "sourceTree": "e6e63401081c8629aa9953c6c0d202a1ee5f8c02",
+  "generatorCommand": "uv run python Tests/CompatibilityFixtures/generate.py --source <pinned-clean-checkout>",
+  "oracleStatus": "Source-pinned golden vectors and durable artifacts are regenerated deterministically and exercised by Swift and TypeScript interoperability gates.",
+  "files": [
+    {
+      "path": "v1/canonical-json/values.json",
+      "bytes": 207,
+      "sha256": "b64d3f256d069c78df08337fe087f05fa2bcf20c556546aad2bdea436bbe78b7"
+    },
+    {
+      "path": "v1/events/agent-events.jsonl",
+      "bytes": 324,
+      "sha256": "0aae955e006fe8467a66695508bf9473bc89ebd9d058636afc5e524155a4f98d"
+    },
+    {
+      "path": "v1/migrations/auth-settings.json",
+      "bytes": 219,
+      "sha256": "f9ccf1e774da7db20f4debb9b9a3003655ecc2f850b2faf9458b22b6d84cf92d"
+    },
+    {
+      "path": "v1/protocol/cbor-vectors.json",
+      "bytes": 413,
+      "sha256": "d8418fbba9d1d12b87f51d774b3c945a33d24f0b84cc86a68143593376df0e59"
+    },
+    {
+      "path": "v1/protocol/framed-hello.bin",
+      "bytes": 25,
+      "sha256": "645eb27af58427c5e92d657609e81e6d2b0652c233b6b37d14403ac7c3f59d5f"
+    },
+    {
+      "path": "v1/providers/requests.json",
+      "bytes": 306,
+      "sha256": "9011a3b50299cfb4a5af221d2e79ad217f31ebcd72db6d92915e0b3fe6e89fe3"
+    },
+    {
+      "path": "v1/providers/streams.jsonl",
+      "bytes": 208,
+      "sha256": "83bc0bf8b9788de6f3bd3a988d93e67bf8cef1da3374430cfbfb4d879b732ae3"
+    },
+    {
+      "path": "v1/rpc/transcript.jsonl",
+      "bytes": 178,
+      "sha256": "eaf5fb1a3b91df52c5a2bf9b785082381366906fa3caf729e14b2766f6bd874e"
+    },
+    {
+      "path": "v1/sessions/agent-core-v4.jsonl",
+      "bytes": 317,
+      "sha256": "7eb24326349090f24b43c45f6c93cbbcef26bcf02a2d2050be386a373e1fabc6"
+    },
+    {
+      "path": "v1/sessions/coding-agent-v3.jsonl",
+      "bytes": 298,
+      "sha256": "323cbbcdc2b00707a7e08edd89b1d709636d7fda0b29fab47c6653929269c7bd"
+    },
+    {
+      "path": "v1/sqlite/current-schema.sqlite3",
+      "bytes": 143360,
+      "sha256": "f0213d121a15d48eafae9e83eb30344e45d8edf3bcf27475b6d5050d9b16ad78"
+    },
+    {
+      "path": "v1/terminal/ansi-render.json",
+      "bytes": 149,
+      "sha256": "4d7466eb489cb310f1a308a95e09f890d558ca25e2ce9c4578e1c182f19a8329"
+    },
+    {
+      "path": "v1/tools/results.json",
+      "bytes": 222,
+      "sha256": "9a505c7719eaf881bf7688de15bcaa352be1697d3368029f6681b9275fdc8ddb"
+    }
+  ]
+}

@@ -1,0 +1,176 @@
+import CryptoKit
+import Foundation
+
+public struct AWSCredential: Sendable, Equatable {
+    public var accessKeyID: String
+    public var secretAccessKey: String
+    public var sessionToken: String?
+
+    public init(
+        accessKeyID: String,
+        secretAccessKey: String,
+        sessionToken: String? = nil
+    ) {
+        self.accessKeyID = accessKeyID
+        self.secretAccessKey = secretAccessKey
+        self.sessionToken = sessionToken
+    }
+}
+
+public struct AWSSignedRequest: Sendable {
+    public var request: URLRequest
+    public var canonicalRequest: String
+    public var stringToSign: String
+    public var signature: String
+}
+
+public enum AWSSignatureError: Error, LocalizedError, Sendable {
+    case invalidURL
+    case missingHost
+
+    public var errorDescription: String? {
+        switch self {
+        case .invalidURL:
+            "AWS request URL is invalid"
+        case .missingHost:
+            "AWS request host is missing"
+        }
+    }
+}
+
+public enum AWSSignatureV4 {
+    public static func sign(
+        request: URLRequest,
+        body: Data,
+        service: String,
+        region: String,
+        credential: AWSCredential,
+        date: Date
+    ) throws -> AWSSignedRequest {
+        guard let url = request.url,
+            var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+        else {
+            throw AWSSignatureError.invalidURL
+        }
+        guard let host = components.host else {
+            throw AWSSignatureError.missingHost
+        }
+        let timestamp = awsTimestamp(date)
+        let day = String(timestamp.prefix(8))
+        var headers = request.allHTTPHeaderFields ?? [:]
+        headers["host"] = host
+        headers["x-amz-date"] = timestamp
+        if let token = credential.sessionToken {
+            headers["x-amz-security-token"] = token
+        }
+        let normalized = Dictionary(
+            headers.map { ($0.key.lowercased(), normalize($0.value)) },
+            uniquingKeysWith: { _, newest in newest }
+        )
+        let headerNames = normalized.keys.sorted()
+        let canonicalHeaders =
+            headerNames
+            .map { "\($0):\(normalized[$0]!)\n" }
+            .joined()
+        let signedHeaders = headerNames.joined(separator: ";")
+        components.percentEncodedQuery = canonicalQuery(components)
+        let canonicalURI = url.path.isEmpty ? "/" : awsEncodePath(url.path)
+        let payloadHash = sha256(body)
+        let canonicalRequest = [
+            request.httpMethod ?? "GET",
+            canonicalURI,
+            components.percentEncodedQuery ?? "",
+            canonicalHeaders,
+            signedHeaders,
+            payloadHash,
+        ].joined(separator: "\n")
+        let scope = "\(day)/\(region)/\(service)/aws4_request"
+        let stringToSign = [
+            "AWS4-HMAC-SHA256",
+            timestamp,
+            scope,
+            sha256(Data(canonicalRequest.utf8)),
+        ].joined(separator: "\n")
+        let dateKey = hmac(
+            key: Data(("AWS4" + credential.secretAccessKey).utf8),
+            data: Data(day.utf8)
+        )
+        let regionKey = hmac(key: dateKey, data: Data(region.utf8))
+        let serviceKey = hmac(key: regionKey, data: Data(service.utf8))
+        let signingKey = hmac(key: serviceKey, data: Data("aws4_request".utf8))
+        let signature = hmac(
+            key: signingKey,
+            data: Data(stringToSign.utf8)
+        ).hex
+        var signed = request
+        signed.setValue(timestamp, forHTTPHeaderField: "x-amz-date")
+        signed.setValue(host, forHTTPHeaderField: "host")
+        if let token = credential.sessionToken {
+            signed.setValue(token, forHTTPHeaderField: "x-amz-security-token")
+        }
+        signed.setValue(
+            "AWS4-HMAC-SHA256 Credential=\(credential.accessKeyID)/\(scope), "
+                + "SignedHeaders=\(signedHeaders), Signature=\(signature)",
+            forHTTPHeaderField: "Authorization"
+        )
+        signed.httpBody = body
+        return AWSSignedRequest(
+            request: signed,
+            canonicalRequest: canonicalRequest,
+            stringToSign: stringToSign,
+            signature: signature
+        )
+    }
+
+    private static func awsTimestamp(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        formatter.dateFormat = "yyyyMMdd'T'HHmmss'Z'"
+        return formatter.string(from: date)
+    }
+
+    private static func canonicalQuery(_ components: URLComponents) -> String {
+        let encoded: [(String, String)] = (components.queryItems ?? []).map { item in
+            (awsEncode(item.name), awsEncode(item.value ?? ""))
+        }
+        let sorted = encoded.sorted { lhs, rhs in
+            lhs.0 == rhs.0 ? lhs.1 < rhs.1 : lhs.0 < rhs.0
+        }
+        return sorted.map { pair in
+            pair.0 + "=" + pair.1
+        }.joined(separator: "&")
+    }
+
+    private static func normalize(_ value: String) -> String {
+        value.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+    }
+
+    private static func awsEncode(_ value: String) -> String {
+        value.addingPercentEncoding(
+            withAllowedCharacters: CharacterSet(
+                charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
+            )
+        ) ?? ""
+    }
+
+    private static func awsEncodePath(_ value: String) -> String {
+        value.split(separator: "/", omittingEmptySubsequences: false)
+            .map { awsEncode(String($0)) }
+            .joined(separator: "/")
+    }
+
+    private static func sha256(_ data: Data) -> String {
+        Data(SHA256.hash(data: data)).hex
+    }
+
+    private static func hmac(key: Data, data: Data) -> Data {
+        Data(HMAC<SHA256>.authenticationCode(for: data, using: SymmetricKey(data: key)))
+    }
+}
+
+private extension Data {
+    var hex: String {
+        map { String(format: "%02x", $0) }.joined()
+    }
+}

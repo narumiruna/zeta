@@ -1,0 +1,51 @@
+name: Release dry run
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Non-publishing release ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-15
+          - arch: x86_64
+            runner: macos-15-intel
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Run repository gates
+        run: scripts/check-repository.sh
+      - name: Build unsigned local artifacts
+        run: scripts/build-release.sh --arch "${{ matrix.arch }}" --out "$PWD/release-output"
+      - name: Verify artifact checksums and installation
+        run: |
+          cd release-output
+          shasum -a 256 -c SHA256SUMS
+          cd ..
+          prefix="$(mktemp -d)/install"
+          PREFIX="$prefix" scripts/install.sh "$PWD/release-output"
+          "$prefix/bin/zeta" --help
+          "$prefix/bin/pi" --version
+          "$prefix/bin/zeta" --list-models=openai | grep -q 'openai/'
+          PREFIX="$prefix" scripts/uninstall.sh
+          test ! -e "$prefix/bin/zeta"
+          test ! -e "$prefix/bin/pi"
+          scripts/check-release-smoke.sh "$PWD/release-output"
+      - name: Retain unsigned dry-run artifacts
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08
+        with:
+          name: zeta-unsigned-${{ matrix.arch }}
+          path: release-output/
+          if-no-files-found: error
+          retention-days: 7
+
+# This workflow intentionally has no tag, release, registry, signing, or notarization permissions or steps.

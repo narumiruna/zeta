@@ -1,0 +1,75 @@
+name: macOS CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  repository-gates:
+    name: Repository gates
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Record tool versions
+        run: |
+          sw_vers
+          uname -m
+          swift --version
+          uv --version
+      - name: Run repository checks
+        run: scripts/check-repository.sh
+
+  swift:
+    name: Swift ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-15
+          - arch: x86_64
+            runner: macos-15-intel
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Record environment
+        run: |
+          mkdir -p artifacts
+          sw_vers | tee artifacts/environment.txt
+          uname -m | tee -a artifacts/environment.txt
+          swift --version | tee -a artifacts/environment.txt
+          test "$(uname -m)" = "${{ matrix.arch }}"
+      - name: Build and test
+        run: |
+          if [[ ! -f Package.swift ]]; then
+            echo "SKIP: Package.swift is outside the baseline checkpoint." | tee artifacts/swift-skip.txt
+            exit 0
+          fi
+          swift package dump-package > artifacts/package.json
+          swift build -Xswiftc -strict-concurrency=complete -Xswiftc -warnings-as-errors
+          swift test -Xswiftc -strict-concurrency=complete -Xswiftc -warnings-as-errors | tee artifacts/tests.txt
+      - name: Sanitizers
+        run: |
+          swift test --sanitize=address | tee artifacts/address-sanitizer.txt
+          swift test --sanitize=thread | tee artifacts/thread-sanitizer.txt
+      - name: Retain reports
+        if: always()
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08
+        with:
+          name: macos-${{ matrix.arch }}-reports
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 14

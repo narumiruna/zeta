@@ -1,0 +1,7 @@
+{
+  "architecture": "arm64",
+  "iterations": 20,
+  "maximumMilliseconds": 418.55308320373297,
+  "medianMilliseconds": 4.717624979093671,
+  "minimumMilliseconds": 4.309084033593535
+}
