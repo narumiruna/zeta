@@ -42,10 +42,11 @@ public final class Editor: Focusable, @unchecked Sendable {
     }
 
     public func handleInput(_ data: String) {
-        if data.hasPrefix("\u{1B}[200~"), data.hasSuffix("\u{1B}[201~") {
-            let start = data.index(data.startIndex, offsetBy: 6)
-            let end = data.index(data.endIndex, offsetBy: -6)
-            insertPaste(String(data[start..<end]))
+        let pasteStart = "\u{1B}[200~".utf8
+        let pasteEnd = "\u{1B}[201~".utf8
+        if data.utf8.starts(with: pasteStart), data.utf8.suffix(pasteEnd.count).elementsEqual(pasteEnd) {
+            let pasted = data.utf8.dropFirst(pasteStart.count).dropLast(pasteEnd.count)
+            insertPaste(String(decoding: pasted, as: UTF8.self))
             return
         }
         switch data {
@@ -59,13 +60,12 @@ public final class Editor: Focusable, @unchecked Sendable {
         case "\u{7F}":
             guard cursor > 0 else { return }
             checkpoint()
-            cursor -= 1
-            characters.remove(at: cursor)
+            replaceCharacters(in: (cursor - 1)..<cursor, with: "")
             changed()
         case "\u{1B}[3~":
             guard cursor < characters.count else { return }
             checkpoint()
-            characters.remove(at: cursor)
+            replaceCharacters(in: cursor..<(cursor + 1), with: "")
             changed()
         case "\u{1B}[D":
             cursor = max(0, cursor - 1)
@@ -89,9 +89,7 @@ public final class Editor: Focusable, @unchecked Sendable {
 
     private func insert(_ value: String) {
         checkpoint()
-        let added = Array(value)
-        characters.insert(contentsOf: added, at: cursor)
-        cursor += added.count
+        replaceCharacters(in: cursor..<cursor, with: value)
         changed()
     }
 
@@ -132,8 +130,7 @@ public final class Editor: Focusable, @unchecked Sendable {
         let start = lineStart()
         guard start < cursor else { return }
         checkpoint()
-        characters.removeSubrange(start..<cursor)
-        cursor = start
+        replaceCharacters(in: start..<cursor, with: "")
         changed()
     }
 
@@ -141,7 +138,7 @@ public final class Editor: Focusable, @unchecked Sendable {
         let end = lineEnd()
         guard cursor < end else { return }
         checkpoint()
-        characters.removeSubrange(cursor..<end)
+        replaceCharacters(in: cursor..<end, with: "")
         changed()
     }
 
@@ -151,9 +148,14 @@ public final class Editor: Focusable, @unchecked Sendable {
         var start = cursor
         while start > 0, characters[start - 1].isWhitespace { start -= 1 }
         while start > 0, !characters[start - 1].isWhitespace { start -= 1 }
-        characters.removeSubrange(start..<cursor)
-        cursor = start
+        replaceCharacters(in: start..<cursor, with: "")
         changed()
+    }
+
+    private func replaceCharacters(in range: Range<Int>, with replacement: String) {
+        let result = replacingGraphemes(characters, in: range, with: replacement)
+        characters = result.characters
+        cursor = result.cursor
     }
 
     private func changed() {
@@ -173,8 +175,7 @@ public final class Editor: Focusable, @unchecked Sendable {
             text[..<text.index(text.startIndex, offsetBy: cursor)]
             .lastIndex(where: { $0.isWhitespace })
             .map { text.distance(from: text.startIndex, to: text.index(after: $0)) } ?? 0
-        characters.replaceSubrange(tokenStart..<cursor, with: Array(completion))
-        cursor = tokenStart + completion.count
+        replaceCharacters(in: tokenStart..<cursor, with: completion)
         changed()
     }
 }

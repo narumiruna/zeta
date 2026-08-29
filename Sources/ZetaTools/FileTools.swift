@@ -131,28 +131,41 @@ public struct FileTools: @unchecked Sendable {
                 throw FileToolError.unreadable(path)
             }
             let bom = hasBOM ? "\u{FEFF}" : ""
-            let newline = raw.contains("\r\n") ? "\r\n" : "\n"
-            let normalized = raw.replacingOccurrences(of: "\r\n", with: "\n")
-            var ranges: [(Range<String.Index>, String)] = []
+            let normalizedView = NormalizedText(raw)
+            let normalized = normalizedView.text
+            var ranges: [(range: Range<String.Index>, replacement: String)] = []
             for replacement in replacements {
                 guard !replacement.oldText.isEmpty else { throw FileToolError.invalidEdit("oldText must not be empty") }
                 let needle = replacement.oldText.replacingOccurrences(of: "\r\n", with: "\n")
                 let matches = normalized.ranges(of: needle)
                 guard !matches.isEmpty else { throw FileToolError.noMatch(path) }
                 guard matches.count == 1 else { throw FileToolError.multipleMatches(path) }
-                ranges.append((matches[0], replacement.newText.replacingOccurrences(of: "\r\n", with: "\n")))
+                ranges.append(
+                    (
+                        matches[0],
+                        replacement.newText.replacingOccurrences(of: "\r\n", with: "\n")
+                    )
+                )
             }
-            let sorted = ranges.sorted { $0.0.lowerBound < $1.0.lowerBound }
-            for pair in zip(sorted, sorted.dropFirst()) where pair.0.0.upperBound > pair.1.0.lowerBound {
+            let sorted = ranges.sorted { $0.range.lowerBound < $1.range.lowerBound }
+            for pair in zip(sorted, sorted.dropFirst()) where pair.0.range.upperBound > pair.1.range.lowerBound {
                 throw FileToolError.overlappingEdits
             }
-            var updated = normalized
-            for (range, replacement) in sorted.reversed() {
-                updated.replaceSubrange(range, with: replacement)
+            let rawBytes = Array(raw.utf8)
+            let fallbackLineEnding = firstLineEnding(in: rawBytes) ?? [0x0A]
+            var updatedBytes = rawBytes
+            for edit in sorted.reversed() {
+                let rawRange = normalizedView.rawUTF8Range(for: edit.range)
+                let replacementBytes = restoreLineEndings(
+                    in: edit.replacement,
+                    from: Array(rawBytes[rawRange]),
+                    fallback: fallbackLineEnding
+                )
+                updatedBytes.replaceSubrange(rawRange, with: replacementBytes)
             }
-            let firstIndex = sorted.first?.0.lowerBound
+            let firstIndex = sorted.first?.range.lowerBound
             let firstLine = firstIndex.map { normalized[..<$0].reduce(1) { $1 == "\n" ? $0 + 1 : $0 } }
-            let restored = bom + (newline == "\r\n" ? updated.replacingOccurrences(of: "\n", with: "\r\n") : updated)
+            let restored = bom + String(decoding: updatedBytes, as: UTF8.self)
             try Task.checkCancellation()
             try Data(restored.utf8).write(to: url, options: .atomic)
             return EditResult(
@@ -169,6 +182,79 @@ public struct FileTools: @unchecked Sendable {
             return value.lastPathComponent + (isDirectory ? "/" : "")
         }.sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }.prefix(limit).map { $0 }
     }
+}
+
+private struct NormalizedText {
+    let text: String
+    private let rawOffsets: [Int]
+
+    init(_ raw: String) {
+        let bytes = Array(raw.utf8)
+        var normalized: [UInt8] = []
+        var offsets = [0]
+        var index = 0
+        while index < bytes.count {
+            if bytes[index] == 0x0D, index + 1 < bytes.count, bytes[index + 1] == 0x0A {
+                normalized.append(0x0A)
+                index += 2
+            } else {
+                normalized.append(bytes[index])
+                index += 1
+            }
+            offsets.append(index)
+        }
+        self.text = String(decoding: normalized, as: UTF8.self)
+        self.rawOffsets = offsets
+    }
+
+    func rawUTF8Range(for range: Range<String.Index>) -> Range<Int> {
+        let utf8 = text.utf8
+        let lower = range.lowerBound.samePosition(in: utf8) ?? utf8.startIndex
+        let upper = range.upperBound.samePosition(in: utf8) ?? utf8.endIndex
+        let lowerOffset = utf8.distance(from: utf8.startIndex, to: lower)
+        let upperOffset = utf8.distance(from: utf8.startIndex, to: upper)
+        return rawOffsets[lowerOffset]..<rawOffsets[upperOffset]
+    }
+}
+
+private func firstLineEnding(in bytes: [UInt8]) -> [UInt8]? {
+    for index in bytes.indices where bytes[index] == 0x0A {
+        return index > bytes.startIndex && bytes[index - 1] == 0x0D ? [0x0D, 0x0A] : [0x0A]
+    }
+    return nil
+}
+
+private func restoreLineEndings(
+    in replacement: String,
+    from originalBytes: [UInt8],
+    fallback: [UInt8]
+) -> [UInt8] {
+    var originalEndings: [[UInt8]] = []
+    var index = 0
+    while index < originalBytes.count {
+        if originalBytes[index] == 0x0D,
+            index + 1 < originalBytes.count,
+            originalBytes[index + 1] == 0x0A
+        {
+            originalEndings.append([0x0D, 0x0A])
+            index += 2
+        } else {
+            if originalBytes[index] == 0x0A { originalEndings.append([0x0A]) }
+            index += 1
+        }
+    }
+
+    var restored: [UInt8] = []
+    var endingIndex = 0
+    for byte in replacement.utf8 {
+        if byte == 0x0A {
+            restored.append(contentsOf: endingIndex < originalEndings.count ? originalEndings[endingIndex] : fallback)
+            endingIndex += 1
+        } else {
+            restored.append(byte)
+        }
+    }
+    return restored
 }
 
 private extension String {

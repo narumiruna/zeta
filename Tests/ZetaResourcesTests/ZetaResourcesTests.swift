@@ -85,6 +85,50 @@ final class ZetaResourcesTests: XCTestCase {
         XCTAssertEqual(allowed.skills.map(\.name), ["packaged"])
     }
 
+    func testCRLFAndLFFrontmatterPreserveResourceBodies() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let home = root.appendingPathComponent("home")
+        let agent = home.appendingPathComponent(".pi/agent")
+        let prompts = agent.appendingPathComponent("prompts")
+        let skills = agent.appendingPathComponent("skills")
+        let workingDirectory = root.appendingPathComponent("project")
+        try FileManager.default.createDirectory(at: prompts, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(
+            at: skills.appendingPathComponent("crlf"), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(
+            at: skills.appendingPathComponent("lf"), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: workingDirectory, withIntermediateDirectories: true)
+
+        let crlfPrompt = "---\r\ndescription: CRLF prompt\r\n---\r\nfirst\r\nsecond\r\n"
+        let lfPrompt = "---\ndescription: LF prompt\n---\nfirst\nsecond\n"
+        let crlfSkill = "---\r\nname: crlf-skill\r\ndescription: CRLF skill\r\n---\r\nalpha\r\nbeta\r\n"
+        let lfSkill = "---\nname: lf-skill\ndescription: LF skill\n---\nalpha\nbeta\n"
+        try Data(crlfPrompt.utf8).write(to: prompts.appendingPathComponent("crlf.md"))
+        try Data(lfPrompt.utf8).write(to: prompts.appendingPathComponent("lf.md"))
+        try Data(crlfSkill.utf8).write(to: skills.appendingPathComponent("crlf/SKILL.md"))
+        try Data(lfSkill.utf8).write(to: skills.appendingPathComponent("lf/SKILL.md"))
+
+        let snapshot = ResourceLoader(
+            home: home,
+            workingDirectory: workingDirectory,
+            agentDirectory: agent,
+            trusted: false
+        ).load()
+        let loadedPrompts = Dictionary(uniqueKeysWithValues: snapshot.prompts.map { ($0.name, $0) })
+        let loadedSkills = Dictionary(uniqueKeysWithValues: snapshot.skills.map { ($0.name, $0) })
+
+        XCTAssertEqual(loadedPrompts["crlf"]?.description, "CRLF prompt")
+        XCTAssertEqual(loadedPrompts["crlf"]?.body, "first\r\nsecond\r\n")
+        XCTAssertEqual(loadedPrompts["lf"]?.description, "LF prompt")
+        XCTAssertEqual(loadedPrompts["lf"]?.body, "first\nsecond\n")
+        XCTAssertEqual(loadedSkills["crlf-skill"]?.description, "CRLF skill")
+        XCTAssertEqual(loadedSkills["crlf-skill"]?.body, "alpha\r\nbeta\r\n")
+        XCTAssertEqual(loadedSkills["lf-skill"]?.description, "LF skill")
+        XCTAssertEqual(loadedSkills["lf-skill"]?.body, "alpha\nbeta\n")
+        XCTAssertTrue(snapshot.diagnostics.isEmpty)
+    }
+
     func testContextOverrideWinsWithinDirectory() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)

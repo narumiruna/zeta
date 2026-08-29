@@ -577,6 +577,79 @@ final class ProviderRegressionTests: XCTestCase {
         XCTAssertEqual(events.filter { if case .error = $0 { true } else { false } }.count, 1)
     }
 
+    func testCodexIncompleteTerminatesAtLengthWithoutAnotherReceive() async throws {
+        let connection = FailingCodexConnection(frames: [
+            Data(
+                #"{"type":"response.output_text.delta","output_index":0,"delta":"truncated"}"#
+                    .utf8
+            ),
+            Data(
+                #"{"type":"response.incomplete","response":{"id":"response-1","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}}}"#
+                    .utf8
+            ),
+        ])
+        let pool = CodexWebSocketPool { _, _ in connection }
+        let model = pricedModel(api: "openai-codex-responses")
+        let provider = CodexWebSocketProvider(
+            id: model.provider,
+            models: [model],
+            pool: pool
+        )
+
+        let stream = await provider.stream(
+            model: model,
+            context: Context(messages: [.user(UserMessage("hello"))]),
+            options: StreamOptions(apiKey: "synthetic-key", sessionID: "session")
+        )
+        var events: [AssistantEvent] = []
+        for try await event in stream { events.append(event) }
+
+        guard case .done(.length, let message) = events.last else {
+            return XCTFail("Expected terminal Codex length result")
+        }
+        XCTAssertEqual(message.content, [.text(text: "truncated")])
+        XCTAssertEqual(message.responseId, "response-1")
+        XCTAssertEqual(message.rawStopReason, "incomplete.max_output_tokens")
+        let receiveCount = await connection.receiveCount()
+        XCTAssertEqual(receiveCount, 2)
+    }
+
+    func testCodexFailedTerminatesWithPartialWithoutAnotherReceive() async throws {
+        let connection = FailingCodexConnection(frames: [
+            Data(
+                #"{"type":"response.output_text.delta","output_index":0,"delta":"kept"}"#
+                    .utf8
+            ),
+            Data(
+                #"{"type":"response.failed","response":{"status":"failed","error":{"code":"synthetic_failure","message":"failed after partial"}}}"#
+                    .utf8
+            ),
+        ])
+        let pool = CodexWebSocketPool { _, _ in connection }
+        let model = pricedModel(api: "openai-codex-responses")
+        let provider = CodexWebSocketProvider(
+            id: model.provider,
+            models: [model],
+            pool: pool
+        )
+
+        let stream = await provider.stream(
+            model: model,
+            context: Context(messages: [.user(UserMessage("hello"))]),
+            options: StreamOptions(apiKey: "synthetic-key", sessionID: "session")
+        )
+        var events: [AssistantEvent] = []
+        for try await event in stream { events.append(event) }
+
+        guard case .error(.error, let message) = events.last else {
+            return XCTFail("Expected terminal Codex failed error")
+        }
+        XCTAssertEqual(message.content, [.text(text: "kept")])
+        XCTAssertTrue(message.errorMessage?.contains("failed after partial") == true)
+        let receiveCount = await connection.receiveCount()
+        XCTAssertEqual(receiveCount, 2)
+    }
+
     func testSSEDecoderRejectsOversizedPendingRecord() throws {
         var decoder = SSEDecoder(maximumRecordBytes: 8)
         for byte in "data: 12".utf8 {
@@ -732,12 +805,14 @@ private actor CompletingCodexConnection: WebSocketConnection {
 private actor FailingCodexConnection: WebSocketConnection {
     nonisolated let identifier = UUID()
     private var frames: [Data]
+    private var received = 0
 
     init(frames: [Data]) { self.frames = frames }
 
     func send(_ data: Data) {}
 
     func receive() throws -> Data {
+        received += 1
         guard !frames.isEmpty else {
             throw ProviderError.invalidResponse("No scripted WebSocket frame")
         }
@@ -745,6 +820,7 @@ private actor FailingCodexConnection: WebSocketConnection {
     }
 
     func close() {}
+    func receiveCount() -> Int { received }
 }
 
 private final class TimeoutCapturingImageURLProtocol: URLProtocol, @unchecked Sendable {

@@ -369,15 +369,24 @@ public struct ResourceLoader: Sendable {
     }
 
     private func frontmatter(_ value: String) -> (metadata: [String: String], body: String) {
-        guard value.hasPrefix("---\n"),
-            let end = value.range(of: "\n---\n", range: value.index(value.startIndex, offsetBy: 4)..<value.endIndex)
-        else { return ([:], value) }
-        let header = value[value.index(value.startIndex, offsetBy: 4)..<end.lowerBound]
-        let metadata = header.split(separator: "\n").reduce(into: [String: String]()) { result, line in
-            let text = String(line)
-            guard let colon = text.firstIndex(of: ":") else { return }
-            result[String(text[..<colon]).trimmingCharacters(in: .whitespaces)] = String(
-                text[text.index(after: colon)...]
+        let lineEnding: String
+        if value.hasPrefix("---\r\n") {
+            lineEnding = "\r\n"
+        } else if value.hasPrefix("---\n") {
+            lineEnding = "\n"
+        } else {
+            return ([:], value)
+        }
+        let headerStart = value.index(value.startIndex, offsetBy: 3 + lineEnding.count)
+        let closingDelimiter = lineEnding + "---" + lineEnding
+        guard let end = value.range(of: closingDelimiter, range: headerStart..<value.endIndex) else {
+            return ([:], value)
+        }
+        let header = value[headerStart..<end.lowerBound]
+        let metadata = header.components(separatedBy: lineEnding).reduce(into: [String: String]()) { result, line in
+            guard let colon = line.firstIndex(of: ":") else { return }
+            result[String(line[..<colon]).trimmingCharacters(in: .whitespaces)] = String(
+                line[line.index(after: colon)...]
             ).trimmingCharacters(in: .whitespacesAndNewlines.union(CharacterSet(charactersIn: "\"'")))
         }
         return (metadata, String(value[end.upperBound...]))

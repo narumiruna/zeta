@@ -13,6 +13,28 @@ final class ZetaPackagesTests: XCTestCase {
         XCTAssertFalse(try PackageSource("github.com/user/repo").pinned)
     }
 
+    func testSSHSourceParsingKeepsUserInfoAndSplitsPathReferences() throws {
+        XCTAssertEqual(
+            try PackageSource("ssh://git@example.com/owner/repository"),
+            .git(url: "ssh://git@example.com/owner/repository", reference: nil)
+        )
+        XCTAssertEqual(
+            try PackageSource("ssh://git@example.com/owner/repository@release/v1"),
+            .git(
+                url: "ssh://git@example.com/owner/repository",
+                reference: "release/v1"
+            )
+        )
+        XCTAssertEqual(
+            try PackageSource("git@example.com:owner/repository"),
+            .git(url: "git@example.com:owner/repository", reference: nil)
+        )
+        XCTAssertEqual(
+            try PackageSource("git@example.com:owner/repository@v1.2.3"),
+            .git(url: "git@example.com:owner/repository", reference: "v1.2.3")
+        )
+    }
+
     func testLocalGitInstallAndAtomicReplacement() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString)

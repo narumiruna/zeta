@@ -69,6 +69,42 @@ final class ZetaConfigTests: XCTestCase {
         XCTAssertEqual(try String(contentsOf: blockedAgentDirectory, encoding: .utf8), "blocker")
     }
 
+    func testAuthPersistenceFailureDoesNotPublishSetOrDelete() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("auth.json")
+        let originalCredential = StoredCredential.apiKey(key: "original", environment: nil)
+        let seedingStore = try AuthStore(url: url)
+        try await seedingStore.set(provider: "provider", credential: originalCredential)
+        let originalData = try Data(contentsOf: url)
+        let failingStore = try AuthStore(url: url) { _, _ in
+            throw ConfigTestError.persistenceFailed
+        }
+
+        do {
+            try await failingStore.set(
+                provider: "provider",
+                credential: .apiKey(key: "rejected", environment: nil)
+            )
+            XCTFail("Expected persistence failure")
+        } catch ConfigTestError.persistenceFailed {} catch {
+            XCTFail("Expected injected persistence failure, got \(error)")
+        }
+        let credentialAfterSet = await failingStore.read(provider: "provider")
+        XCTAssertEqual(credentialAfterSet, originalCredential)
+        XCTAssertEqual(try Data(contentsOf: url), originalData)
+
+        do {
+            try await failingStore.delete(provider: "provider")
+            XCTFail("Expected persistence failure")
+        } catch ConfigTestError.persistenceFailed {} catch {
+            XCTFail("Expected injected persistence failure, got \(error)")
+        }
+        let credentialAfterDelete = await failingStore.read(provider: "provider")
+        XCTAssertEqual(credentialAfterDelete, originalCredential)
+        XCTAssertEqual(try Data(contentsOf: url), originalData)
+    }
+
     func testOAuthExtrasRoundTripThroughDisk() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -265,5 +301,6 @@ private func waitForCondition(
 }
 
 private enum ConfigTestError: Error {
+    case persistenceFailed
     case timedOut
 }

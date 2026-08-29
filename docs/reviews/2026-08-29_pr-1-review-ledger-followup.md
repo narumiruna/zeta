@@ -181,3 +181,77 @@ Concern: Session lookup searches filenames instead of header IDs.
 Outcome: Addressed by inspecting candidate session headers when filename matching does not resolve the request.
 
 Evidence: Session argument regression resolves an explicit header ID whose filename is unrelated.
+
+## Eighth-round inline feedback
+
+### `3885789699`
+
+Concern: CBOR map duplicate checks are quadratic.
+
+Outcome: Addressed by tracking decoded map keys in a `Set` while preserving ordered values.
+
+Evidence: CBOR stress coverage decodes a 50,000-entry map and retains duplicate rejection.
+
+### `3885789703`
+
+Concern: Grep output is bounded only after full process capture.
+
+Outcome: Addressed by terminating capture at match and byte limits during asynchronous draining.
+
+Evidence: Search regressions verify bounded output and child-process cleanup.
+
+### `3885789705`
+
+Concern: Dash-prefixed find patterns are parsed as options.
+
+Outcome: Addressed by placing the pattern and path after fd's `--` delimiter.
+
+Evidence: Search regressions verify literal dash-prefixed patterns.
+
+### `3885789707`
+
+Concern: Failed auth persistence publishes rejected in-memory credentials.
+
+Outcome: Addressed by persisting a candidate credential dictionary before assigning actor state.
+
+Evidence: AuthStore failure injection verifies set and delete leave memory and disk bytes unchanged.
+
+### `3885789709`
+
+Concern: File edits normalize unaffected mixed line endings.
+
+Outcome: Addressed by matching normalized text while applying replacements against original byte ranges and separators.
+
+Evidence: Byte-exact mixed CRLF and LF regressions preserve BOM and untouched separators.
+
+### `3885789712`
+
+Concern: Codex waits forever on incomplete and failed terminal responses.
+
+Outcome: Addressed by mapping incomplete output limits to `length`, failed responses to errors, and ending receive immediately.
+
+Evidence: Codex regressions verify partial output, stop reasons, and receive counts.
+
+### `3885789714`
+
+Concern: SSH URL userinfo is mistaken for a Git reference suffix.
+
+Outcome: Addressed by parsing references only after the repository path and preserving SSH and SCP userinfo.
+
+Evidence: Package-source regressions cover SSH URLs, SCP forms, and explicit references.
+
+### `3885789715`
+
+Concern: Combining-scalar insertion leaves the editor cursor outside valid grapheme boundaries.
+
+Outcome: Addressed by recomputing cursor position from the post-edit grapheme sequence for insertion, paste, completion, delete, and backspace.
+
+Evidence: TUI regressions cover combining marks and ZWJ emoji edits without traps.
+
+### `3885789716`
+
+Concern: CRLF resource frontmatter is not parsed.
+
+Outcome: Addressed by line-ending-aware delimiter parsing that preserves body line endings.
+
+Evidence: Resource regressions load CRLF prompts and skills while retaining LF behavior.

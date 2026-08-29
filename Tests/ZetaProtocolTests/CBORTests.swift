@@ -50,6 +50,32 @@ import ZetaCore
         #expect(try decodeCBOR(Data(hex: "1a00000018")) == .integer(24))
     }
 
+    @Test func decodesLargeMapInSourceOrderAndRejectsDuplicate() throws {
+        let entries = (0..<50_000).map {
+            OrderedCBORMap.Entry(key: "key-\($0)", value: .integer(Int64($0)))
+        }
+        let encoded = try encodeCBOR(.map(OrderedCBORMap(entries)))
+
+        guard case let .map(decoded) = try decodeCBOR(encoded) else {
+            Issue.record("Expected decoded map")
+            return
+        }
+        #expect(decoded.count == entries.count)
+        #expect(decoded.map(\.key) == entries.map(\.key))
+        #expect(decoded.first?.value == .integer(0))
+        #expect(decoded.last?.value == .integer(49_999))
+
+        var duplicate = encoded
+        let finalKey = Data("key-49999".utf8)
+        let previousKey = Data("key-49998".utf8)
+        guard let range = duplicate.range(of: finalKey, options: .backwards) else {
+            Issue.record("Expected final encoded map key")
+            return
+        }
+        duplicate.replaceSubrange(range, with: previousKey)
+        expectCBORThrow { try decodeCBOR(duplicate) }
+    }
+
     @Test func rejectsInvalidDecoderInputs() {
         let invalid = [
             "", "18", "1c", "5f", "7f", "9f", "bf", "c000", "f7", "e0", "ff",

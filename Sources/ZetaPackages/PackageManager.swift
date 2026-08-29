@@ -23,13 +23,7 @@ public enum PackageSource: Sendable, Equatable {
         }
         var value = raw
         if value.hasPrefix("git:") { value = String(value.dropFirst(4)) }
-        let referenceSeparator = value.lastIndex(of: "@").flatMap { index in
-            value[value.startIndex..<index].contains("/") ? index : nil
-        }
-        let reference = referenceSeparator.map {
-            String(value[value.index(after: $0)...])
-        }
-        let urlPart = referenceSeparator.map { String(value[..<$0]) } ?? value
+        let (urlPart, reference) = Self.splitGitReference(value)
         let normalized: String
         if urlPart.hasPrefix("http://") || urlPart.hasPrefix("https://")
             || urlPart.hasPrefix("ssh://") || urlPart.hasPrefix("git@")
@@ -42,6 +36,32 @@ public enum PackageSource: Sendable, Equatable {
         }
         guard !normalized.isEmpty else { throw PackageManagerError.invalidSource(raw) }
         self = .git(url: normalized, reference: reference)
+    }
+
+    private static func splitGitReference(_ value: String) -> (String, String?) {
+        let repositoryPathStart: String.Index?
+        if let scheme = value.range(of: "://") {
+            repositoryPathStart = value[scheme.upperBound...].firstIndex(of: "/").map {
+                value.index(after: $0)
+            }
+        } else if value.hasPrefix("git@"), let colon = value.firstIndex(of: ":") {
+            repositoryPathStart = value.index(after: colon)
+        } else if let slash = value.firstIndex(of: "/") {
+            repositoryPathStart = value.index(after: slash)
+        } else {
+            repositoryPathStart = nil
+        }
+        guard let repositoryPathStart,
+            let separator = value[repositoryPathStart...].lastIndex(of: "@"),
+            separator > repositoryPathStart,
+            value.index(after: separator) < value.endIndex
+        else {
+            return (value, nil)
+        }
+        return (
+            String(value[..<separator]),
+            String(value[value.index(after: separator)...])
+        )
     }
 
     public var identifier: String {

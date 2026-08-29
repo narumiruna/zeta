@@ -42,6 +42,60 @@ final class ZetaTUITests: XCTestCase {
         XCTAssertEqual(editor.value(), "/help")
     }
 
+    func testEditorKeepsCursorOnGraphemeBoundariesAfterUnicodeInsertion() {
+        let editor = Editor()
+        editor.focused = true
+
+        editor.handleInput("a")
+        editor.handleInput("\u{301}")
+        XCTAssertEqual(editor.value(), "a\u{301}")
+        XCTAssertEqual(editor.value().count, 1)
+        XCTAssertFalse(editor.render(width: 10).isEmpty)
+        editor.handleInput("\u{7F}")
+        XCTAssertEqual(editor.value(), "")
+
+        editor.handleInput("👩")
+        editor.handleInput("\u{200D}")
+        editor.handleInput("💻")
+        XCTAssertEqual(editor.value(), "👩‍💻")
+        XCTAssertEqual(editor.value().count, 1)
+        editor.handleInput("\u{7F}")
+        XCTAssertEqual(editor.value(), "")
+
+        editor.setValue("aX")
+        editor.handleInput("\u{1B}[D")
+        editor.handleInput("\u{1B}[200~\u{301}\u{1B}[201~")
+        XCTAssertEqual(editor.value(), "a\u{301}X")
+        editor.handleInput("\u{1B}[3~")
+        editor.handleInput("\u{7F}")
+        XCTAssertEqual(editor.value(), "")
+
+        editor.autocompleteProvider = FixedAutocompleteProvider(completion: "a\u{301}")
+        editor.setValue("/a")
+        editor.handleInput("\t")
+        XCTAssertEqual(editor.value(), "a\u{301}")
+        editor.handleInput("\u{7F}")
+        XCTAssertEqual(editor.value(), "")
+    }
+
+    func testInputKeepsCursorOnGraphemeBoundariesAfterUnicodeInsertion() {
+        let input = Input()
+
+        input.handleInput("a")
+        input.handleInput("\u{301}")
+        XCTAssertEqual(input.value, "a\u{301}")
+        XCTAssertEqual(input.value.count, 1)
+        input.handleInput("\u{7F}")
+        XCTAssertEqual(input.value, "")
+
+        input.handleInput("👩")
+        input.handleInput("\u{200D}")
+        input.handleInput("💻")
+        XCTAssertEqual(input.value, "👩‍💻")
+        input.handleInput("\u{7F}")
+        XCTAssertEqual(input.value, "")
+    }
+
     func testEditorClearsFullValueAfterSubmit() {
         let recorder = SubmissionRecorder()
         let editor = Editor()
@@ -222,6 +276,12 @@ final class ZetaTUITests: XCTestCase {
         XCTAssertFalse(snapshot.overlapped)
         tui.stop()
     }
+}
+
+private struct FixedAutocompleteProvider: AutocompleteProvider {
+    var completion: String
+
+    func completions(for text: String) -> [String] { [completion] }
 }
 
 private final class SerializationCheckingInput: Focusable, @unchecked Sendable {

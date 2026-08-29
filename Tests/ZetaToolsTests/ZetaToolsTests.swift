@@ -81,6 +81,108 @@ final class ZetaToolsTests: XCTestCase {
         }
     }
 
+    func testFindPlacesDashPrefixedPatternAfterOptionDelimiter() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let script = directory.appendingPathComponent("fd")
+        let argumentsFile = directory.appendingPathComponent("arguments")
+        let source = """
+            #!/bin/sh
+            printf '%s\\n' "$@" > '\(argumentsFile.path)'
+            printf '%s\\n' 'sub/-result.txt'
+            """
+        try Data(source.utf8).write(to: script)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: script.path)
+        let search = SearchTools(
+            workingDirectory: directory,
+            useExternalCommands: true,
+            executableDirectory: directory
+        )
+
+        let result = try await search.find(pattern: "--dash-*.txt", path: "sub")
+
+        XCTAssertEqual(result, ["sub/-result.txt"])
+        let arguments = try String(contentsOf: argumentsFile, encoding: .utf8)
+            .split(separator: "\n")
+            .map(String.init)
+        XCTAssertEqual(
+            arguments,
+            [
+                "--glob", "--hidden", "--exclude", ".git", "--color", "never",
+                "--", "--dash-*.txt", "sub",
+            ]
+        )
+    }
+
+    func testGrepTerminatesProducerAtMaximumMatches() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let script = directory.appendingPathComponent("rg")
+        let source = """
+            #!/bin/sh
+            sleep 30 &
+            child=$!
+            echo $$ > rg-parent.pid
+            echo $child > rg-child.pid
+            line=1
+            while :; do
+                printf 'file.txt:%s:needle-%s\\n' "$line" "$line"
+                line=$((line + 1))
+            done
+            """
+        try Data(source.utf8).write(to: script)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: script.path)
+        let search = SearchTools(
+            workingDirectory: directory,
+            useExternalCommands: true,
+            executableDirectory: directory
+        )
+        let parentFile = directory.appendingPathComponent("rg-parent.pid")
+        let childFile = directory.appendingPathComponent("rg-child.pid")
+
+        let matches = try await search.grep(pattern: "needle", maximumMatches: 3)
+
+        XCTAssertEqual(matches.map(\.text), ["needle-1", "needle-2", "needle-3"])
+        let parent = try readProcessID(parentFile)
+        let child = try readProcessID(childFile)
+        try await waitForCondition {
+            !processIsRunning(parent) && !processIsRunning(child)
+        }
+    }
+
+    func testGrepTerminatesProducerAtByteLimitWithoutReturningPartialLine() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let script = directory.appendingPathComponent("rg")
+        let source = """
+            #!/bin/sh
+            echo $$ > rg-parent.pid
+            printf 'file.txt:1:'
+            while :; do
+                printf '0123456789abcdef0123456789abcdef'
+            done
+            """
+        try Data(source.utf8).write(to: script)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: script.path)
+        let search = SearchTools(
+            workingDirectory: directory,
+            useExternalCommands: true,
+            executableDirectory: directory
+        )
+        let parentFile = directory.appendingPathComponent("rg-parent.pid")
+
+        let matches = try await search.grep(pattern: "needle")
+
+        XCTAssertTrue(matches.isEmpty)
+        let parent = try readProcessID(parentFile)
+        try await waitForCondition {
+            !processIsRunning(parent)
+        }
+    }
+
     func testSearchCancellationTerminatesExternalProcessTrees() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -94,7 +196,11 @@ final class ZetaToolsTests: XCTestCase {
                 child=$!
                 echo $$ > \(executable)-parent.pid
                 echo $child > \(executable)-child.pid
-                /usr/bin/awk 'BEGIN { for (i=0; i<100000; i++) print "file:1:needle" }'
+                if [ '\(executable)' = rg ]; then
+                    printf '%s\\n' 'file:1:needle'
+                else
+                    printf '%s\\n' 'file'
+                fi
                 touch \(executable)-output-ready
                 wait
                 """
@@ -191,6 +297,51 @@ final class ZetaToolsTests: XCTestCase {
         try tools.write(path: "file.txt", content: "\u{FEFF}a\r\nb\r\n")
         _ = try await tools.edit(path: "file.txt", replacements: [TextReplacement(oldText: "a\nb", newText: "x\ny")])
         XCTAssertEqual(try tools.read(path: "file.txt"), "\u{FEFF}x\r\ny\r\n")
+    }
+
+    func testEditPreservesMixedLineEndingsAndBOMByteExactly() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let file = directory.appendingPathComponent("mixed.txt")
+        let original = Data([0xEF, 0xBB, 0xBF]) + Data("keep-lf\nold-one\r\nold-two\nkeep-crlf\r\ntail\n".utf8)
+        try original.write(to: file)
+        let tools = FileTools(workingDirectory: directory)
+
+        _ = try await tools.edit(
+            path: "mixed.txt",
+            replacements: [
+                TextReplacement(
+                    oldText: "old-one\nold-two\n",
+                    newText: "new-one\nnew-two\n"
+                )
+            ]
+        )
+
+        let expected = Data([0xEF, 0xBB, 0xBF]) + Data("keep-lf\nnew-one\r\nnew-two\nkeep-crlf\r\ntail\n".utf8)
+        XCTAssertEqual(try Data(contentsOf: file), expected)
+    }
+
+    func testMultipleEditsLeaveEveryMixedLineSeparatorByteExact() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let file = directory.appendingPathComponent("mixed.txt")
+        try Data("first\r\nsecond\nthird\r\nfourth\n".utf8).write(to: file)
+        let tools = FileTools(workingDirectory: directory)
+
+        _ = try await tools.edit(
+            path: "mixed.txt",
+            replacements: [
+                TextReplacement(oldText: "first", newText: "FIRST"),
+                TextReplacement(oldText: "fourth", newText: "FOURTH"),
+            ]
+        )
+
+        XCTAssertEqual(
+            try Data(contentsOf: file),
+            Data("FIRST\r\nsecond\nthird\r\nFOURTH\n".utf8)
+        )
     }
 
     func testEditRejectsInvalidUTF8WithoutChangingBytes() async throws {

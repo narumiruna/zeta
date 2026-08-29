@@ -83,19 +83,22 @@ public struct CodexWebSocketProvider: AIProvider {
                                     await output.emit(event)
                                 }
                                 if case .object(let object) = value,
-                                    case .string(let type)? = object["type"],
-                                    type == "response.completed"
+                                    case .string(let type)? = object["type"]
                                 {
-                                    var message = reducer.partial
-                                    if message.stopReason == .pending { message.stopReason = .stop }
-                                    await output.emit(.done(reason: message.stopReason, message: message))
-                                    terminal = true
-                                }
-                                if case .object(let object) = value,
-                                    case .string(let type)? = object["type"],
-                                    type.contains("error")
-                                {
-                                    throw ProviderError.invalidResponse(OrderedJSON.string(value))
+                                    if let message = try terminalMessage(
+                                        type: type,
+                                        object: object,
+                                        partial: reducer.partial
+                                    ) {
+                                        await output.emit(
+                                            .done(reason: message.stopReason, message: message)
+                                        )
+                                        terminal = true
+                                    } else if type.contains("error") {
+                                        throw ProviderError.invalidResponse(
+                                            OrderedJSON.string(value)
+                                        )
+                                    }
                                 }
                             }
                         } onCancel: {
@@ -129,6 +132,48 @@ public struct CodexWebSocketProvider: AIProvider {
         }
         output.attachProducer(producer)
         return output
+    }
+
+    private func terminalMessage(
+        type: String,
+        object: OrderedJSONObject,
+        partial: AssistantMessage
+    ) throws -> AssistantMessage? {
+        let status = object.codexString(at: ["response", "status"])
+        if type == "response.failed" || status == "failed" || status == "cancelled" {
+            let message =
+                object.codexString(at: ["response", "error", "message"])
+                ?? object.codexString(at: ["response", "incomplete_details", "reason"])
+                ?? "Codex response failed"
+            throw ProviderError.invalidResponse(message)
+        }
+        guard
+            type == "response.completed"
+                || type == "response.done"
+                || type == "response.incomplete"
+        else {
+            return nil
+        }
+
+        var message = partial
+        if type == "response.incomplete" || status == "incomplete" {
+            let reason = object.codexString(at: [
+                "response", "incomplete_details", "reason",
+            ])
+            message.rawStopReason =
+                reason.map { "incomplete.\($0)" }
+                ?? "incomplete"
+            guard reason == "max_output_tokens" else {
+                throw ProviderError.invalidResponse(
+                    reason.map { "Codex response incomplete: \($0)" }
+                        ?? "Codex response incomplete without a provider reason"
+                )
+            }
+            message.stopReason = .length
+        } else if message.stopReason == .pending {
+            message.stopReason = .stop
+        }
+        return message
     }
 
     private func connectionFingerprint(
@@ -166,5 +211,19 @@ public struct CodexWebSocketProvider: AIProvider {
             throw ProviderError.invalidResponse("Invalid Codex WebSocket URL")
         }
         return url
+    }
+}
+
+private extension OrderedJSONObject {
+    func codexString(at path: [String]) -> String? {
+        var current: JSONValue = .object(self)
+        for key in path {
+            guard case .object(let object) = current, let next = object[key] else {
+                return nil
+            }
+            current = next
+        }
+        if case .string(let string) = current { return string }
+        return nil
     }
 }

@@ -73,6 +73,10 @@ public struct OrderedCBORMap: Sendable, Equatable, ExpressibleByDictionaryLitera
         storage = entries
     }
 
+    fileprivate init(validatedEntries: [Entry]) {
+        storage = validatedEntries
+    }
+
     public init(dictionaryLiteral elements: (String, CBORValue)...) {
         storage = []
         for (key, value) in elements { self[key] = value }
@@ -360,14 +364,22 @@ private struct CBORReader {
             return .array(values)
         case 5:
             let count = try length(info, kind: "map", limit: options.maximumContainerLength)
-            var map = OrderedCBORMap()
+            var entries: [OrderedCBORMap.Entry] = []
+            entries.reserveCapacity(min(count, 4_096))
+            var keys = Set<String>()
+            keys.reserveCapacity(min(count, 4_096))
             for _ in 0..<count {
                 guard case let .textString(key) = try item(depth: depth + 1) else {
                     throw CBORError("CBOR map keys must be strings")
                 }
-                try map.append(key: key, value: item(depth: depth + 1))
+                guard keys.insert(key).inserted else {
+                    throw CBORError("CBOR map contains a duplicate key")
+                }
+                entries.append(
+                    .init(key: key, value: try item(depth: depth + 1))
+                )
             }
-            return .map(map)
+            return .map(OrderedCBORMap(validatedEntries: entries))
         case 6:
             throw CBORError("CBOR tags are not supported")
         case 7:

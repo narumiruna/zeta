@@ -61,6 +61,23 @@ public class Container: Component, @unchecked Sendable {
     public func invalidate() { children.forEach { $0.invalidate() } }
 }
 
+func replacingGraphemes(
+    _ source: [Character], in range: Range<Int>, with replacement: String
+) -> (characters: [Character], cursor: Int) {
+    let prefix = String(source[..<range.lowerBound])
+    let suffix = String(source[range.upperBound...])
+    let cursorUTF8Offset = prefix.utf8.count + replacement.utf8.count
+    let characters = Array(prefix + replacement + suffix)
+    // An edit endpoint can become the interior of a merged grapheme, so round it to the following boundary.
+    var byteOffset = 0
+    var cursor = 0
+    while cursor < characters.count, byteOffset < cursorUTF8Offset {
+        byteOffset += String(characters[cursor]).utf8.count
+        cursor += 1
+    }
+    return (characters, cursor)
+}
+
 public final class Input: Focusable, @unchecked Sendable {
     public var focused = false
     public var onSubmit: (@Sendable (String) -> Void)?
@@ -89,19 +106,20 @@ public final class Input: Focusable, @unchecked Sendable {
             onSubmit?(submitted)
         case "\u{7F}":
             if cursor > 0 {
-                let start = value.index(value.startIndex, offsetBy: cursor - 1)
-                let end = value.index(after: start)
-                value.removeSubrange(start..<end)
-                cursor -= 1
+                replaceCharacters(in: (cursor - 1)..<cursor, with: "")
             }
         case "\u{1B}[D": cursor = max(0, cursor - 1)
         case "\u{1B}[C": cursor = min(value.count, cursor + 1)
         default:
             guard !data.hasPrefix("\u{1B}") else { return }
-            let index = value.index(value.startIndex, offsetBy: cursor)
-            value.insert(contentsOf: data, at: index)
-            cursor += data.count
+            replaceCharacters(in: cursor..<cursor, with: data)
         }
+    }
+
+    private func replaceCharacters(in range: Range<Int>, with replacement: String) {
+        let result = replacingGraphemes(Array(value), in: range, with: replacement)
+        value = String(result.characters)
+        cursor = result.cursor
     }
 }
 

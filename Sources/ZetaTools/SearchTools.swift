@@ -40,7 +40,12 @@ public struct SearchTools: Sendable {
         ]
         if let filePattern { arguments += ["--glob", filePattern] }
         arguments += ["--regexp", pattern, path]
-        let result = try await command("rg", arguments: arguments)
+        let result = try await command(
+            "rg",
+            arguments: arguments,
+            maximumLines: maximumMatches,
+            maximumBytes: defaultMaximumBytes
+        )
         if result.status == 127 {
             return try fallbackGrep(
                 pattern: pattern,
@@ -73,8 +78,10 @@ public struct SearchTools: Sendable {
             "fd",
             arguments: [
                 "--glob", "--hidden", "--exclude", ".git", "--color", "never",
-                pattern, path,
-            ]
+                "--", pattern, path,
+            ],
+            maximumLines: maximumResults,
+            maximumBytes: defaultMaximumBytes
         )
         guard result.status == 0 else {
             if result.status == 127 {
@@ -179,7 +186,9 @@ public struct SearchTools: Sendable {
 
     private func command(
         _ executable: String,
-        arguments: [String]
+        arguments: [String],
+        maximumLines: Int,
+        maximumBytes: Int
     ) async throws -> (status: Int32, output: String) {
         guard useExternalCommands else { return (127, "External search command disabled") }
         let process = Process()
@@ -204,15 +213,35 @@ public struct SearchTools: Sendable {
             do {
                 try Task.checkCancellation()
                 var data = Data()
+                data.reserveCapacity(min(maximumBytes, 8 * 1_024))
+                var lineCount = 0
+                var reachedLimit = false
                 for try await byte in pipe.fileHandleForReading.bytes {
                     data.append(byte)
+                    if byte == 0x0A { lineCount += 1 }
+                    if lineCount >= maximumLines || data.count >= maximumBytes {
+                        reachedLimit = true
+                        ToolProcessLifecycle.terminate(
+                            process,
+                            closing: [pipe.fileHandleForReading]
+                        )
+                        break
+                    }
+                }
+                if data.count >= maximumBytes, data.last != 0x0A {
+                    if let newline = data.lastIndex(of: 0x0A) {
+                        data.removeSubrange(data.index(after: newline)..<data.endIndex)
+                    } else {
+                        data.removeAll(keepingCapacity: true)
+                    }
                 }
                 while process.isRunning {
                     try Task.checkCancellation()
                     try await Task.sleep(for: .milliseconds(10))
                 }
                 try Task.checkCancellation()
-                return (process.terminationStatus, String(decoding: data, as: UTF8.self))
+                let status = reachedLimit ? 0 : process.terminationStatus
+                return (status, String(decoding: data, as: UTF8.self))
             } catch {
                 ToolProcessLifecycle.terminate(process, closing: [pipe.fileHandleForReading])
                 if Task.isCancelled { throw CancellationError() }

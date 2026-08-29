@@ -70,15 +70,24 @@ public struct ResolvedStoredCredential: Sendable, Equatable {
 
 public actor AuthStore {
     private let url: URL
+    private let persistence: @Sendable ([String: StoredCredential], URL) throws -> Void
     private var credentials: [String: StoredCredential]
 
     public init(url: URL) throws {
         self.url = url
-        if FileManager.default.fileExists(atPath: url.path) {
-            self.credentials = try JSONDecoder().decode([String: StoredCredential].self, from: Data(contentsOf: url))
-        } else {
-            self.credentials = [:]
+        self.persistence = { credentials, url in
+            try Self.persist(credentials, to: url)
         }
+        self.credentials = try Self.load(from: url)
+    }
+
+    init(
+        url: URL,
+        persistence: @escaping @Sendable ([String: StoredCredential], URL) throws -> Void
+    ) throws {
+        self.url = url
+        self.persistence = persistence
+        self.credentials = try Self.load(from: url)
     }
 
     public func read(provider: String) -> StoredCredential? { credentials[provider] }
@@ -88,13 +97,17 @@ public actor AuthStore {
     }
 
     public func set(provider: String, credential: StoredCredential) throws {
-        credentials[provider] = credential
-        try persist()
+        var candidate = credentials
+        candidate[provider] = credential
+        try persistence(candidate, url)
+        credentials = candidate
     }
 
     public func delete(provider: String) throws {
-        credentials[provider] = nil
-        try persist()
+        var candidate = credentials
+        candidate[provider] = nil
+        try persistence(candidate, url)
+        credentials = candidate
     }
 
     public func resolveCredential(
@@ -155,19 +168,29 @@ public actor AuthStore {
         !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
-    private func persist() throws {
-        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try FileManager.default.setAttributes(
-            [.posixPermissions: 0o700], ofItemAtPath: url.deletingLastPathComponent().path)
+    private static func load(from url: URL) throws -> [String: StoredCredential] {
+        guard FileManager.default.fileExists(atPath: url.path) else { return [:] }
+        return try JSONDecoder().decode([String: StoredCredential].self, from: Data(contentsOf: url))
+    }
+
+    private static func persist(_ credentials: [String: StoredCredential], to url: URL) throws {
+        let directory = url.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
         let data = try encoder.encode(credentials)
         try withAdvisoryFileLock(url: url) {
-            try data.write(to: url, options: .atomic)
+            let temporaryURL = directory.appendingPathComponent(".\(url.lastPathComponent).\(UUID().uuidString).tmp")
+            defer { try? FileManager.default.removeItem(at: temporaryURL) }
+            try data.write(to: temporaryURL)
             try FileManager.default.setAttributes(
                 [.posixPermissions: 0o600],
-                ofItemAtPath: url.path
+                ofItemAtPath: temporaryURL.path
             )
+            guard rename(temporaryURL.path, url.path) == 0 else {
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            }
         }
     }
 
