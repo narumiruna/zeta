@@ -2,6 +2,7 @@
 
 Zeta is a native macOS coding-agent executable with Pi-compatible behavior at the pinned source baseline.
 Use `zeta` as the primary command or `pi` as a compatibility entry point.
+A separate iOS 17 library surface provides the supported AI and agent modules without the executable runtime.
 
 ## Start
 
@@ -20,6 +21,7 @@ RPC mode accepts concurrent strict JSONL commands on standard input.
 ## Topics
 
 - [Providers and authentication](providers.md)
+- [iOS libraries](ios-libraries.md)
 - [Configuration and tools](configuration.md)
 - [Sessions and migration](sessions.md)
 - [Integration protocols](integration.md)

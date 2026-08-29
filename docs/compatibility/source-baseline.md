@@ -43,7 +43,8 @@ The other versioned extension examples report version `0.84.3`.
 
 ## Included surfaces
 
-The required platform is macOS on arm64 and x86_64.
+The Pi-compatible executable contract requires macOS on arm64 and x86_64.
+The additional iOS 17 support contract covers only the `ZetaCore`, `ZetaTelemetry`, `ZetaAI`, and `ZetaAgent` library closure and does not extend Pi binary compatibility.
 The primary executable is `zeta`.
 The `pi` compatibility entry point must invoke the same product behavior.
 Included semantic surfaces are telemetry, AI and providers, current agent behavior, current session systems, protocol, client, server, Unix transport, SQLite, TUI, coding-agent CLI and modes, deterministic evaluations, scripts, durable files, settings, authentication metadata, tools, resources, packages, exports, and extension capabilities.
@@ -59,6 +60,7 @@ The inventory gate rejects `planned` rows; every required row records a verified
 
 Browser and Cloudflare Worker library distribution are not target products, although the source browser smoke check remains baseline evidence.
 Windows, Linux, PowerShell product behavior, and non-macOS binaries are not required.
+The supported iOS libraries are an additional Zeta platform surface rather than a non-macOS Pi executable.
 Historical databases created by an older mutable `001_initial.sql` are not migrated in place.
 The future design in `packages/agent/docs/harness.md` is excluded where it differs from executable behavior at the pin.
 TypeScript package import compatibility is excluded.

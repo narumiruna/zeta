@@ -11,6 +11,8 @@ Every public symbol is listed in the generated [symbol reference](symbols.md).
 `ZetaAuth` owns API-key resolution, OAuth, PKCE, callback handling, refresh serialization, Vertex credential discovery, and AWS SigV4.
 `ZetaBedrock` isolates AWS event-stream and Bedrock request behavior.
 `ZetaAgent` owns agent state, event ordering, tools, queues, hooks, cancellation, and settlement.
+On iOS 17 or newer, the supported closure is `ZetaCore`, `ZetaTelemetry`, `ZetaAI`, and `ZetaAgent`, with `ZetaAI` and `ZetaAgent` as the consumer products.
+See the [iOS library guide](../user/ios-libraries.md) for the narrower platform boundary and compiling consumer example.
 `ZetaCompaction` owns token estimation, cut points, summary prompts, and branch summaries.
 
 ## Durable data

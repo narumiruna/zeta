@@ -70,6 +70,7 @@ Any future external dependency requires its exact license and transitive license
 
 Zeta has a small audited supply chain and a larger responsibility for focused compatibility code.
 Non-macOS portability is not a design requirement for this release.
+[ADR 0002](0002-ios-library-platform.md) later extends support to the portable AI and agent library closure on iOS without changing the macOS executable contract.
 Apple framework behavior is wrapped behind Zeta modules where deterministic substitution is useful.
 arm64 CI is required, while x86_64 validation is an explicit local release check.
 A universal binary is an optional packaging result and never substitutes for architecture-specific validation.

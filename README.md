@@ -3,12 +3,14 @@
 Zeta is a Swift-native macOS implementation of the Pi coding-agent harness.
 Compatibility is pinned to Pi commit `56700d42ed65a94a80af7376adb19a9298065164`.
 The package builds both `zeta` and the `pi` compatibility executable.
+Applications on iOS 17 or newer can separately consume the supported AI and agent libraries.
 
 ## Requirements
 
-- macOS 14 or newer.
+- macOS 14 or newer for the command-line products.
+- iOS 17 or newer for the supported library products.
 - Swift 6.2 or newer.
-- Apple Silicon or Intel Mac.
+- Apple Silicon or Intel Mac for command-line development.
 - Provider credentials for live model requests.
 
 ## Build
@@ -49,6 +51,12 @@ zeta --mode rpc
 The built-in tools are `read`, `write`, `edit`, and `bash`.
 The optional `grep`, `find`, and `ls` tools can be selected with `--tools`.
 
+## iOS libraries
+
+Select only the `ZetaAI` and `ZetaAgent` SwiftPM products for an iOS application.
+The supported iOS closure is `ZetaCore`, `ZetaTelemetry`, `ZetaAI`, and `ZetaAgent`; the CLI and other macOS products remain unsupported on iOS.
+See [iOS libraries](docs/user/ios-libraries.md) for installation, app-owned tools, cancellation, lifecycle, and credential guidance.
+
 ## Compatibility
 
 Zeta includes the generated catalog for 1,276 tool-capable models across 39 providers.
@@ -63,6 +71,7 @@ Resource-only Pi packages can provide skills, prompts, and themes.
 
 - [User guide](docs/user/README.md)
 - [Providers and authentication](docs/user/providers.md)
+- [iOS libraries](docs/user/ios-libraries.md)
 - [Sessions and migration](docs/user/sessions.md)
 - [JSON, RPC, client, and server APIs](docs/user/integration.md)
 - [Swift plugins and packages](docs/user/plugins.md)
