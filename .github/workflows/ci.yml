@@ -46,18 +46,8 @@ jobs:
         run: scripts/check-repository.sh
 
   swift:
-    name: Swift ${{ matrix.arch }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: arm64
-            runner: macos-15
-            uv-checksum: fcf0a9ea6599c6ae28a4c854ac6da76f2c889354d7c36ce136ef071f7ab9721f
-          - arch: x86_64
-            runner: macos-15-intel
-            uv-checksum: 171eb8c518313e157c5b4cec7b4f743bc6bab1bd23e09b646679a02d096a047f
-    runs-on: ${{ matrix.runner }}
+    name: Swift arm64
+    runs-on: macos-15
     timeout-minutes: 60
     steps:
       - name: Check out source
@@ -70,7 +60,7 @@ jobs:
         uses: astral-sh/setup-uv@5a095e7a2014a4212f075830d4f7277575a9d098 # v7.3.1
         with:
           version: "0.9.26"
-          checksum: ${{ matrix.uv-checksum }}
+          checksum: fcf0a9ea6599c6ae28a4c854ac6da76f2c889354d7c36ce136ef071f7ab9721f
       - name: Record environment
         run: |
           mkdir -p artifacts
@@ -78,7 +68,7 @@ jobs:
           uname -m | tee -a artifacts/environment.txt
           swift --version | tee -a artifacts/environment.txt
           uv --version | tee -a artifacts/environment.txt
-          test "$(uname -m)" = "${{ matrix.arch }}"
+          test "$(uname -m)" = "arm64"
           grep -Eq 'Swift version 6\.2(\.0)?([[:space:]]|$)' artifacts/environment.txt
           test "$(uv --version | awk '{print $2}')" = "0.9.26"
       - name: Build and test
@@ -98,7 +88,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08
         with:
-          name: macos-${{ matrix.arch }}-reports
+          name: macos-arm64-reports
           path: artifacts/
           if-no-files-found: error
           retention-days: 14

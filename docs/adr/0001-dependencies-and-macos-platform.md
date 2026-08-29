@@ -36,7 +36,8 @@ The model catalog generator records its Pi source commit and SHA-256 checksum.
 Protocol and terminal tests cover fragmentation, Unicode, malformed inputs, and restoration sequences.
 SQLite tests cover required capabilities, writer fencing, branch caches, FTS, historical-schema rejection, and integrity.
 macOS arm64 measurements are recorded under `docs/performance`.
-CI defines independent arm64 and x86_64 build, test, sanitizer, and release dry-run jobs.
+CI runs arm64 build, test, sanitizer, and release dry-run jobs.
+The x86_64 build remains available as a local release-engineering path.
 
 ## Selection matrix
 
@@ -70,5 +71,5 @@ Any future external dependency requires its exact license and transitive license
 Zeta has a small audited supply chain and a larger responsibility for focused compatibility code.
 Non-macOS portability is not a design requirement for this release.
 Apple framework behavior is wrapped behind Zeta modules where deterministic substitution is useful.
-Architecture-specific CI remains required even though both builds use the same source.
-A universal binary is an optional packaging result and never substitutes for separate architecture tests.
+arm64 CI is required, while x86_64 validation is an explicit local release check.
+A universal binary is an optional packaging result and never substitutes for architecture-specific validation.

@@ -40,8 +40,9 @@ Unsigned local and CI dry runs are expected.
 
 ## CI
 
-`.github/workflows/ci.yml` runs repository gates and independent arm64 and x86_64 strict builds, tests, sanitizers, and retained reports.
-`.github/workflows/release-dry-run.yml` creates and installs unsigned per-architecture artifacts without publishing them.
+`.github/workflows/ci.yml` runs repository gates and an arm64 strict build, tests, sanitizers, and retained reports.
+`.github/workflows/release-dry-run.yml` creates and installs an unsigned arm64 artifact without publishing it.
+The x86_64 path remains available for explicit local release validation.
 
 ## Publishing activation
 
