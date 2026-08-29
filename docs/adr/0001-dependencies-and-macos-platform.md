@@ -1,6 +1,6 @@
 # ADR 0001: Dependency policy and macOS platform
 
-- Status: Accepted and implemented
+- Status: Accepted; zero-external-dependency decision superseded by [ADR 0003](0003-command-line-and-logging-dependencies.md)
 - Date: 2026-08-28
 - Decision owners: Zeta maintainers
 
@@ -29,8 +29,8 @@ Binary targets require checksums, provenance, both architectures, and explicit a
 
 ## Evidence
 
-`Package.swift` resolves zero external dependencies.
-`scripts/check-licenses.py` verifies the project license and resolved dependency count.
+At adoption, `Package.swift` resolved zero external dependencies.
+At adoption, `scripts/check-licenses.py` verified the project license and resolved dependency count.
 `scripts/check-repository.sh` verifies strict concurrency, warnings as errors, formatting, tests, generated files, fixtures, secrets, and API symbols.
 The model catalog generator records its Pi source commit and SHA-256 checksum.
 Protocol and terminal tests cover fragmentation, Unicode, malformed inputs, and restoration sequences.
@@ -61,10 +61,10 @@ The x86_64 build remains available as a local release-engineering path.
 ## License review
 
 The repository is MIT licensed.
-The Swift package resolves no external packages.
+At adoption, the Swift package resolved no external packages.
 Apple SDK frameworks are platform components and are not vendored.
 SQLite is public domain and is loaded from the macOS SDK.
-Any future external dependency requires its exact license and transitive licenses in a superseding ADR.
+External dependency review now follows [ADR 0003](0003-command-line-and-logging-dependencies.md).
 
 ## Consequences
 

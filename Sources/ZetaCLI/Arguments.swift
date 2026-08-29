@@ -1,3 +1,4 @@
+import ArgumentParser
 import Foundation
 import ZetaAI
 
@@ -33,100 +34,62 @@ public struct CLIArguments: Sendable {
     public var extensionFlags: [String: String?] = [:]
 
     public static func parse(_ values: [String]) throws -> CLIArguments {
+        let preprocessed = CLIArgumentPreprocessor.process(values)
+        let parsed: ParsedCLIArguments
+        do {
+            parsed = try SwiftArgumentParserAdapter().parse(preprocessed.values)
+        } catch {
+            throw normalizeParserError(error)
+        }
+
         var result = CLIArguments()
-        var index = 0
-        var options = true
-        func requireValue(_ flag: String) throws -> String {
-            index += 1
-            guard index < values.count else { throw CLIArgumentError.missingValue(flag) }
-            return values[index]
-        }
-        while index < values.count {
-            let value = values[index]
-            if options && value == "--" {
-                options = false
-                index += 1
-                continue
+        result.mode = try parsed.mode.map { value in
+            guard let mode = CLIMode(rawValue: value) else {
+                throw CLIArgumentError.invalidValue("--mode")
             }
-            if options && value.hasPrefix("--") {
-                let parts = value.dropFirst(2).split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
-                let flag = String(parts[0])
-                let attached = parts.count > 1 ? String(parts[1]) : nil
-                func argument() throws -> String {
-                    if let attached { return attached }
-                    return try requireValue("--\(flag)")
-                }
-                switch flag {
-                case "help": result.help = true
-                case "version": result.version = true
-                case "print": result.print = true
-                case "mode":
-                    guard let mode = CLIMode(rawValue: try argument()) else {
-                        throw CLIArgumentError.invalidValue("--mode")
-                    }
-                    result.mode = mode
-                case "list-models": result.listModels = attached ?? ""
-                case "provider": result.provider = try argument()
-                case "model":
-                    let value = try argument()
-                    if let separator = value.lastIndex(of: ":"),
-                        let level = ThinkingLevel(rawValue: String(value[value.index(after: separator)...]))
-                    {
-                        result.model = String(value[..<separator])
-                        result.thinking = level
-                        result.thinkingSpecified = true
-                    } else {
-                        result.model = value
-                    }
-                case "api-key": result.apiKey = try argument()
-                case "thinking":
-                    guard let level = ThinkingLevel(rawValue: try argument()) else {
-                        throw CLIArgumentError.invalidValue("--thinking")
-                    }
-                    result.thinking = level
-                    result.thinkingSpecified = true
-                case "no-session": result.noSession = true
-                case "continue": result.continueSession = true
-                case "resume": result.resume = true
-                case "session": result.session = try argument()
-                case "session-id": result.sessionID = try argument()
-                case "fork": result.fork = try argument()
-                case "session-dir": result.sessionDirectory = try argument()
-                case "name": result.name = try argument()
-                case "tools": result.tools = Set(try argument().split(separator: ",").map(String.init))
-                case "exclude-tools":
-                    result.excludedTools.formUnion(try argument().split(separator: ",").map(String.init))
-                case "no-builtin-tools": result.noBuiltinTools = true
-                case "no-tools": result.noTools = true
-                case "approve": result.approve = true
-                case "no-approve": result.approve = false
-                case "offline": result.offline = true
-                default: throw CLIArgumentError.invalidValue("--\(flag)")
-                }
-            } else if options && value.hasPrefix("-") {
-                switch value {
-                case "-h": result.help = true
-                case "-v": result.version = true
-                case "-p": result.print = true
-                case "-c": result.continueSession = true
-                case "-r": result.resume = true
-                case "-a": result.approve = true
-                case "-na": result.approve = false
-                case "-n": result.name = try requireValue("-n")
-                case "-t": result.tools = Set(try requireValue("-t").split(separator: ",").map(String.init))
-                case "-xt":
-                    result.excludedTools.formUnion(try requireValue("-xt").split(separator: ",").map(String.init))
-                case "-nt": result.noTools = true
-                case "-nbt": result.noBuiltinTools = true
-                default: throw CLIArgumentError.unknownShortFlag(value)
-                }
-            } else if options && value.hasPrefix("@") {
-                result.files.append(String(value.dropFirst()))
-            } else {
-                result.messages.append(value)
-            }
-            index += 1
+            return mode
         }
+        result.print = parsed.print
+        result.help = preprocessed.help
+        result.version = preprocessed.version
+        result.listModels = preprocessed.listModels
+        result.provider = parsed.provider
+        result.apiKey = parsed.apiKey
+        result.noSession = parsed.noSession
+        result.continueSession = parsed.continueSession
+        result.resume = parsed.resume
+        result.session = parsed.session
+        result.sessionID = parsed.sessionID
+        result.fork = parsed.fork
+        result.sessionDirectory = parsed.sessionDirectory
+        result.name = parsed.name
+        result.tools = parsed.tools.map(commaSeparatedSet)
+        result.excludedTools = Set(parsed.excludedTools.flatMap(commaSeparatedValues))
+        result.noBuiltinTools = parsed.noBuiltinTools
+        result.noTools = parsed.noTools
+        result.approve = parsed.approve
+        result.offline = parsed.offline
+        result.files = preprocessed.files
+        result.messages = parsed.inputs
+
+        if let model = parsed.model,
+            let separator = model.lastIndex(of: ":"),
+            let level = ThinkingLevel(rawValue: String(model[model.index(after: separator)...]))
+        {
+            result.model = String(model[..<separator])
+            result.thinking = level
+            result.thinkingSpecified = true
+        } else {
+            result.model = parsed.model
+        }
+        if let thinking = parsed.thinking {
+            guard let level = ThinkingLevel(rawValue: thinking) else {
+                throw CLIArgumentError.invalidValue("--thinking")
+            }
+            result.thinking = level
+            result.thinkingSpecified = true
+        }
+
         try result.validate()
         return result
     }
@@ -135,6 +98,26 @@ public struct CLIArguments: Sendable {
         if let mode { return mode }
         if print || !stdinIsTTY || !stdoutIsTTY { return .print }
         return .interactive
+    }
+
+    private static func commaSeparatedSet(_ value: String) -> Set<String> {
+        Set(commaSeparatedValues(value))
+    }
+
+    private static func commaSeparatedValues(_ value: String) -> [String] {
+        value.split(separator: ",").map(String.init)
+    }
+
+    private static func normalizeParserError(_ error: any Error) -> any Error {
+        let message = ParsedCLIArguments.message(for: error)
+        let marker = "Unknown option '"
+        if message.hasPrefix(marker), let end = message.dropFirst(marker.count).firstIndex(of: "'") {
+            let option = String(message.dropFirst(marker.count)[..<end])
+            let name = option.split(separator: "=", maxSplits: 1).first.map(String.init) ?? option
+            if name.hasPrefix("--") { return CLIArgumentError.invalidValue(name) }
+            return CLIArgumentError.unknownShortFlag(name)
+        }
+        return CLIParserMessageError(message: message)
     }
 
     private func validate() throws {
@@ -156,11 +139,120 @@ public struct CLIArguments: Sendable {
     }
 }
 
+private protocol CLIOptionParser {
+    func parse(_ values: [String]) throws -> ParsedCLIArguments
+}
+
+private struct SwiftArgumentParserAdapter: CLIOptionParser {
+    func parse(_ values: [String]) throws -> ParsedCLIArguments {
+        try ParsedCLIArguments.parse(values)
+    }
+}
+
+private struct ParsedCLIArguments: ParsableArguments {
+    @Flag(name: .shortAndLong) var print = false
+    @Option(name: .long) var mode: String?
+    @Option(name: .long) var provider: String?
+    @Option(name: .long) var model: String?
+    @Option(name: .customLong("api-key")) var apiKey: String?
+    @Option(name: .long) var thinking: String?
+    @Flag(name: .customLong("no-session")) var noSession = false
+    @Flag(name: [.customShort("c"), .customLong("continue")]) var continueSession = false
+    @Flag(name: .shortAndLong) var resume = false
+    @Option(name: .long) var session: String?
+    @Option(name: .customLong("session-id")) var sessionID: String?
+    @Option(name: .long) var fork: String?
+    @Option(name: .customLong("session-dir")) var sessionDirectory: String?
+    @Option(name: [.customLong("n", withSingleDash: true), .long]) var name: String?
+    @Option(name: [.customLong("t", withSingleDash: true), .long]) var tools: String?
+    @Option(name: [
+        .customLong("xt", withSingleDash: true),
+        .customLong("exclude-tools"),
+    ]) var excludedTools: [String] = []
+    @Flag(name: [
+        .customLong("nbt", withSingleDash: true),
+        .customLong("no-builtin-tools"),
+    ]) var noBuiltinTools = false
+    @Flag(name: [
+        .customLong("nt", withSingleDash: true),
+        .customLong("no-tools"),
+    ]) var noTools = false
+    @Flag(
+        name: .customLong("approve"),
+        inversion: .prefixedNo,
+        exclusivity: .chooseLast
+    ) var approve: Bool?
+    @Flag(name: .long) var offline = false
+    @Argument(parsing: .remaining) var inputs: [String] = []
+}
+
+private struct PreprocessedCLIArguments {
+    var values: [String]
+    var help = false
+    var version = false
+    var listModels: String?
+    var files: [String] = []
+}
+
+private enum CLIArgumentPreprocessor {
+    private static let valueOptions: Set<String> = [
+        "--mode", "--provider", "--model", "--api-key", "--thinking", "--session",
+        "--session-id", "--fork", "--session-dir", "--name", "--tools", "--exclude-tools",
+        "-n", "-t", "-xt",
+    ]
+
+    static func process(_ values: [String]) -> PreprocessedCLIArguments {
+        var result = PreprocessedCLIArguments(values: [])
+        var index = 0
+        while index < values.count {
+            let value = values[index]
+            if value == "--" {
+                result.values.append(contentsOf: values[index...])
+                break
+            }
+            if valueOptions.contains(value), values.indices.contains(index + 1) {
+                result.values.append(value)
+                result.values.append(values[index + 1])
+                index += 2
+                continue
+            }
+            let longParts = value.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
+            let name = longParts.first.map(String.init) ?? value
+            switch name {
+            case "-h", "--help":
+                result.help = true
+            case "-v", "--version":
+                result.version = true
+            case "--list-models":
+                result.listModels = longParts.count == 2 ? String(longParts[1]) : ""
+            case "-a":
+                result.values.append("--approve")
+            case "-na":
+                result.values.append("--no-approve")
+            default:
+                if value.hasPrefix("@") {
+                    result.files.append(String(value.dropFirst()))
+                } else {
+                    result.values.append(value)
+                }
+            }
+            index += 1
+        }
+        return result
+    }
+}
+
+private struct CLIParserMessageError: Error, LocalizedError, Sendable {
+    let message: String
+    var errorDescription: String? { message }
+}
+
 public enum CLIArgumentError: Error, LocalizedError, Sendable {
     case missingValue(String)
     case invalidValue(String)
     case unknownShortFlag(String)
     case conflict(String)
+
     public var errorDescription: String? {
         switch self {
         case .missingValue(let flag): "Missing value for \(flag)"

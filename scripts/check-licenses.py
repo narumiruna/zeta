@@ -9,7 +9,7 @@ from pathlib import Path
 
 def main() -> None:
     license_path = Path("LICENSE")
-    adr_path = Path("docs/adr/0001-dependencies-and-macos-platform.md")
+    adr_path = Path("docs/adr/0003-command-line-and-logging-dependencies.md")
     if not license_path.is_file() or not license_path.read_text(encoding="utf-8").strip():
         raise SystemExit("LICENSE is missing or empty")
     adr = adr_path.read_text(encoding="utf-8")

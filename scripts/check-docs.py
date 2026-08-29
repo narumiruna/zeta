@@ -10,7 +10,7 @@ REQUIRED = {
     "README.md", "AGENTS.md", "CONTRIBUTING.md", "SECURITY.md",
     "docs/compatibility/source-baseline.md", "docs/compatibility/typescript-baseline-results.md",
     "docs/compatibility/README.md", "docs/adr/0001-dependencies-and-macos-platform.md",
-    "docs/development/README.md", "docs/development/testing.md", "docs/development/generated-files.md",
+    "docs/adr/0003-command-line-and-logging-dependencies.md", "docs/development/README.md", "docs/development/testing.md", "docs/development/generated-files.md",
     "docs/development/release.md",
 }
 LINK = re.compile(r"(?<!!)\[[^]]+\]\(([^)]+)\)")

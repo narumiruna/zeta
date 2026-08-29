@@ -61,8 +61,29 @@ package = json.loads(Path(sys.argv[1]).read_text())
 platforms = {item["platformName"]: item["version"] for item in package["platforms"]}
 if platforms != {"macos": "14.0", "ios": "17.0"}:
     raise SystemExit(f"unexpected package platforms: {platforms}")
-if package["dependencies"]:
-    raise SystemExit("the root package must have zero external dependencies")
+expected_dependencies = {
+    "swift-argument-parser": (
+        "https://github.com/apple/swift-argument-parser.git",
+        "1.8.2",
+    ),
+    "swift-log": ("https://github.com/apple/swift-log.git", "1.9.1"),
+}
+dependencies = {}
+for dependency in package["dependencies"]:
+    source_control = dependency.get("sourceControl", [])
+    if len(source_control) != 1:
+        raise SystemExit(f"unexpected dependency declaration: {dependency}")
+    declaration = source_control[0]
+    remotes = declaration["location"].get("remote", [])
+    exact = declaration["requirement"].get("exact", [])
+    if len(remotes) != 1 or len(exact) != 1:
+        raise SystemExit(f"dependency is not pinned exactly: {declaration['identity']}")
+    dependencies[declaration["identity"]] = (
+        remotes[0]["urlString"],
+        exact[0],
+    )
+if dependencies != expected_dependencies:
+    raise SystemExit(f"unexpected root dependencies: {dependencies}")
 products = {item["name"]: item["type"] for item in package["products"]}
 for name in ("ZetaAI", "ZetaAgent"):
     if products.get(name) != {"library": ["automatic"]}:
