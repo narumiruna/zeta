@@ -83,6 +83,60 @@ final class ZetaClientTests: XCTestCase {
         await client.disconnect()
     }
 
+    func testHandshakeTimesOutAndClosesTransportExactlyOnce() async throws {
+        let box = HandshakeRaceTransportBox()
+        let client = try PiClient(handshakeTimeout: .milliseconds(20)) { handlers in
+            let transport = HandshakeRaceTransport(handlers: handlers)
+            await box.set(transport)
+            return transport
+        }
+
+        do {
+            try await client.connect()
+            XCTFail("Expected handshake timeout")
+        } catch PiClientError.protocolFailure(let message) {
+            XCTAssertEqual(message, "Server handshake timed out")
+        }
+
+        let transport = await box.wait()
+        let closeCount = await transport.closeCount
+        let state = await client.connectionState()
+        XCTAssertEqual(closeCount, 1)
+        XCTAssertEqual(state, .disconnected)
+        await transport.completeHello()
+        try await Task.sleep(for: .milliseconds(10))
+        let finalCloseCount = await transport.closeCount
+        XCTAssertEqual(finalCloseCount, 1)
+    }
+
+    func testHandshakeCancellationClearsContinuationAndWinsLateHelloRace() async throws {
+        let box = HandshakeRaceTransportBox()
+        let client = try PiClient(handshakeTimeout: .seconds(5)) { handlers in
+            let transport = HandshakeRaceTransport(handlers: handlers)
+            await box.set(transport)
+            return transport
+        }
+        let connection = Task { try await client.connect() }
+        let transport = await box.wait()
+        try await waitUntil { await transport.helloCount == 1 }
+
+        connection.cancel()
+        await transport.completeHello()
+        do {
+            try await connection.value
+            XCTFail("Expected cancellation")
+        } catch is CancellationError {}
+
+        let closeCount = await transport.closeCount
+        let state = await client.connectionState()
+        XCTAssertEqual(closeCount, 1)
+        XCTAssertEqual(state, .disconnected)
+        await transport.completeHello()
+        try await Task.sleep(for: .milliseconds(10))
+        let finalCloseCount = await transport.closeCount
+        XCTAssertEqual(finalCloseCount, 1)
+    }
+
     func testExclusiveAndSharedOwnership() async throws {
         let client = try PiClient { ScriptedTransport(handlers: $0) }
         try await client.connect()
@@ -342,6 +396,50 @@ private actor HandshakeTransport: ByteTransport {
     }
 
     func close() {}
+}
+
+private actor HandshakeRaceTransportBox {
+    private var value: HandshakeRaceTransport?
+    private var waiters: [CheckedContinuation<HandshakeRaceTransport, Never>] = []
+
+    func set(_ value: HandshakeRaceTransport) {
+        self.value = value
+        waiters.forEach { $0.resume(returning: value) }
+        waiters.removeAll()
+    }
+
+    func wait() async -> HandshakeRaceTransport {
+        if let value { return value }
+        return await withCheckedContinuation { waiters.append($0) }
+    }
+}
+
+private actor HandshakeRaceTransport: ByteTransport {
+    private let handlers: ByteTransportHandlers
+    private let decoder = try! ClientMessageDecoder()
+    private(set) var helloCount = 0
+    private(set) var closeCount = 0
+
+    init(handlers: ByteTransportHandlers) { self.handlers = handlers }
+
+    func send(_ bytes: Data) throws {
+        for message in try decoder.push(bytes) {
+            if case .hello = message { helloCount += 1 }
+        }
+    }
+
+    func completeHello() {
+        let snapshot = try! ServerSnapshot(
+            serverID: "server", revision: 0, sessions: [], models: []
+        )
+        handlers.onData(
+            try! encodeServerMessage(
+                .hello(try! ServerHello(connectionID: "connection", snapshot: snapshot))
+            )
+        )
+    }
+
+    func close() { closeCount += 1 }
 }
 
 private actor ControlledTransportBox {

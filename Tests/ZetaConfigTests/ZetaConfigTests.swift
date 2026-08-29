@@ -1,3 +1,4 @@
+import Darwin
 import XCTest
 
 @testable import ZetaConfig
@@ -43,6 +44,29 @@ final class ZetaConfigTests: XCTestCase {
                 with: Data(contentsOf: directory.appendingPathComponent("trust.json"))
             ) as? [String: Bool]
         XCTAssertEqual(stored?[parent.path], true)
+    }
+
+    func testFailedSettingsModificationDoesNotPublishCandidate() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let blockedAgentDirectory = directory.appendingPathComponent("not-a-directory")
+        try Data("blocker".utf8).write(to: blockedAgentDirectory)
+        let paths = ZetaPaths(
+            home: directory,
+            workingDirectory: directory,
+            environment: ["PI_CODING_AGENT_DIR": blockedAgentDirectory.path]
+        )
+        let store = try SettingsStore(paths: paths, includeProject: false)
+
+        do {
+            try await store.modify { $0.theme = "rejected" }
+            XCTFail("Expected persistence failure")
+        } catch {}
+
+        let current = await store.current()
+        XCTAssertEqual(current.theme, "dark")
+        XCTAssertEqual(try String(contentsOf: blockedAgentDirectory, encoding: .utf8), "blocker")
     }
 
     func testOAuthExtrasRoundTripThroughDisk() async throws {
@@ -159,6 +183,36 @@ final class ZetaConfigTests: XCTestCase {
         XCTAssertEqual(credential?.last, "x")
     }
 
+    func testOversizedCredentialHelperOutputTerminatesProcessTree() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let parentFile = directory.appendingPathComponent("helper-parent.pid")
+        let childFile = directory.appendingPathComponent("helper-child.pid")
+        let store = try AuthStore(url: directory.appendingPathComponent("auth.json"))
+        let command = """
+            !/bin/sleep 30 & child=$!; echo $$ > '\(parentFile.path)'; echo $child > '\(childFile.path)'; /usr/bin/awk 'BEGIN { for (i=0; i<1100000; i++) printf "x" }'; wait
+            """
+        try await store.set(
+            provider: "helper",
+            credential: .apiKey(key: command, environment: nil)
+        )
+
+        do {
+            _ = try await store.resolveAPIKey(
+                provider: "helper",
+                environment: [:],
+                fallbackVariables: []
+            )
+            XCTFail("Expected oversized helper output to fail")
+        } catch {}
+
+        let parent = try readProcessID(parentFile)
+        let child = try readProcessID(childFile)
+        try await waitForCondition {
+            !processIsRunning(parent) && !processIsRunning(child)
+        }
+    }
+
     func testCredentialKindsDoNotExposeSecretsInList() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let store = try AuthStore(url: directory.appendingPathComponent("auth.json"))
@@ -184,4 +238,32 @@ final class ZetaConfigTests: XCTestCase {
         )
         XCTAssertEqual(access, "oauth-access")
     }
+}
+
+private func readProcessID(_ url: URL) throws -> pid_t {
+    pid_t(
+        try XCTUnwrap(
+            Int32(String(contentsOf: url, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines))
+        )
+    )
+}
+
+private func processIsRunning(_ identifier: pid_t) -> Bool {
+    kill(identifier, 0) == 0 || errno == EPERM
+}
+
+private func waitForCondition(
+    timeout: Duration = .seconds(2),
+    _ condition: () -> Bool
+) async throws {
+    let clock = ContinuousClock()
+    let deadline = clock.now.advanced(by: timeout)
+    while !condition() {
+        guard clock.now < deadline else { throw ConfigTestError.timedOut }
+        try await Task.sleep(for: .milliseconds(1))
+    }
+}
+
+private enum ConfigTestError: Error {
+    case timedOut
 }

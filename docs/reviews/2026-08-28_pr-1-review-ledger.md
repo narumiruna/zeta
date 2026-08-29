@@ -4,6 +4,8 @@ Target: [PR #1](https://github.com/narumiruna/zeta/pull/1), `narumi/feat/swift-n
 
 Reviewed feedback is the Codex review submitted on 2026-08-28 and the three failing macOS CI checks for commit `9913698ceb5a5180e4bba57f7a5942fb6b3d38f2`.
 
+Rounds six and seven continue in the [follow-up review ledger](2026-08-29_pr-1-review-ledger-followup.md).
+
 ## Inline feedback
 
 ### `3883403780`

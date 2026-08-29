@@ -559,6 +559,7 @@ Regenerate it with `uv run python scripts/generate-api-docs.py`.
 | `ClientConnectionState` | Enumeration |
 | `LeaseMode` | Enumeration |
 | `PiClientError` | Enumeration |
+| `init(maximumFrameLength:handshakeTimeout:transportFactory:)` | Initializer |
 | `init(maximumFrameLength:transportFactory:)` | Initializer |
 | `init(onData:onClose:onError:)` | Initializer |
 | `init(rawValue:)` | Initializer |

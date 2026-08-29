@@ -2,6 +2,7 @@ import Foundation
 import ZetaAI
 import ZetaAgent
 import ZetaCompaction
+import ZetaConfig
 import ZetaCore
 import ZetaExport
 import ZetaModes
@@ -13,7 +14,8 @@ public actor CLIRPCRuntime {
     private let models: [Model]
     private let shell: ShellTool
     private let workingDirectory: URL
-    private var autoCompaction = true
+    private var autoCompaction: Bool
+    private let compactionPolicy: ZetaCompaction.CompactionSettings
     private var autoRetry = true
     private var sessionName: String?
     private let session: PersistentSessionController?
@@ -28,13 +30,53 @@ public actor CLIRPCRuntime {
         agent: Agent,
         models: [Model],
         workingDirectory: URL,
-        session: PersistentSessionController? = nil
+        session: PersistentSessionController? = nil,
+        compactionSettings: ZetaConfig.CompactionSettings? = nil
     ) {
+        let compactionSettings = compactionSettings ?? Settings().compaction
         self.agent = agent
         self.models = models
         self.session = session
         self.workingDirectory = workingDirectory
+        autoCompaction = compactionSettings.enabled
+        compactionPolicy = ZetaCompaction.CompactionSettings(
+            reserveTokens: compactionSettings.reserveTokens,
+            keepRecentTokens: compactionSettings.keepRecentTokens
+        )
         shell = ShellTool(workingDirectory: workingDirectory)
+    }
+
+    func admit(
+        _ request: StrictRPCRequest
+    ) async -> Task<StrictRPCResponse, Never> {
+        guard request.command == .bash else {
+            let response = await handle(request)
+            return Task { response }
+        }
+        do {
+            let command = try requiredString("command", request.fields)
+            guard activeBash == nil else {
+                throw AgentError.blocked("A bash command is already running")
+            }
+            let id = UUID()
+            let task = Task { try await shell.run(command: command) }
+            activeBash = (id, task)
+            return Task {
+                await self.finishAdmittedBash(
+                    request: request,
+                    id: id,
+                    task: task
+                )
+            }
+        } catch {
+            let response = StrictRPCResponse(
+                id: request.id,
+                command: request.command,
+                success: false,
+                error: String(describing: error)
+            )
+            return Task { response }
+        }
     }
 
     public func handle(_ request: StrictRPCRequest) async -> StrictRPCResponse {
@@ -121,6 +163,7 @@ public actor CLIRPCRuntime {
             else {
                 throw ProviderError.unknownModel("\(provider)/\(id)")
             }
+            try await session?.recordModel(model)
             await agent.setModel(model)
             return ["model": .string("\(provider)/\(id)")]
         case .cycleModel:
@@ -173,7 +216,12 @@ public actor CLIRPCRuntime {
             compactionInProgress = true
             defer { compactionInProgress = false }
             let state = await agent.state()
-            guard let preparation = Compaction.prepare(messages: state.messages) else {
+            guard
+                let preparation = Compaction.prepare(
+                    messages: state.messages,
+                    settings: compactionPolicy
+                )
+            else {
                 return ["compacted": false]
             }
             let summary = try await agent.compact(
@@ -282,11 +330,31 @@ public actor CLIRPCRuntime {
                     if case .user = message { return try encoded(message) }
                     return nil
                 })
-        case .getEntries, .getTree:
-            if let session {
-                return .array(try await session.currentEntries().map(encoded))
+        case .getEntries:
+            var entries = await rpcEntries()
+            if let since = optionalString("since", request.fields) {
+                guard let index = entries.firstIndex(where: { $0.base.id == since }) else {
+                    throw SessionError.missingEntry(since)
+                }
+                entries = Array(entries.dropFirst(index + 1))
             }
-            return .array(try await agent.state().messages.map(encoded))
+            let leafID = await rpcLeafID()
+            return [
+                "entries": .array(try entries.map(encoded)),
+                "leafId": leafID.map(JSONValue.string) ?? .null,
+            ]
+        case .getTree:
+            let tree =
+                if let session {
+                    await session.currentTree()
+                } else {
+                    Self.tree(from: await rpcEntries())
+                }
+            let leafID = await rpcLeafID()
+            return [
+                "tree": try encodedTree(tree),
+                "leafId": leafID.map(JSONValue.string) ?? .null,
+            ]
         case .getMessages:
             return .array(try await agent.state().messages.map(encoded))
         case .getLastAssistantText:
@@ -309,6 +377,36 @@ public actor CLIRPCRuntime {
 
     func waitForIdle() async {
         if let promptTask { await promptTask.value }
+    }
+
+    private func finishAdmittedBash(
+        request: StrictRPCRequest,
+        id: UUID,
+        task: Task<ShellResult, Error>
+    ) async -> StrictRPCResponse {
+        defer {
+            if activeBash?.id == id { activeBash = nil }
+        }
+        do {
+            let result = try await task.value
+            return StrictRPCResponse(
+                id: request.id,
+                command: request.command,
+                success: true,
+                data: [
+                    "output": .string(result.output),
+                    "exitCode": .number(JSONNumber(Int(result.exitCode))),
+                    "truncated": .bool(result.truncated),
+                ]
+            )
+        } catch {
+            return StrictRPCResponse(
+                id: request.id,
+                command: request.command,
+                success: false,
+                error: String(describing: error)
+            )
+        }
     }
 
     private func beginSessionMutation() async throws {
@@ -345,8 +443,12 @@ public actor CLIRPCRuntime {
             Compaction.shouldCompact(
                 messages: state.messages,
                 contextWindow: state.model.contextWindow,
-                reserveTokens: 16_384
-            ), let preparation = Compaction.prepare(messages: state.messages)
+                reserveTokens: compactionPolicy.reserveTokens
+            ),
+            let preparation = Compaction.prepare(
+                messages: state.messages,
+                settings: compactionPolicy
+            )
         else {
             return
         }
@@ -357,6 +459,56 @@ public actor CLIRPCRuntime {
         try await session?.recordCompaction(
             summary: summary,
             preparation: preparation
+        )
+    }
+
+    private func rpcEntries() async -> [SessionEntry] {
+        if let session { return await session.currentEntries() }
+        var parentID: String?
+        return await agent.state().messages.enumerated().map { index, message in
+            let id = String(format: "%08x", index + 1)
+            defer { parentID = id }
+            return .message(
+                SessionEntryBase(
+                    id: id,
+                    parentId: parentID,
+                    timestamp: Self.timestamp(for: message)
+                ),
+                message
+            )
+        }
+    }
+
+    private func rpcLeafID() async -> String? {
+        if let session { return await session.currentLeafID() }
+        let entries = await rpcEntries()
+        return entries.last?.base.id
+    }
+
+    private static func tree(from entries: [SessionEntry]) -> [SessionTreeNode] {
+        let nodes = entries.reduce(into: [String: SessionTreeNode]()) {
+            $0[$1.base.id] = SessionTreeNode(entry: $1)
+        }
+        var roots: [SessionTreeNode] = []
+        for entry in entries {
+            guard let node = nodes[entry.base.id] else { continue }
+            if let parentID = entry.base.parentId, let parent = nodes[parentID] {
+                parent.children.append(node)
+            } else {
+                roots.append(node)
+            }
+        }
+        return roots
+    }
+
+    private func encodedTree(_ nodes: [SessionTreeNode]) throws -> JSONValue {
+        .array(
+            try nodes.map { node in
+                [
+                    "entry": try encoded(node.entry),
+                    "children": try encodedTree(node.children),
+                ]
+            }
         )
     }
 

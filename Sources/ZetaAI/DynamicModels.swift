@@ -51,15 +51,19 @@ public actor FileModelCatalogStore: ModelCatalogStore {
 
     public func read(provider: String) -> StoredModelCatalog? { entries[provider] }
     public func write(provider: String, entry: StoredModelCatalog) throws {
-        entries[provider] = entry
-        try persist()
+        var updated = entries
+        updated[provider] = entry
+        try persist(updated)
+        entries = updated
     }
     public func delete(provider: String) throws {
-        entries[provider] = nil
-        try persist()
+        var updated = entries
+        updated[provider] = nil
+        try persist(updated)
+        entries = updated
     }
 
-    private func persist() throws {
+    private func persist(_ entries: [String: StoredModelCatalog]) throws {
         try FileManager.default.createDirectory(
             at: url.deletingLastPathComponent(),
             withIntermediateDirectories: true
@@ -128,8 +132,10 @@ public actor DynamicModelProvider: AIProvider {
         let fetched = try await fetch(stored)
         try Task.checkCancellation()
         guard generation == requestedGeneration else { return }
-        currentModels = fetched.models
         try await store.write(provider: id, entry: fetched)
+        try Task.checkCancellation()
+        guard generation == requestedGeneration else { return }
+        currentModels = fetched.models
     }
 
     public func stream(

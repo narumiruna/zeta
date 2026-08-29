@@ -69,6 +69,15 @@ enum CLIProviderAuthenticationResolver {
             ? explicitAPIKey : stored.apiKey
 
         if api == "google-vertex" || provider == "google-vertex" {
+            if let explicitAPIKey,
+                !explicitAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            {
+                return CLIResolvedProviderAuthentication(
+                    apiKey: explicitAPIKey,
+                    headers: [:],
+                    environment: stored.environment
+                )
+            }
             if let bearerToken = stored.bearerToken {
                 return CLIResolvedProviderAuthentication(
                     bearerToken: bearerToken,
@@ -216,6 +225,7 @@ actor CLIModelStreamDispatcher {
     private let authStore: AuthStore
     private let explicitAPIKeys: [String: String]
     private let transportPreference: TransportPreference
+    private let httpIdleTimeoutMilliseconds: Int
     private let environment: @Sendable () -> [String: String]
     private let codexPool = CodexWebSocketPool(factory: CodexWebSocket.defaultFactory())
     private var fauxProviders: [String: FauxProvider] = [:]
@@ -224,6 +234,7 @@ actor CLIModelStreamDispatcher {
         authStore: AuthStore,
         explicitAPIKeys: [String: String],
         transportPreference: TransportPreference,
+        httpIdleTimeoutMilliseconds: Int = 300_000,
         environment: @escaping @Sendable () -> [String: String] = {
             ProcessInfo.processInfo.environment
         }
@@ -231,6 +242,7 @@ actor CLIModelStreamDispatcher {
         self.authStore = authStore
         self.explicitAPIKeys = explicitAPIKeys
         self.transportPreference = transportPreference
+        self.httpIdleTimeoutMilliseconds = httpIdleTimeoutMilliseconds
         self.environment = environment
     }
 
@@ -239,6 +251,7 @@ actor CLIModelStreamDispatcher {
         context: Context,
         options: StreamOptions
     ) async -> AssistantEventStream {
+        let options = applyingDefaultTimeout(to: options)
         let currentEnvironment = environment()
         if currentEnvironment["ZETA_FAUX_RESPONSE"] != nil
             || currentEnvironment["ZETA_FAUX_TOOL"] != nil
@@ -317,6 +330,16 @@ actor CLIModelStreamDispatcher {
             )
             return stream
         }
+    }
+
+    func applyingDefaultTimeout(to original: StreamOptions) -> StreamOptions {
+        guard original.timeout == nil else { return original }
+        var options = original
+        let milliseconds =
+            httpIdleTimeoutMilliseconds == 0
+            ? Int(Int32.max) : httpIdleTimeoutMilliseconds
+        options.timeout = .milliseconds(milliseconds)
+        return options
     }
 
     func resolveAuthentication(

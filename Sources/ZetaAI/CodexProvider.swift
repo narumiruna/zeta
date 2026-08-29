@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import ZetaCore
 
@@ -57,7 +58,14 @@ public struct CodexWebSocketProvider: AIProvider {
                 request["session_id"] = .string(sessionID)
                 let requestData = OrderedJSON.encode(.object(request))
                 try await pool.withConnection(
-                    key: .init(account: id, sessionID: sessionID),
+                    key: .init(
+                        account: connectionFingerprint(
+                            credential: credential,
+                            url: url,
+                            headers: headers
+                        ),
+                        sessionID: sessionID
+                    ),
                     url: url,
                     headers: headers.dictionary
                 ) { connection in
@@ -121,6 +129,30 @@ public struct CodexWebSocketProvider: AIProvider {
         }
         output.attachProducer(producer)
         return output
+    }
+
+    private func connectionFingerprint(
+        credential: String,
+        url: URL,
+        headers: CaseInsensitiveHeaders
+    ) -> String {
+        let normalizedHeaders: [(String, String)] = headers.dictionary.map {
+            ($0.key.lowercased(), $0.value)
+        }
+        let sortedHeaders = normalizedHeaders.sorted {
+            $0.0 == $1.0 ? $0.1 < $1.1 : $0.0 < $1.0
+        }
+        var components = [id, url.absoluteString, credential]
+        for (name, value) in sortedHeaders {
+            components.append(name)
+            components.append(value)
+        }
+        let material = components.map { "\($0.utf8.count):\($0)" }
+            .joined(separator: "|")
+        let digest = SHA256.hash(data: Data(material.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
+        return "codex-\(digest)"
     }
 
     private func websocketURL(_ base: URL) throws -> URL {

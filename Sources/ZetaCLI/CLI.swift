@@ -115,7 +115,8 @@ public enum ZetaCLI {
                 initialModel: model,
                 explicitAPIKey: parsed.apiKey,
                 authStore: authStore,
-                transport: settings.transport
+                transport: settings.transport,
+                httpIdleTimeoutMilliseconds: settings.httpIdleTimeoutMs
             )
             let pluginRuntime = CLIPluginRuntime()
             for diagnostic in await pluginRuntime.load(
@@ -174,7 +175,8 @@ public enum ZetaCLI {
                 result = await runRPC(
                     agent: agent,
                     models: models,
-                    session: persistentSession
+                    session: persistentSession,
+                    compactionSettings: settings.compaction
                 )
             }
             await pluginRuntime.stop()
@@ -273,7 +275,8 @@ public enum ZetaCLI {
     private static func runRPC(
         agent: Agent,
         models: [Model],
-        session: PersistentSessionController?
+        session: PersistentSessionController?,
+        compactionSettings: ZetaConfig.CompactionSettings
     ) async -> Int32 {
         let runtime = CLIRPCRuntime(
             agent: agent,
@@ -281,7 +284,8 @@ public enum ZetaCLI {
             workingDirectory: URL(
                 fileURLWithPath: FileManager.default.currentDirectoryPath
             ),
-            session: session
+            session: session,
+            compactionSettings: compactionSettings
         )
         let writer = RPCOutputWriter()
         await agent.subscribe { event in
@@ -299,16 +303,18 @@ public enum ZetaCLI {
                 for try await byte in FileHandle.standardInput.bytes {
                     for record in try decoder.push(Data([byte])) {
                         let request = try StrictRPCRequest.decode(record)
+                        let operation = await runtime.admit(request)
                         group.addTask {
-                            let response = await runtime.handle(request)
+                            let response = await operation.value
                             await writer.write(response.encodedLine())
                         }
                     }
                 }
                 for record in try decoder.finish() {
                     let request = try StrictRPCRequest.decode(record)
+                    let operation = await runtime.admit(request)
                     group.addTask {
-                        let response = await runtime.handle(request)
+                        let response = await operation.value
                         await writer.write(response.encodedLine())
                     }
                 }
@@ -344,13 +350,15 @@ public enum ZetaCLI {
         initialModel: Model,
         explicitAPIKey: String?,
         authStore: AuthStore,
-        transport: TransportPreference
+        transport: TransportPreference,
+        httpIdleTimeoutMilliseconds: Int
     ) -> Agent.StreamFunction {
         let explicitAPIKeys = explicitAPIKey.map { [initialModel.provider: $0] } ?? [:]
         let dispatcher = CLIModelStreamDispatcher(
             authStore: authStore,
             explicitAPIKeys: explicitAPIKeys,
-            transportPreference: transport
+            transportPreference: transport,
+            httpIdleTimeoutMilliseconds: httpIdleTimeoutMilliseconds
         )
         return { model, context, options in
             await dispatcher.stream(model: model, context: context, options: options)

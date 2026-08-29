@@ -129,8 +129,13 @@ extension ZetaCLI {
             let minimum =
                 try value(after: "--min-expiry", in: arguments)
                 .map(durationMilliseconds) ?? 30 * 60 * 1_000
+            let now = Int64(Date().timeIntervalSince1970 * 1_000)
+            let deadline = try minimumExpiryDeadline(
+                nowMilliseconds: now,
+                minimumMilliseconds: minimum
+            )
             guard case .oauth(let access, _, let expires, _)? = await store.read(provider: provider),
-                expires > Int64(Date().timeIntervalSince1970 * 1_000) + minimum
+                expires > deadline
             else {
                 return 1
             }
@@ -141,20 +146,42 @@ extension ZetaCLI {
         }
     }
 
-    private static func durationMilliseconds(_ value: String) throws -> Int64 {
-        let unit = value.last
-        let numberText = unit?.isNumber == true ? value : String(value.dropLast())
-        guard let number = Int64(numberText), number >= 0 else {
+    static func durationMilliseconds(_ value: String) throws -> Int64 {
+        let units: [(suffix: String, multiplier: Int64)] = [
+            ("ms", 1),
+            ("s", 1_000),
+            ("m", 60_000),
+            ("h", 3_600_000),
+            ("d", 86_400_000),
+        ]
+        let matched = units.first { value.hasSuffix($0.suffix) }
+        let numberText = matched.map { String(value.dropLast($0.suffix.count)) } ?? value
+        guard !numberText.isEmpty,
+            numberText.allSatisfy(\.isNumber),
+            let number = Int64(numberText),
+            number >= 0
+        else {
             throw CLIArgumentError.invalidValue("--min-expiry")
         }
-        switch unit {
-        case "s": return number * 1_000
-        case "m": return number * 60 * 1_000
-        case "h": return number * 60 * 60 * 1_000
-        case "d": return number * 24 * 60 * 60 * 1_000
-        case _ where unit?.isNumber == true: return number
-        default: throw CLIArgumentError.invalidValue("--min-expiry")
+        let result = number.multipliedReportingOverflow(by: matched?.multiplier ?? 1)
+        guard !result.overflow else {
+            throw CLIArgumentError.invalidValue("--min-expiry")
         }
+        return result.partialValue
+    }
+
+    static func minimumExpiryDeadline(
+        nowMilliseconds: Int64,
+        minimumMilliseconds: Int64
+    ) throws -> Int64 {
+        guard minimumMilliseconds >= 0 else {
+            throw CLIArgumentError.invalidValue("--min-expiry")
+        }
+        let deadline = nowMilliseconds.addingReportingOverflow(minimumMilliseconds)
+        guard !deadline.overflow else {
+            throw CLIArgumentError.invalidValue("--min-expiry")
+        }
+        return deadline.partialValue
     }
 
     static func migrationLocations(

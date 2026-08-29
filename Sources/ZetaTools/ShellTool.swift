@@ -33,58 +33,89 @@ public struct ShellTool: Sendable {
         let pipe = Pipe()
         process.standardOutput = pipe
         process.standardError = pipe
-        try process.run()
-        _ = setpgid(process.processIdentifier, process.processIdentifier)
+        let spoolURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("zeta-shell-\(UUID().uuidString).log")
+        guard FileManager.default.createFile(atPath: spoolURL.path, contents: nil),
+            let spool = try? FileHandle(forWritingTo: spoolURL)
+        else {
+            throw FileToolError.processFailed("Could not create shell output spool")
+        }
+        var preserveSpool = false
+        defer {
+            try? spool.close()
+            if !preserveSpool { try? FileManager.default.removeItem(at: spoolURL) }
+        }
 
-        return try await withTaskCancellationHandler {
-            try await withThrowingTaskGroup(of: ShellRace.self) { group in
-                group.addTask {
-                    var data = Data()
-                    for try await byte in pipe.fileHandleForReading.bytes {
-                        data.append(byte)
-                        if data.count % 4_096 == 0, let text = String(data: data, encoding: .utf8) {
-                            onUpdate?(text)
+        try process.run()
+        ToolProcessLifecycle.prepare(process)
+
+        let capture: (ShellCapture, Int32)
+        do {
+            capture = try await withTaskCancellationHandler {
+                try await withThrowingTaskGroup(of: ShellRace.self) { group in
+                    group.addTask {
+                        var capture = ShellCapture()
+                        var chunk = Data()
+                        var lastUpdateBytes = 0
+                        var nextUpdate = ContinuousClock.now
+                        defer { try? spool.close() }
+                        for try await byte in pipe.fileHandleForReading.bytes {
+                            chunk.append(byte)
+                            guard chunk.count >= 16 * 1_024 else { continue }
+                            try spool.write(contentsOf: chunk)
+                            capture.append(chunk)
+                            chunk.removeAll(keepingCapacity: true)
+                            if let onUpdate, ContinuousClock.now >= nextUpdate {
+                                onUpdate(capture.output)
+                                lastUpdateBytes = capture.totalBytes
+                                nextUpdate = ContinuousClock.now.advanced(by: .milliseconds(100))
+                            }
+                        }
+                        if !chunk.isEmpty {
+                            try spool.write(contentsOf: chunk)
+                            capture.append(chunk)
+                        }
+                        if let onUpdate, capture.totalBytes != lastUpdateBytes {
+                            onUpdate(capture.output)
+                        }
+                        let status = try await Self.waitForExit(process)
+                        return .completed(capture, status)
+                    }
+                    if let timeout {
+                        group.addTask {
+                            try await Task.sleep(for: .seconds(timeout))
+                            return .timedOut
                         }
                     }
-                    let status = try await Self.waitForExit(process)
-                    return .completed(data, status)
-                }
-                if let timeout {
-                    group.addTask {
-                        try await Task.sleep(for: .seconds(timeout))
-                        return .timeout
+                    guard let first = try await group.next() else {
+                        throw FileToolError.processFailed("Command did not produce a result")
+                    }
+                    group.cancelAll()
+                    switch first {
+                    case .timedOut:
+                        ToolProcessLifecycle.terminate(process, closing: [pipe.fileHandleForReading])
+                        throw FileToolError.timedOut
+                    case .completed(let capture, let status):
+                        return (capture, status)
                     }
                 }
-                guard let first = try await group.next() else {
-                    throw FileToolError.processFailed("Command did not produce a result")
-                }
-                group.cancelAll()
-                switch first {
-                case .timeout:
-                    Self.terminateProcessTree(process)
-                    try? pipe.fileHandleForReading.close()
-                    throw FileToolError.timedOut
-                case .completed(let data, let status):
-                    let full = String(decoding: data, as: UTF8.self)
-                    let truncated = Truncation.tail(full)
-                    var outputFile: URL?
-                    if truncated.truncated {
-                        let url = FileManager.default.temporaryDirectory
-                            .appendingPathComponent("zeta-shell-\(UUID().uuidString).log")
-                        try data.write(to: url, options: .atomic)
-                        outputFile = url
-                    }
-                    return ShellResult(
-                        output: truncated.content,
-                        exitCode: status,
-                        truncated: truncated.truncated,
-                        fullOutputFile: outputFile
-                    )
-                }
+            } onCancel: {
+                ToolProcessLifecycle.terminate(process, closing: [pipe.fileHandleForReading])
             }
-        } onCancel: {
-            Self.terminateProcessTree(process)
+        } catch {
+            ToolProcessLifecycle.terminate(process, closing: [pipe.fileHandleForReading])
+            if Task.isCancelled { throw CancellationError() }
+            throw error
         }
+
+        let truncated = capture.0.truncated
+        preserveSpool = truncated
+        return ShellResult(
+            output: capture.0.output,
+            exitCode: capture.1,
+            truncated: truncated,
+            fullOutputFile: truncated ? spoolURL : nil
+        )
     }
 
     private static func waitForExit(_ process: Process) async throws -> Int32 {
@@ -92,23 +123,52 @@ public struct ShellTool: Sendable {
             try Task.checkCancellation()
             try await Task.sleep(for: .milliseconds(10))
         }
+        try Task.checkCancellation()
         return process.terminationStatus
     }
+}
 
-    private static func terminateProcessTree(_ process: Process) {
-        guard process.isRunning else { return }
-        if kill(-process.processIdentifier, SIGTERM) != 0 {
-            process.terminate()
+private struct ShellCapture: Sendable {
+    private static let retainedBytes = defaultMaximumBytes * 2
+    private var tail = Data()
+    private var tailStartsAtLineBoundary = true
+    private var newlineCount = 0
+    private var lastByte: UInt8?
+    private(set) var totalBytes = 0
+
+    mutating func append(_ data: Data) {
+        guard !data.isEmpty else { return }
+        totalBytes += data.count
+        newlineCount += data.reduce(into: 0) { count, byte in
+            if byte == 0x0A { count += 1 }
         }
-        usleep(100_000)
-        if process.isRunning {
-            kill(-process.processIdentifier, SIGKILL)
-            process.interrupt()
+        lastByte = data.last
+        tail.append(data)
+        guard tail.count > Self.retainedBytes else { return }
+        let removed = tail.count - Self.retainedBytes
+        tailStartsAtLineBoundary = tail[tail.index(tail.startIndex, offsetBy: removed - 1)] == 0x0A
+        tail.removeFirst(removed)
+    }
+
+    var truncated: Bool {
+        totalBytes > defaultMaximumBytes || totalLines > defaultMaximumLines
+    }
+
+    var output: String {
+        var snapshot = tail
+        if !tailStartsAtLineBoundary, let newline = snapshot.firstIndex(of: 0x0A) {
+            snapshot.removeSubrange(snapshot.startIndex...newline)
         }
+        return Truncation.tail(String(decoding: snapshot, as: UTF8.self)).content
+    }
+
+    private var totalLines: Int {
+        guard totalBytes > 0 else { return 0 }
+        return newlineCount + (lastByte == 0x0A ? 0 : 1)
     }
 }
 
 private enum ShellRace: Sendable {
-    case completed(Data, Int32)
-    case timeout
+    case completed(ShellCapture, Int32)
+    case timedOut
 }

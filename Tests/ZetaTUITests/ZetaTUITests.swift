@@ -11,6 +11,18 @@ final class ZetaTUITests: XCTestCase {
         XCTAssertEqual(ANSI.wrap("ab漢c", width: 3), ["ab", "漢c"])
     }
 
+    func testFocusedEditorWrappingPreservesCursorMarkerAndStyle() {
+        let editor = Editor()
+        editor.focused = true
+        editor.setValue("abcdEF")
+
+        let lines = editor.render(width: 4)
+
+        XCTAssertEqual(lines.map(ANSI.visibleWidth), [4, 3])
+        XCTAssertTrue(lines[1].contains(cursorMarker))
+        XCTAssertTrue(lines[1].contains("\u{1B}[7m \u{1B}[27m"))
+    }
+
     func testEditorUndoPasteAndAutocomplete() {
         let editor = Editor()
         editor.setValue("hello")

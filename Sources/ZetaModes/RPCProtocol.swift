@@ -144,7 +144,9 @@ public struct StrictRPCRequest: Sendable, Equatable {
         case .fork:
             properties.append(field("entryId", .string()))
         case .getEntries:
-            properties.append(field("since", .string(), required: false))
+            properties.append(
+                field("since", .string(minLength: 1), required: false)
+            )
         case .setSessionName:
             properties.append(field("name", .string()))
         case .abort, .clearQueue, .getState, .cycleModel,

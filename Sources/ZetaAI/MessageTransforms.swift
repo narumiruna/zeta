@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import ZetaCore
 
@@ -10,6 +11,7 @@ public enum MessageTransforms {
         let toolNames = Set(knownTools.map(\.name))
         var output: [Message] = []
         var pendingCalls: [String: String] = [:]
+        var toolCallIDs = ToolCallIDNormalizer()
         for message in messages {
             switch message {
             case .assistant(var assistant):
@@ -29,7 +31,7 @@ public enum MessageTransforms {
                         guard !redacted, !text.isEmpty else { return nil }
                         return .text(text: "<thinking>\(text)</thinking>")
                     case .toolCall(var call):
-                        call.id = normalizeToolCallID(call.id)
+                        call.id = toolCallIDs.normalize(call.id)
                         if !toolNames.isEmpty, !toolNames.contains(call.name) {
                             // Preserve calls to no-longer-active tools for transcript
                             // continuity; providers still require a paired result.
@@ -42,7 +44,7 @@ public enum MessageTransforms {
                 }
                 output.append(.assistant(assistant))
             case .toolResult(var result):
-                result.toolCallId = normalizeToolCallID(result.toolCallId)
+                result.toolCallId = toolCallIDs.normalize(result.toolCallId)
                 pendingCalls[result.toolCallId] = nil
                 output.append(.toolResult(result))
             case .user:
@@ -64,8 +66,22 @@ public enum MessageTransforms {
         }
         var normalized = String(String.UnicodeScalarView(allowed))
         if normalized.isEmpty { normalized = "call" }
-        if normalized.count > 64 { normalized = String(normalized.prefix(64)) }
+        guard normalized == value, normalized.count <= 64 else {
+            return suffixedToolCallID(normalized, source: value)
+        }
         return normalized
+    }
+
+    private static func suffixedToolCallID(
+        _ prefix: String,
+        source: String
+    ) -> String {
+        let digest = SHA256.hash(data: Data(source.utf8))
+            .prefix(8)
+            .map { String(format: "%02x", $0) }
+            .joined()
+        let suffix = "-\(digest)"
+        return String(prefix.prefix(64 - suffix.count)) + suffix
     }
 
     public static func estimateContextTokens(_ context: Context) -> Int {
@@ -127,6 +143,27 @@ public enum MessageTransforms {
             )
         }
         pending.removeAll()
+    }
+
+    private struct ToolCallIDNormalizer {
+        private var normalizedBySource: [String: String] = [:]
+        private var sourceByNormalized: [String: String] = [:]
+
+        mutating func normalize(_ source: String) -> String {
+            if let normalized = normalizedBySource[source] { return normalized }
+            var discriminator = 0
+            var normalized = MessageTransforms.normalizeToolCallID(source)
+            while let owner = sourceByNormalized[normalized], owner != source {
+                discriminator += 1
+                normalized = MessageTransforms.suffixedToolCallID(
+                    normalized,
+                    source: "\(source)\u{0}\(discriminator)"
+                )
+            }
+            normalizedBySource[source] = normalized
+            sourceByNormalized[normalized] = source
+            return normalized
+        }
     }
 
     private static func estimate(_ message: Message) -> Int {

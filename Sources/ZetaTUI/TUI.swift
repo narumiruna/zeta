@@ -395,12 +395,31 @@ public enum ANSI {
         guard visibleWidth(value) > width else { return value }
         let target = max(0, width - visibleWidth(ellipsis))
         var output = ""
+        var pendingCursorPrefix = ""
+        var preservingCursor = false
         var used = 0
-        for character in strip(value) {
-            let next = characterWidth(character)
-            if used + next > target { break }
-            output.append(character)
-            used += next
+        tokenLoop: for token in tokens(value) {
+            switch token {
+            case .control(let sequence):
+                if sequence == cursorMarker {
+                    preservingCursor = true
+                    pendingCursorPrefix += sequence
+                } else if preservingCursor {
+                    if pendingCursorPrefix.isEmpty {
+                        output += sequence
+                    } else {
+                        pendingCursorPrefix += sequence
+                    }
+                    if sequence == "\u{1B}[27m" { preservingCursor = false }
+                }
+            case .character(let character):
+                let next = characterWidth(character)
+                if used + next > target { break tokenLoop }
+                output += pendingCursorPrefix
+                pendingCursorPrefix = ""
+                output.append(character)
+                used += next
+            }
         }
         return output + ellipsis
     }
@@ -408,17 +427,72 @@ public enum ANSI {
     public static func wrap(_ value: String, width: Int) -> [String] {
         guard width > 0 else { return [""] }
         var lines = [""]
+        var pendingCursorPrefix = ""
+        var preservingCursor = false
         var used = 0
-        for character in strip(value) {
-            let next = characterWidth(character)
-            if used + next > width {
-                lines.append("")
-                used = 0
+        for token in tokens(value) {
+            switch token {
+            case .control(let sequence):
+                if sequence == cursorMarker {
+                    preservingCursor = true
+                    pendingCursorPrefix += sequence
+                } else if preservingCursor {
+                    if pendingCursorPrefix.isEmpty {
+                        lines[lines.count - 1] += sequence
+                    } else {
+                        pendingCursorPrefix += sequence
+                    }
+                    if sequence == "\u{1B}[27m" { preservingCursor = false }
+                }
+            case .character(let character):
+                if character == "\n" {
+                    lines[lines.count - 1] += pendingCursorPrefix
+                    pendingCursorPrefix = ""
+                    lines.append("")
+                    used = 0
+                    continue
+                }
+                let next = characterWidth(character)
+                if used + next > width {
+                    lines.append("")
+                    used = 0
+                }
+                lines[lines.count - 1] += pendingCursorPrefix
+                pendingCursorPrefix = ""
+                lines[lines.count - 1].append(character)
+                used += next
             }
-            lines[lines.count - 1].append(character)
-            used += next
         }
+        lines[lines.count - 1] += pendingCursorPrefix
         return lines
+    }
+
+    private enum Token {
+        case control(String)
+        case character(Character)
+    }
+
+    private static func tokens(_ value: String) -> [Token] {
+        let source = value as NSString
+        let matches = escape.matches(
+            in: value,
+            range: NSRange(location: 0, length: source.length)
+        )
+        var result: [Token] = []
+        var location = 0
+        for match in matches {
+            if match.range.location > location {
+                result += source.substring(
+                    with: NSRange(location: location, length: match.range.location - location)
+                ).map(Token.character)
+            }
+            result.append(.control(source.substring(with: match.range)))
+            location = NSMaxRange(match.range)
+        }
+        if location < source.length {
+            result += source.substring(from: location).map(Token.character)
+        }
+        return result
     }
 
     private static func characterWidth(_ character: Character) -> Int {

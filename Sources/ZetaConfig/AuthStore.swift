@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 public enum StoredCredential: Codable, Sendable, Equatable {
@@ -184,18 +185,23 @@ public actor AuthStore {
             let data = try await withTaskCancellationHandler {
                 try await withThrowingTaskGroup(of: CredentialHelperResult.self) { group in
                     group.addTask {
-                        var output = Data()
-                        for try await byte in pipe.fileHandleForReading.bytes {
-                            guard output.count < 1_048_576 else {
-                                throw CredentialHelperError.outputTooLarge
+                        do {
+                            var output = Data()
+                            for try await byte in pipe.fileHandleForReading.bytes {
+                                guard output.count < 1_048_576 else {
+                                    throw CredentialHelperError.outputTooLarge
+                                }
+                                output.append(byte)
                             }
-                            output.append(byte)
+                            while process.isRunning {
+                                try Task.checkCancellation()
+                                try await Task.sleep(for: .milliseconds(10))
+                            }
+                            return .completed(output, process.terminationStatus)
+                        } catch {
+                            Self.terminateCredentialHelper(process, closing: pipe.fileHandleForReading)
+                            throw error
                         }
-                        while process.isRunning {
-                            try Task.checkCancellation()
-                            try await Task.sleep(for: .milliseconds(10))
-                        }
-                        return .completed(output, process.terminationStatus)
                     }
                     group.addTask {
                         try await Task.sleep(for: .seconds(30))
@@ -210,13 +216,12 @@ public actor AuthStore {
                         guard status == 0 else { throw CredentialHelperError.failed }
                         return output
                     case .timedOut:
-                        Self.terminateCredentialHelper(process)
-                        try? pipe.fileHandleForReading.close()
+                        Self.terminateCredentialHelper(process, closing: pipe.fileHandleForReading)
                         throw CredentialHelperError.timedOut
                     }
                 }
             } onCancel: {
-                Self.terminateCredentialHelper(process)
+                Self.terminateCredentialHelper(process, closing: pipe.fileHandleForReading)
             }
             return String(decoding: data, as: UTF8.self)
                 .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -237,14 +242,34 @@ public actor AuthStore {
             .replacingOccurrences(of: sentinelBang, with: "!")
     }
 
-    private static func terminateCredentialHelper(_ process: Process) {
-        guard process.isRunning else { return }
-        if kill(-process.processIdentifier, SIGTERM) != 0 {
-            process.terminate()
+    private nonisolated static func terminateCredentialHelper(
+        _ process: Process,
+        closing handle: FileHandle? = nil
+    ) {
+        try? handle?.close()
+        let identifier = process.processIdentifier
+        guard identifier > 0 else { return }
+        signalCredentialHelperTree(identifier, signal: SIGTERM)
+        signalCredentialHelperTree(identifier, signal: SIGKILL)
+    }
+
+    private nonisolated static func signalCredentialHelperTree(_ identifier: pid_t, signal: Int32) {
+        let descendants = credentialHelperDescendants(of: identifier)
+        _ = kill(-identifier, signal)
+        for child in descendants.reversed() { _ = kill(child, signal) }
+        _ = kill(identifier, signal)
+    }
+
+    private nonisolated static func credentialHelperDescendants(of identifier: pid_t) -> [pid_t] {
+        let count = proc_listchildpids(identifier, nil, 0)
+        guard count > 0 else { return [] }
+        var children = [pid_t](repeating: 0, count: Int(count))
+        let actualCount = children.withUnsafeMutableBytes { buffer in
+            proc_listchildpids(identifier, buffer.baseAddress, Int32(buffer.count))
         }
-        if process.isRunning {
-            _ = kill(-process.processIdentifier, SIGKILL)
-        }
+        guard actualCount > 0 else { return [] }
+        children.removeSubrange(min(Int(actualCount), children.count)..<children.count)
+        return children.filter { $0 > 0 }.flatMap { child in credentialHelperDescendants(of: child) + [child] }
     }
 }
 

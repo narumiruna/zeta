@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 public let zetaPluginProtocolVersion = 1
@@ -121,7 +122,7 @@ public actor PluginHost {
 
     public static func terminateActiveProcesses() {
         let processes = activeLock.withLock { Array(activeProcesses.values) }
-        for process in processes where process.isRunning { process.terminate() }
+        for process in processes { PluginProcessLifecycle.terminate(process) }
     }
 
     public struct Configuration: Sendable {
@@ -167,9 +168,11 @@ public actor PluginHost {
         process.standardOutput = stdout
         process.standardError = FileHandle.standardError
         try process.run()
+        PluginProcessLifecycle.prepare(process)
         Self.activeLock.withLock { Self.activeProcesses[process.processIdentifier] = process }
         self.process = process
         self.input = stdin.fileHandleForWriting
+        _ = fcntl(stdin.fileHandleForWriting.fileDescriptor, F_SETNOSIGPIPE, 1)
         self.output = stdout.fileHandleForReading
         do {
             let response = try await request(method: "initialize", payload: try JSONEncoder().encode(manifest))
@@ -196,16 +199,19 @@ public actor PluginHost {
         var encoded = try JSONEncoder().encode(envelope)
         guard encoded.count <= configuration.maximumRecordBytes else { throw PluginError.malformedMessage }
         encoded.append(0x0A)
-        try input.write(contentsOf: encoded)
         let line: Data
         do {
-            line = try await PluginLineRead.read(
-                from: output,
+            line = try await PluginRequestIO.exchange(
+                encoded,
+                process: process,
+                input: input,
+                output: output,
                 maximumBytes: configuration.maximumRecordBytes,
                 timeout: configuration.requestTimeout
             )
         } catch {
             await stop()
+            if Task.isCancelled { throw CancellationError() }
             throw error
         }
         let response = try JSONDecoder().decode(PluginEnvelope.self, from: line)
@@ -225,15 +231,12 @@ public actor PluginHost {
         self.process = nil
         self.input = nil
         self.output = nil
-        try? input?.close()
-        try? output?.close()
         if let process {
             Self.activeLock.withLock { Self.activeProcesses[process.processIdentifier] = nil }
-        }
-        if let process, process.isRunning {
-            process.terminate()
-            try? await Task.sleep(for: .milliseconds(100))
-            if process.isRunning { process.interrupt() }
+            PluginProcessLifecycle.terminate(process, closing: [input, output].compactMap { $0 })
+        } else {
+            try? input?.close()
+            try? output?.close()
         }
     }
 
@@ -279,79 +282,88 @@ public actor PluginHost {
 
 }
 
-private final class PluginLineRead: @unchecked Sendable {
-    private let lock = NSLock()
-    private let handle: FileHandle
-    private let maximumBytes: Int
-    private var buffer = Data()
-    private var continuation: CheckedContinuation<Data, Error>?
-    private var settled = false
-
-    private init(handle: FileHandle, maximumBytes: Int) {
-        self.handle = handle
-        self.maximumBytes = maximumBytes
-    }
-
-    static func read(
-        from handle: FileHandle,
+private enum PluginRequestIO {
+    static func exchange(
+        _ request: Data,
+        process: Process,
+        input: FileHandle,
+        output: FileHandle,
         maximumBytes: Int,
         timeout: Duration
     ) async throws -> Data {
-        let operation = PluginLineRead(handle: handle, maximumBytes: maximumBytes)
-        return try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { continuation in
-                operation.start(continuation: continuation, timeout: timeout)
+        try await withTaskCancellationHandler {
+            try await withThrowingTaskGroup(of: PluginRequestRace.self) { group in
+                group.addTask {
+                    try input.write(contentsOf: request)
+                    var line = Data()
+                    for try await byte in output.bytes {
+                        if byte == 0x0A {
+                            if line.last == 0x0D { line.removeLast() }
+                            return .response(line)
+                        }
+                        guard line.count < maximumBytes else {
+                            throw PluginError.malformedMessage
+                        }
+                        line.append(byte)
+                    }
+                    throw PluginError.crashed(process.isRunning ? -1 : process.terminationStatus)
+                }
+                group.addTask {
+                    try await Task.sleep(for: timeout)
+                    return .timedOut
+                }
+                guard let first = try await group.next() else {
+                    throw PluginError.crashed(-1)
+                }
+                group.cancelAll()
+                switch first {
+                case .response(let line):
+                    return line
+                case .timedOut:
+                    PluginProcessLifecycle.terminate(process, closing: [input, output])
+                    throw PluginError.timedOut
+                }
             }
         } onCancel: {
-            operation.finish(.failure(CancellationError()))
+            PluginProcessLifecycle.terminate(process, closing: [input, output])
         }
     }
+}
 
-    private func start(
-        continuation: CheckedContinuation<Data, Error>,
-        timeout: Duration
-    ) {
-        lock.withLock { self.continuation = continuation }
-        handle.readabilityHandler = { [weak self] handle in
-            guard let self else { return }
-            let data = handle.availableData
-            guard !data.isEmpty else {
-                self.finish(.failure(PluginError.crashed(-1)))
-                return
-            }
-            self.consume(data)
-        }
-        Task { [weak self] in
-            try? await Task.sleep(for: timeout)
-            self?.finish(.failure(PluginError.timedOut))
-        }
+private enum PluginRequestRace: Sendable {
+    case response(Data)
+    case timedOut
+}
+
+private enum PluginProcessLifecycle {
+    static func prepare(_ process: Process) {
+        _ = setpgid(process.processIdentifier, process.processIdentifier)
     }
 
-    private func consume(_ data: Data) {
-        let result: Result<Data, Error>? = lock.withLock {
-            guard !settled else { return nil }
-            buffer.append(data)
-            if buffer.count > maximumBytes {
-                return .failure(PluginError.malformedMessage)
-            }
-            guard let newline = buffer.firstIndex(of: 0x0A) else { return nil }
-            var line = Data(buffer[..<newline])
-            if line.last == 0x0D { line.removeLast() }
-            return .success(line)
-        }
-        if let result { finish(result) }
+    static func terminate(_ process: Process, closing handles: [FileHandle] = []) {
+        for handle in handles { try? handle.close() }
+        let identifier = process.processIdentifier
+        guard identifier > 0 else { return }
+        signalTree(identifier, signal: SIGTERM)
+        signalTree(identifier, signal: SIGKILL)
     }
 
-    fileprivate func finish(_ result: Result<Data, Error>) {
-        let callback: CheckedContinuation<Data, Error>? = lock.withLock {
-            guard !settled else { return nil }
-            settled = true
-            let value = continuation
-            continuation = nil
-            return value
+    private static func signalTree(_ identifier: pid_t, signal: Int32) {
+        let descendants = descendants(of: identifier)
+        _ = kill(-identifier, signal)
+        for child in descendants.reversed() { _ = kill(child, signal) }
+        _ = kill(identifier, signal)
+    }
+
+    private static func descendants(of identifier: pid_t) -> [pid_t] {
+        let count = proc_listchildpids(identifier, nil, 0)
+        guard count > 0 else { return [] }
+        var children = [pid_t](repeating: 0, count: Int(count))
+        let actualCount = children.withUnsafeMutableBytes { buffer in
+            proc_listchildpids(identifier, buffer.baseAddress, Int32(buffer.count))
         }
-        guard let callback else { return }
-        handle.readabilityHandler = nil
-        callback.resume(with: result)
+        guard actualCount > 0 else { return [] }
+        children.removeSubrange(min(Int(actualCount), children.count)..<children.count)
+        return children.filter { $0 > 0 }.flatMap { child in descendants(of: child) + [child] }
     }
 }

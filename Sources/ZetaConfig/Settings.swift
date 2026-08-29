@@ -95,8 +95,10 @@ public actor SettingsStore {
     public func current() -> Settings { settings }
 
     public func modify(_ body: @Sendable (inout Settings) -> Void) throws {
-        body(&settings)
-        try Self.write(settings, to: paths.globalSettings)
+        var candidate = settings
+        body(&candidate)
+        try Self.write(candidate, to: paths.globalSettings)
+        settings = candidate
     }
 
     /// Returns after all settings accepted by this actor are durable.

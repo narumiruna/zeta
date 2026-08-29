@@ -69,7 +69,6 @@ public enum SessionSearch {
             let task = Task {
                 do {
                     let needle = query.trimmingCharacters(in: .whitespacesAndNewlines)
-                        .lowercased()
                     guard !needle.isEmpty,
                         options.limit > 0,
                         options.entryTypes?.isEmpty != true
@@ -91,7 +90,7 @@ public enum SessionSearch {
                                 continue
                             }
                             let haystack = document.text + "\n" + (document.label ?? "")
-                            guard let range = haystack.lowercased().range(of: needle)
+                            guard let range = haystack.range(of: needle, options: .caseInsensitive)
                             else {
                                 continue
                             }

@@ -9,15 +9,22 @@ public struct SearchMatch: Sendable, Equatable {
 public struct SearchTools: Sendable {
     public let workingDirectory: URL
     private let useExternalCommands: Bool
+    private let executableDirectory: URL?
 
     public init(workingDirectory: URL) {
         self.workingDirectory = workingDirectory.standardizedFileURL
         useExternalCommands = true
+        executableDirectory = nil
     }
 
-    init(workingDirectory: URL, useExternalCommands: Bool) {
+    init(
+        workingDirectory: URL,
+        useExternalCommands: Bool,
+        executableDirectory: URL? = nil
+    ) {
         self.workingDirectory = workingDirectory.standardizedFileURL
         self.useExternalCommands = useExternalCommands
+        self.executableDirectory = executableDirectory
     }
 
     public func grep(
@@ -176,8 +183,13 @@ public struct SearchTools: Sendable {
     ) async throws -> (status: Int32, output: String) {
         guard useExternalCommands else { return (127, "External search command disabled") }
         let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        process.arguments = [executable] + arguments
+        if let executableDirectory {
+            process.executableURL = executableDirectory.appendingPathComponent(executable)
+            process.arguments = arguments
+        } else {
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+            process.arguments = [executable] + arguments
+        }
         process.currentDirectoryURL = workingDirectory
         let pipe = Pipe()
         process.standardOutput = pipe
@@ -187,9 +199,28 @@ public struct SearchTools: Sendable {
         } catch {
             return (127, String(describing: error))
         }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
-        return (process.terminationStatus, String(decoding: data, as: UTF8.self))
+        ToolProcessLifecycle.prepare(process)
+        return try await withTaskCancellationHandler {
+            do {
+                try Task.checkCancellation()
+                var data = Data()
+                for try await byte in pipe.fileHandleForReading.bytes {
+                    data.append(byte)
+                }
+                while process.isRunning {
+                    try Task.checkCancellation()
+                    try await Task.sleep(for: .milliseconds(10))
+                }
+                try Task.checkCancellation()
+                return (process.terminationStatus, String(decoding: data, as: UTF8.self))
+            } catch {
+                ToolProcessLifecycle.terminate(process, closing: [pipe.fileHandleForReading])
+                if Task.isCancelled { throw CancellationError() }
+                throw error
+            }
+        } onCancel: {
+            ToolProcessLifecycle.terminate(process, closing: [pipe.fileHandleForReading])
+        }
     }
 
     private func globRegex(_ pattern: String) -> String {

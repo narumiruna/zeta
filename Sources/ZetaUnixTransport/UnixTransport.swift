@@ -47,15 +47,37 @@ public final class UnixByteTransport: ByteTransport, @unchecked Sendable {
     private let descriptor: Int32
     private let handlers: ByteTransportHandlers
     private let maximumPendingBytes: Int
-    private let queue = DispatchQueue(label: "zeta.unix.client.write")
+    private let queue: DispatchQueue
     private let lock = NSLock()
     private var pendingBytes = 0
     private var closed = false
+    private var descriptorClosed = false
+    private var notifyOnClose = false
+    private var closeWaiters: [CheckedContinuation<Void, Never>] = []
     private var readSource: DispatchSourceRead?
 
-    public init(path: String, maximumPendingBytes: Int = 64 * 1_024 * 1_024, handlers: ByteTransportHandlers) throws {
+    public convenience init(
+        path: String,
+        maximumPendingBytes: Int = 64 * 1_024 * 1_024,
+        handlers: ByteTransportHandlers
+    ) throws {
+        try self.init(
+            path: path,
+            maximumPendingBytes: maximumPendingBytes,
+            handlers: handlers,
+            queue: DispatchQueue(label: "zeta.unix.client.lifecycle")
+        )
+    }
+
+    init(
+        path: String,
+        maximumPendingBytes: Int,
+        handlers: ByteTransportHandlers,
+        queue: DispatchQueue
+    ) throws {
         self.handlers = handlers
         self.maximumPendingBytes = maximumPendingBytes
+        self.queue = queue
         descriptor = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
         guard descriptor >= 0 else { throw UnixTransportError.system("socket", errno) }
         do {
@@ -88,55 +110,98 @@ public final class UnixByteTransport: ByteTransport, @unchecked Sendable {
                     return
                 }
                 defer { self.lock.withLock { self.pendingBytes -= copy.count } }
+                guard !self.lock.withLock({ self.closed }) else {
+                    continuation.resume(throwing: UnixTransportError.closed)
+                    return
+                }
                 do {
                     try Self.writeAll(copy, to: self.descriptor)
                     continuation.resume()
                 } catch {
-                    continuation.resume(throwing: error)
-                    self.fail(error)
+                    let closing = self.lock.withLock { self.closed }
+                    continuation.resume(throwing: closing ? UnixTransportError.closed : error)
+                    if !closing { self.fail(error) }
                 }
             }
         }
     }
 
-    public func close() async { closeSync(notify: false) }
+    public func close() async {
+        await withCheckedContinuation { continuation in
+            beginClose(notify: false, waiter: continuation)
+        }
+    }
+
+    var pendingByteCount: Int { lock.withLock { pendingBytes } }
+    var isClosed: Bool { lock.withLock { closed } }
 
     private func startReading() {
-        let source = DispatchSource.makeReadSource(fileDescriptor: descriptor, queue: .global())
+        let source = DispatchSource.makeReadSource(fileDescriptor: descriptor, queue: queue)
         source.setEventHandler { [weak self] in
-            guard let self else { return }
+            guard let self, !self.lock.withLock({ self.closed }) else { return }
             var bytes = [UInt8](repeating: 0, count: 64 * 1_024)
             let count = Darwin.read(self.descriptor, &bytes, bytes.count)
             if count > 0 {
                 self.handlers.onData(Data(bytes.prefix(count)))
             } else if count == 0 {
-                self.closeSync(notify: true)
+                self.beginClose(notify: true)
             } else if errno != EINTR && errno != EAGAIN {
                 self.fail(UnixTransportError.system("read", errno))
             }
         }
-        source.setCancelHandler { [descriptor] in Darwin.close(descriptor) }
+        lock.withLock { readSource = source }
         source.resume()
-        readSource = source
     }
 
     private func fail(_ error: Error) {
         handlers.onError(error)
-        closeSync(notify: false)
-    }
-    private func closeSync(notify: Bool) {
-        let shouldClose = lock.withLock {
-            if closed { return false }
-            closed = true
-            return true
-        }
-        guard shouldClose else { return }
-        readSource?.cancel()
-        readSource = nil
-        if notify { handlers.onClose() }
+        beginClose(notify: false)
     }
 
-    private static func writeAll(_ data: Data, to descriptor: Int32) throws {
+    private func beginClose(
+        notify: Bool,
+        waiter: CheckedContinuation<Void, Never>? = nil
+    ) {
+        var closeNow = false
+        var alreadyClosed = false
+        var source: DispatchSourceRead?
+        lock.withLock {
+            if descriptorClosed {
+                alreadyClosed = true
+            } else {
+                if let waiter { closeWaiters.append(waiter) }
+                if !closed {
+                    closed = true
+                    notifyOnClose = notify
+                    source = readSource
+                    closeNow = true
+                }
+            }
+        }
+        if alreadyClosed {
+            waiter?.resume()
+            return
+        }
+        guard closeNow else { return }
+        _ = Darwin.shutdown(descriptor, SHUT_RDWR)
+        source?.cancel()
+        queue.async { [self] in finishClose() }
+    }
+
+    private func finishClose() {
+        Darwin.close(descriptor)
+        let state = lock.withLock {
+            descriptorClosed = true
+            readSource = nil
+            let waiters = closeWaiters
+            closeWaiters.removeAll()
+            return (notifyOnClose, waiters)
+        }
+        if state.0 { handlers.onClose() }
+        state.1.forEach { $0.resume() }
+    }
+
+    fileprivate static func writeAll(_ data: Data, to descriptor: Int32) throws {
         try data.withUnsafeBytes { raw in
             var offset = 0
             while offset < raw.count {
@@ -162,9 +227,12 @@ public func createUnixTransportFactory(path: String, maximumPendingBytes: Int = 
 public final class UnixServerConnection: ServerByteConnection, @unchecked Sendable {
     public let id = UUID().uuidString
     private let descriptor: Int32
-    private let queue = DispatchQueue(label: "zeta.unix.server.write")
+    private let queue = DispatchQueue(label: "zeta.unix.server.lifecycle")
     private let lock = NSLock()
     private var closed = false
+    private var descriptorClosed = false
+    private var notifyOnClose = false
+    private var closeWaiters: [CheckedContinuation<Void, Never>] = []
     private var readSource: DispatchSourceRead?
     private var dataHandler: (@Sendable (Data) -> Void)?
     private var closeHandler: (@Sendable () -> Void)?
@@ -172,24 +240,29 @@ public final class UnixServerConnection: ServerByteConnection, @unchecked Sendab
     fileprivate init(descriptor: Int32) { self.descriptor = descriptor }
 
     public func start(onData: @escaping @Sendable (Data) -> Void, onClose: @escaping @Sendable () -> Void) {
-        dataHandler = onData
-        closeHandler = onClose
-        let source = DispatchSource.makeReadSource(fileDescriptor: descriptor, queue: .global())
+        let source: DispatchSourceRead? = lock.withLock {
+            guard !closed, readSource == nil else { return nil }
+            let source = DispatchSource.makeReadSource(fileDescriptor: descriptor, queue: queue)
+            dataHandler = onData
+            closeHandler = onClose
+            readSource = source
+            return source
+        }
+        guard let source else { return }
         source.setEventHandler { [weak self] in
-            guard let self else { return }
+            guard let self, !self.lock.withLock({ self.closed }) else { return }
             var bytes = [UInt8](repeating: 0, count: 64 * 1_024)
             let count = Darwin.read(self.descriptor, &bytes, bytes.count)
             if count > 0 {
-                self.dataHandler?(Data(bytes.prefix(count)))
+                let handler = self.lock.withLock { self.dataHandler }
+                handler?(Data(bytes.prefix(count)))
             } else if count == 0 {
-                self.closeSync(notify: true)
+                self.beginClose(notify: true)
             } else if errno != EINTR && errno != EAGAIN {
-                self.closeSync(notify: true)
+                self.beginClose(notify: true)
             }
         }
-        source.setCancelHandler { [descriptor] in Darwin.close(descriptor) }
         source.resume()
-        readSource = source
     }
 
     public func send(_ bytes: Data) async throws {
@@ -197,44 +270,69 @@ public final class UnixServerConnection: ServerByteConnection, @unchecked Sendab
         guard !lock.withLock({ closed }) else { throw UnixTransportError.closed }
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             queue.async {
+                guard !self.lock.withLock({ self.closed }) else {
+                    continuation.resume(throwing: UnixTransportError.closed)
+                    return
+                }
                 do {
-                    try copy.withUnsafeBytes { raw in
-                        var offset = 0
-                        while offset < raw.count {
-                            let count = Darwin.write(
-                                self.descriptor, raw.baseAddress!.advanced(by: offset), raw.count - offset)
-                            if count > 0 {
-                                offset += count
-                            } else if count < 0 && errno == EINTR {
-                                continue
-                            } else {
-                                throw UnixTransportError.system("write", errno)
-                            }
-                        }
-                    }
+                    try UnixByteTransport.writeAll(copy, to: self.descriptor)
                     continuation.resume()
                 } catch {
-                    continuation.resume(throwing: error)
-                    self.closeSync(notify: true)
+                    let closing = self.lock.withLock { self.closed }
+                    continuation.resume(throwing: closing ? UnixTransportError.closed : error)
+                    if !closing { self.beginClose(notify: true) }
                 }
             }
         }
     }
 
-    public func close() async { closeSync(notify: false) }
-    private func closeSync(notify: Bool) {
-        let changed = lock.withLock {
-            if closed { return false }
-            closed = true
-            return true
+    public func close() async {
+        await withCheckedContinuation { continuation in
+            beginClose(notify: false, waiter: continuation)
         }
-        guard changed else { return }
-        shutdown(descriptor, SHUT_RDWR)
-        let source = readSource
+    }
+
+    private func beginClose(
+        notify: Bool,
+        waiter: CheckedContinuation<Void, Never>? = nil
+    ) {
+        var closeNow = false
+        var alreadyClosed = false
+        var source: DispatchSourceRead?
+        lock.withLock {
+            if descriptorClosed {
+                alreadyClosed = true
+            } else {
+                if let waiter { closeWaiters.append(waiter) }
+                if !closed {
+                    closed = true
+                    notifyOnClose = notify
+                    source = readSource
+                    closeNow = true
+                }
+            }
+        }
+        if alreadyClosed {
+            waiter?.resume()
+            return
+        }
+        guard closeNow else { return }
+        _ = Darwin.shutdown(descriptor, SHUT_RDWR)
         source?.cancel()
-        readSource = nil
-        if source == nil { Darwin.close(descriptor) }
-        if notify { closeHandler?() }
+        queue.async { [self] in finishClose() }
+    }
+
+    private func finishClose() {
+        Darwin.close(descriptor)
+        let state = lock.withLock {
+            descriptorClosed = true
+            readSource = nil
+            let waiters = closeWaiters
+            closeWaiters.removeAll()
+            return (notifyOnClose, closeHandler, waiters)
+        }
+        if state.0 { state.1?() }
+        state.2.forEach { $0.resume() }
     }
 }
 

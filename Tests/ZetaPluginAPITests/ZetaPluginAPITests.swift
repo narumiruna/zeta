@@ -1,3 +1,4 @@
+import Darwin
 import XCTest
 
 @testable import ZetaPluginAPI
@@ -148,9 +149,133 @@ final class ZetaPluginAPITests: XCTestCase {
         await host.stop()
     }
 
+    func testPluginRequestTimeoutIncludesBlockedStdinWrite() async throws {
+        let fixture = try makeBackpressuredPluginFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+        var configuration = PluginHost.Configuration()
+        configuration.requestTimeout = .milliseconds(500)
+        configuration.maximumRecordBytes = 8 * 1_024 * 1_024
+        let host = PluginHost(configuration: configuration)
+        try await host.start(manifest: fixture.manifest, baseDirectory: fixture.directory, trusted: true)
+
+        let clock = ContinuousClock()
+        let start = clock.now
+        do {
+            _ = try await host.request(
+                method: "blocked",
+                payload: Data(repeating: 0x61, count: 4 * 1_024 * 1_024)
+            )
+            XCTFail("Expected timeout")
+        } catch PluginError.timedOut {}
+        XCTAssertLessThan(start.duration(to: clock.now), .seconds(2))
+
+        let pid = try readPID(fixture.pidFile)
+        try await waitUntil { !processExists(pid) }
+    }
+
+    func testCancellingBlockedPluginWriteTerminatesProcess() async throws {
+        let fixture = try makeBackpressuredPluginFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+        var configuration = PluginHost.Configuration()
+        configuration.requestTimeout = .seconds(10)
+        configuration.maximumRecordBytes = 8 * 1_024 * 1_024
+        let host = PluginHost(configuration: configuration)
+        try await host.start(manifest: fixture.manifest, baseDirectory: fixture.directory, trusted: true)
+
+        let request = Task {
+            try await host.request(
+                method: "blocked",
+                payload: Data(repeating: 0x63, count: 4 * 1_024 * 1_024)
+            )
+        }
+        try await Task.sleep(for: .milliseconds(20))
+        let clock = ContinuousClock()
+        let start = clock.now
+        request.cancel()
+        do {
+            _ = try await request.value
+            XCTFail("Expected cancellation")
+        } catch is CancellationError {}
+        XCTAssertLessThan(start.duration(to: clock.now), .seconds(2))
+
+        let pid = try readPID(fixture.pidFile)
+        try await waitUntil { !processExists(pid) }
+    }
+
+    func testStopCanTerminatePluginWithBlockedStdinWrite() async throws {
+        let fixture = try makeBackpressuredPluginFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+        var configuration = PluginHost.Configuration()
+        configuration.requestTimeout = .seconds(10)
+        configuration.maximumRecordBytes = 8 * 1_024 * 1_024
+        let host = PluginHost(configuration: configuration)
+        try await host.start(manifest: fixture.manifest, baseDirectory: fixture.directory, trusted: true)
+
+        let request = Task {
+            try await host.request(
+                method: "blocked",
+                payload: Data(repeating: 0x62, count: 4 * 1_024 * 1_024)
+            )
+        }
+        try await Task.sleep(for: .milliseconds(20))
+        let clock = ContinuousClock()
+        let start = clock.now
+        await host.stop()
+        XCTAssertLessThan(start.duration(to: clock.now), .seconds(2))
+        request.cancel()
+        _ = await request.result
+
+        let pid = try readPID(fixture.pidFile)
+        try await waitUntil { !processExists(pid) }
+    }
+
     func testManifestRequiresIdentityAndExecutable() {
         XCTAssertThrowsError(try PluginManifest(name: "", version: "1", executable: "", capabilities: []).validate())
     }
+}
+
+private func makeBackpressuredPluginFixture() throws -> (
+    directory: URL,
+    manifest: PluginManifest,
+    pidFile: URL
+) {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    let script = directory.appendingPathComponent("blocked.py")
+    let source = #"""
+        #!/usr/bin/env python3
+        import base64,json,os,sys,time
+        open("plugin.pid", "w").write(str(os.getpid()))
+        request=json.loads(sys.stdin.readline())
+        response={"id":request.get("id"),"type":"response","generation":request["generation"],"payload":base64.b64encode(b"[]").decode()}
+        print(json.dumps(response,separators=(',',':')),flush=True)
+        open("initialized", "w").close()
+        time.sleep(30)
+        """#
+    try Data(source.utf8).write(to: script)
+    try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: script.path)
+    return (
+        directory,
+        PluginManifest(
+            name: "blocked",
+            version: "1",
+            executable: script.lastPathComponent,
+            capabilities: []
+        ),
+        directory.appendingPathComponent("plugin.pid")
+    )
+}
+
+private func readPID(_ url: URL) throws -> pid_t {
+    pid_t(
+        try XCTUnwrap(
+            Int32(String(contentsOf: url, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines))
+        )
+    )
+}
+
+private func processExists(_ identifier: pid_t) -> Bool {
+    kill(identifier, 0) == 0 || errno == EPERM
 }
 
 private func waitUntil(

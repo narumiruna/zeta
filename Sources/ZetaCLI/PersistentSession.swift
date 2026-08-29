@@ -84,6 +84,8 @@ actor PersistentSessionController {
     }
 
     func currentEntries() async -> [SessionEntry] { await manager.allEntries() }
+    func currentTree() async -> [SessionTreeNode] { await manager.tree() }
+    func currentLeafID() async -> String? { await manager.leaf()?.base.id }
     func currentMessages() async throws -> [Message] { try await manager.context().messages }
     func currentFile() async -> URL? { await manager.file }
     func exportSnapshot() async -> (header: SessionHeader, entries: [SessionEntry], leafID: String?) {
@@ -133,6 +135,18 @@ actor PersistentSessionController {
                 fromHook: false
             )
         )
+    }
+
+    func recordModel(_ model: Model) async throws {
+        let base = SessionEntryBase(
+            id: String(UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(8)).lowercased(),
+            parentId: await manager.leaf()?.base.id,
+            timestamp: ISO8601DateFormatter().string(from: Date())
+        )
+        try await manager.append(
+            .modelChange(base, provider: model.provider, modelID: model.id)
+        )
+        try await manager.materialize()
     }
 
     func recordThinkingLevel(_ level: ThinkingLevel) async throws {
@@ -226,12 +240,39 @@ actor PersistentSessionController {
         if FileManager.default.fileExists(atPath: direct.path) {
             return try SessionManager.load(file: direct)
         }
-        let matches = ((try? FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)) ?? [])
-            .filter { $0.pathExtension == "jsonl" && $0.lastPathComponent.contains(value) }
-        guard let selected = matches.sorted(by: { $0.lastPathComponent > $1.lastPathComponent }).first else {
+        let sessions =
+            ((try? FileManager.default.contentsOfDirectory(
+                at: root,
+                includingPropertiesForKeys: nil
+            )) ?? [])
+            .filter { $0.pathExtension == "jsonl" }
+            .sorted { $0.lastPathComponent > $1.lastPathComponent }
+        let identified = sessions.compactMap { file in
+            sessionID(in: file).map { (file: file, id: $0) }
+        }
+        guard
+            let selected = identified.first(where: { $0.id == value })
+                ?? identified.first(where: { $0.id.hasPrefix(value) })
+        else {
             throw CocoaError(.fileNoSuchFile)
         }
-        return try SessionManager.load(file: selected)
+        return try SessionManager.load(file: selected.file)
+    }
+
+    private static func sessionID(in file: URL) -> String? {
+        guard let data = try? Data(contentsOf: file), !data.isEmpty else { return nil }
+        var decoder = StrictJSONLDecoder()
+        for record in decoder.push(data) + decoder.finish() {
+            guard
+                let object = try? JSONSerialization.jsonObject(with: record) as? [String: Any],
+                object["type"] as? String == "session",
+                let id = object["id"] as? String
+            else {
+                continue
+            }
+            return id
+        }
+        return nil
     }
 
     private static func latestSession(in root: URL) -> URL? {

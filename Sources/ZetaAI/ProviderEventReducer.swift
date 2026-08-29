@@ -2,6 +2,8 @@ import Foundation
 import ZetaCore
 
 public struct ProviderEventReducer: Sendable {
+    static let maximumProviderContentIndex = 4_095
+
     public private(set) var partial: AssistantMessage
     private let model: Model
     private var toolArgumentBuffers: [Int: String] = [:]
@@ -31,6 +33,7 @@ public struct ProviderEventReducer: Sendable {
             throw ProviderError.invalidResponse(error)
         }
         let type = object.string("type") ?? eventName ?? ""
+        try validateProviderContentIndexes(object)
         var events = consumeGoogleParts(object)
         if type == "response.output_item.added" {
             events += startOpenAIResponseToolCall(object)
@@ -42,11 +45,11 @@ public struct ProviderEventReducer: Sendable {
             let index = object.integer("index") ?? partial.content.count
             switch block.string("type") {
             case "text":
-                ensureIndex(index, block: .text(text: ""))
+                try ensureIndex(index, block: .text(text: ""))
                 openContentBlockIndices.insert(index)
                 events.append(.textStart(index: index, partial: partial))
             case "thinking":
-                ensureIndex(
+                try ensureIndex(
                     index,
                     block: .thinking(
                         text: block.string("thinking") ?? "",
@@ -56,7 +59,7 @@ public struct ProviderEventReducer: Sendable {
                 openContentBlockIndices.insert(index)
                 events.append(.thinkingStart(index: index, partial: partial))
             case "redacted_thinking":
-                ensureIndex(
+                try ensureIndex(
                     index,
                     block: .thinking(
                         text: "[Reasoning redacted]",
@@ -71,7 +74,7 @@ public struct ProviderEventReducer: Sendable {
                     id: block.string("id") ?? "call",
                     name: block.string("name") ?? "tool"
                 )
-                ensureIndex(index, block: .toolCall(call))
+                try ensureIndex(index, block: .toolCall(call))
                 toolArgumentBuffers[index] = ""
                 events.append(.toolCallStart(index: index, partial: partial))
             default:
@@ -124,7 +127,7 @@ public struct ProviderEventReducer: Sendable {
             ?? (type.contains("function_call_arguments.delta")
                 ? object.string("delta") : nil)
         if let toolDelta {
-            let index = toolContentIndex(for: object, type: type, events: &events)
+            let index = try toolContentIndex(for: object, type: type, events: &events)
             toolArgumentBuffers[index, default: ""] += toolDelta
             updateToolArguments(index)
             events.append(
@@ -133,7 +136,7 @@ public struct ProviderEventReducer: Sendable {
         }
 
         if type.contains("function_call_arguments.done") {
-            let index = toolContentIndex(for: object, type: type, events: &events)
+            let index = try toolContentIndex(for: object, type: type, events: &events)
             if let arguments = object.string("arguments") {
                 let previous = toolArgumentBuffers[index] ?? ""
                 toolArgumentBuffers[index] = arguments
@@ -215,6 +218,51 @@ public struct ProviderEventReducer: Sendable {
         }
         updateUsage(object)
         return events
+    }
+
+    private func validateProviderContentIndexes(
+        _ object: OrderedJSONObject
+    ) throws {
+        try validateProviderContentIndex(object["index"], field: "index")
+        try validateProviderContentIndex(
+            object["output_index"],
+            field: "output_index"
+        )
+        guard
+            case .array(let toolCalls)? = object.path([
+                "choices", "0", "delta", "tool_calls",
+            ])
+        else {
+            return
+        }
+        guard toolCalls.count <= Self.maximumProviderContentIndex + 1 else {
+            throw ProviderError.invalidResponse(
+                "Provider tool-call count exceeds the content index limit"
+            )
+        }
+        for value in toolCalls {
+            guard case .object(let toolCall) = value else { continue }
+            try validateProviderContentIndex(
+                toolCall["index"],
+                field: "tool_calls.index"
+            )
+        }
+    }
+
+    private func validateProviderContentIndex(
+        _ value: JSONValue?,
+        field: String
+    ) throws {
+        guard let value else { return }
+        guard case .number(let number) = value,
+            let index = number.safeIntegerValue,
+            (0...Int64(Self.maximumProviderContentIndex)).contains(index)
+        else {
+            throw ProviderError.invalidResponse(
+                "Provider \(field) must be an integer from 0 through "
+                    + "\(Self.maximumProviderContentIndex)"
+            )
+        }
     }
 
     private mutating func consumeGoogleParts(
@@ -417,7 +465,7 @@ public struct ProviderEventReducer: Sendable {
         for object: OrderedJSONObject,
         type: String,
         events: inout [AssistantEvent]
-    ) -> Int {
+    ) throws -> Int {
         if type.hasPrefix("response."), let outputIndex = object.integer("output_index") {
             if let contentIndex = openAIResponseContentIndices[outputIndex] {
                 return contentIndex
@@ -439,7 +487,7 @@ public struct ProviderEventReducer: Sendable {
                 id: object.string("call_id") ?? "call-\(index)",
                 name: object.string("name") ?? "tool"
             )
-            ensureIndex(index, block: .toolCall(call))
+            try ensureIndex(index, block: .toolCall(call))
             toolArgumentBuffers[index] = ""
             events.append(.toolCallStart(index: index, partial: partial))
         }
@@ -653,9 +701,23 @@ public struct ProviderEventReducer: Sendable {
         }
     }
 
-    private mutating func ensureIndex(_ index: Int, block: ContentBlock) {
-        while partial.content.count < index { partial.content.append(.text(text: "")) }
-        if partial.content.count == index { partial.content.append(block) } else { partial.content[index] = block }
+    private mutating func ensureIndex(
+        _ index: Int,
+        block: ContentBlock
+    ) throws {
+        guard (0...Self.maximumProviderContentIndex).contains(index) else {
+            throw ProviderError.invalidResponse(
+                "Provider content index is outside the supported range"
+            )
+        }
+        while partial.content.count < index {
+            partial.content.append(.text(text: ""))
+        }
+        if partial.content.count == index {
+            partial.content.append(block)
+        } else {
+            partial.content[index] = block
+        }
     }
 
     private mutating func updateToolArguments(_ index: Int) {

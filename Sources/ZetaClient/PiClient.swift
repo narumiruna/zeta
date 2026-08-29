@@ -49,6 +49,11 @@ public actor PiClient {
         let token: UUID
         let task: Task<Void, Error>
     }
+    private struct HandshakeOperation {
+        let generation: UInt64
+        let continuation: CheckedContinuation<ServerSnapshot, Error>
+        let timeoutTask: Task<Void, Never>
+    }
     private struct AttachmentOperation {
         let token: UUID
         let task: Task<Void, Error>
@@ -70,7 +75,7 @@ public actor PiClient {
     private var transport: (any ByteTransport)?
     private var decoder: ServerMessageDecoder?
     private var pending: [String: CheckedContinuation<ResponseEnvelope, Error>] = [:]
-    private var handshake: CheckedContinuation<ServerSnapshot, Error>?
+    private var handshake: HandshakeOperation?
     private var leases: [String: LeaseBook] = [:]
     private var sessionSnapshots: [String: SessionSnapshot] = [:]
     private var snapshotValue: ServerSnapshot?
@@ -79,9 +84,26 @@ public actor PiClient {
     private var eventListeners: [UUID: @Sendable (ServerEvent) -> Void] = [:]
     private let factory: ByteTransportFactory
     private let options: FrameDecoderOptions
+    private let handshakeTimeout: Duration
 
-    public init(maximumFrameLength: Int = 16 * 1_024 * 1_024, transportFactory: @escaping ByteTransportFactory) throws {
+    public init(
+        maximumFrameLength: Int = 16 * 1_024 * 1_024,
+        transportFactory: @escaping ByteTransportFactory
+    ) throws {
+        try self.init(
+            maximumFrameLength: maximumFrameLength,
+            handshakeTimeout: .seconds(5),
+            transportFactory: transportFactory
+        )
+    }
+
+    public init(
+        maximumFrameLength: Int = 16 * 1_024 * 1_024,
+        handshakeTimeout: Duration,
+        transportFactory: @escaping ByteTransportFactory
+    ) throws {
         options = FrameDecoderOptions(maximumFrameLength: maximumFrameLength)
+        self.handshakeTimeout = handshakeTimeout
         factory = transportFactory
     }
 
@@ -90,28 +112,46 @@ public actor PiClient {
     public func sessionSnapshot(_ id: String) -> SessionSnapshot? { sessionSnapshots[id] }
 
     public func connect() async throws {
+        try Task.checkCancellation()
         guard !disposed else { throw PiClientError.disposed }
-        if stateValue == .connected { return }
-        if stateValue == .connecting, let operation = connectionOperation {
-            try await operation.task.value
+        let operation: ConnectionOperation
+        if stateValue == .connected {
             return
+        } else if stateValue == .connecting, let current = connectionOperation {
+            operation = current
+        } else {
+            let nextDecoder = try ServerMessageDecoder(options: options)
+            generation &+= 1
+            let activeGeneration = generation
+            decoder = nextDecoder
+            stateValue = .connecting
+            let token = UUID()
+            let task = Task { try await self.performConnection(generation: activeGeneration) }
+            operation = ConnectionOperation(token: token, task: task)
+            connectionOperation = operation
         }
-
-        let nextDecoder = try ServerMessageDecoder(options: options)
-        generation &+= 1
-        let activeGeneration = generation
-        decoder = nextDecoder
-        stateValue = .connecting
-        let token = UUID()
-        let task = Task { try await self.performConnection(generation: activeGeneration) }
-        connectionOperation = ConnectionOperation(token: token, task: task)
         do {
-            try await task.value
-            clearConnectionOperation(token)
+            try await waitForConnection(operation)
+            clearConnectionOperation(operation.token)
         } catch {
-            clearConnectionOperation(token)
+            clearConnectionOperation(operation.token)
             throw error
         }
+    }
+
+    private func waitForConnection(_ operation: ConnectionOperation) async throws {
+        try await withTaskCancellationHandler {
+            try Task.checkCancellation()
+            try await operation.task.value
+        } onCancel: {
+            Task { await self.cancelConnection(operation.token) }
+        }
+    }
+
+    private func cancelConnection(_ token: UUID) async {
+        guard let operation = connectionOperation, operation.token == token else { return }
+        operation.task.cancel()
+        await fail(CancellationError(), close: true)
     }
 
     private func performConnection(generation activeGeneration: UInt64) async throws {
@@ -130,8 +170,21 @@ public actor PiClient {
             }
             self.transport = transport
             let hello = try encodeClientMessage(.hello(try ClientHello()), options: options)
+            let timeout = handshakeTimeout
             let snapshot = try await withCheckedThrowingContinuation { continuation in
-                handshake = continuation
+                let timeoutTask = Task.detached { [weak self] in
+                    do {
+                        try await Task.sleep(for: timeout)
+                    } catch {
+                        return
+                    }
+                    await self?.handshakeTimedOut(generation: activeGeneration)
+                }
+                handshake = HandshakeOperation(
+                    generation: activeGeneration,
+                    continuation: continuation,
+                    timeoutTask: timeoutTask
+                )
                 Task { await self.sendHello(hello, using: transport, generation: activeGeneration) }
             }
             guard generation == activeGeneration, stateValue == .connecting else {
@@ -153,6 +206,14 @@ public actor PiClient {
             guard generation == activeGeneration else { return }
             await fail(error, close: true)
         }
+    }
+
+    private func handshakeTimedOut(generation timedOutGeneration: UInt64) async {
+        guard handshake?.generation == timedOutGeneration else { return }
+        await fail(
+            PiClientError.protocolFailure("Server handshake timed out"),
+            close: true
+        )
     }
 
     private func clearConnectionOperation(_ token: UUID) {
@@ -407,16 +468,17 @@ public actor PiClient {
 
     private func handle(_ message: ServerMessage) {
         if let handshake {
+            self.handshake = nil
+            handshake.timeoutTask.cancel()
             switch message {
             case .hello(let value):
-                self.handshake = nil
-                handshake.resume(returning: value.snapshot)
+                handshake.continuation.resume(returning: value.snapshot)
             case .helloError(let error):
-                self.handshake = nil
-                handshake.resume(throwing: PiClientError.server(error))
+                handshake.continuation.resume(throwing: PiClientError.server(error))
             default:
-                self.handshake = nil
-                handshake.resume(throwing: PiClientError.protocolFailure("First server message was not hello"))
+                handshake.continuation.resume(
+                    throwing: PiClientError.protocolFailure("First server message was not hello")
+                )
             }
             return
         }
@@ -459,8 +521,10 @@ public actor PiClient {
         snapshotValue = nil
         sessionSnapshots.removeAll()
         leases.removeAll()
-        handshake?.resume(throwing: error)
+        let currentHandshake = handshake
         handshake = nil
+        currentHandshake?.timeoutTask.cancel()
+        currentHandshake?.continuation.resume(throwing: error)
         let current = pending
         pending.removeAll()
         current.values.forEach { $0.resume(throwing: error) }

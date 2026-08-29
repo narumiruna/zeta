@@ -36,6 +36,36 @@ final class ZetaSearchTests: XCTestCase {
         XCTAssertEqual(hits[0].entryID, "e1")
     }
 
+    func testCaseInsensitiveUnicodeMatchUsesOriginalStringIndexes() async throws {
+        let text = "İİİİ before NEEDLE after"
+        let sources = ArraySearchSources([
+            (
+                "unicode",
+                [
+                    SearchDocument(
+                        sessionID: "unicode",
+                        entryID: "entry",
+                        entryType: "message",
+                        text: text
+                    )
+                ]
+            )
+        ])
+        var hits: [SessionSearchHit] = []
+
+        for try await hit in SessionSearch.scan(
+            sources,
+            query: "needle",
+            options: SessionSearchOptions(limit: 1, snippetCharacters: 14)
+        ) {
+            hits.append(hit)
+        }
+
+        XCTAssertEqual(hits.count, 1)
+        XCTAssertTrue(hits[0].snippet.contains("NEEDLE"))
+        XCTAssertTrue(text.contains(hits[0].snippet))
+    }
+
     func testDuplicateSessionsFailFast() async {
         let sources = ArraySearchSources([
             ("s", []),

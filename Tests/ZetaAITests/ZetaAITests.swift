@@ -626,7 +626,10 @@ final class ZetaAITests: XCTestCase {
         guard case .toolResult(let missing) = transformed[1] else {
             return XCTFail("Expected synthetic tool result")
         }
-        XCTAssertEqual(missing.toolCallId, "callunsafe")
+        XCTAssertEqual(
+            missing.toolCallId,
+            MessageTransforms.normalizeToolCallID("call/unsafe")
+        )
         XCTAssertTrue(MessageTransforms.classifyOverflow(status: 400, message: "context length exceeded"))
         XCTAssertEqual(MessageTransforms.retryDelay(attempt: 3), 8_000)
         XCTAssertNil(

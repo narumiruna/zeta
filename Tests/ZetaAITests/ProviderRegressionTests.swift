@@ -260,6 +260,151 @@ final class ProviderRegressionTests: XCTestCase {
         XCTAssertEqual(second, ToolCall(id: "call-b|fc-b", name: "write", arguments: ["path": "B"]))
     }
 
+    func testProviderContentIndexesRejectUnsafeValuesBeforeMutation() throws {
+        let invalidIndexes = [
+            -1,
+            ProviderEventReducer.maximumProviderContentIndex + 1,
+        ]
+        for index in invalidIndexes {
+            var anthropic = ProviderEventReducer(
+                model: pricedModel(api: "anthropic-messages")
+            )
+            XCTAssertThrowsError(
+                try anthropic.consume([
+                    "type": "content_block_start",
+                    "index": .number(JSONNumber(index)),
+                    "content_block": ["type": "text"],
+                ])
+            ) { error in
+                guard let providerError = error as? ProviderError,
+                    case .invalidResponse = providerError
+                else {
+                    return XCTFail("Expected an invalid provider response")
+                }
+            }
+            XCTAssertTrue(anthropic.partial.content.isEmpty)
+
+            var responses = ProviderEventReducer(
+                model: pricedModel(api: "openai-responses")
+            )
+            XCTAssertThrowsError(
+                try responses.consume([
+                    "type": "response.output_text.delta",
+                    "output_index": .number(JSONNumber(index)),
+                    "delta": "must-not-append",
+                ])
+            )
+            XCTAssertTrue(responses.partial.content.isEmpty)
+
+            var chat = ProviderEventReducer(
+                model: pricedModel(api: "openai-completions")
+            )
+            XCTAssertThrowsError(
+                try chat.consume([
+                    "choices": .array([
+                        [
+                            "delta": [
+                                "tool_calls": .array([
+                                    [
+                                        "index": .number(JSONNumber(index)),
+                                        "id": "call",
+                                        "function": ["name": "read"],
+                                    ]
+                                ])
+                            ]
+                        ]
+                    ])
+                ])
+            )
+            XCTAssertTrue(chat.partial.content.isEmpty)
+        }
+    }
+
+    func testNormalizedToolCallIDsStayUniqueAndPairWithResults() throws {
+        let model = pricedModel(api: "openai-responses")
+        let messages: [Message] = [
+            .assistant(
+                AssistantMessage(
+                    content: [
+                        .toolCall(ToolCall(id: "call.a", name: "first")),
+                        .toolCall(ToolCall(id: "calla", name: "second")),
+                    ],
+                    api: "source-api",
+                    provider: "source-provider",
+                    model: "source-model",
+                    stopReason: .toolUse
+                )
+            ),
+            .toolResult(
+                ToolResultMessage(
+                    toolCallId: "calla",
+                    toolName: "second",
+                    content: [.text(text: "second-result")],
+                    isError: false
+                )
+            ),
+            .toolResult(
+                ToolResultMessage(
+                    toolCallId: "call.a",
+                    toolName: "first",
+                    content: [.text(text: "first-result")],
+                    isError: false
+                )
+            ),
+        ]
+
+        let transformed = MessageTransforms.forModel(messages, target: model)
+        guard case .assistant(let assistant) = transformed[0] else {
+            return XCTFail("Expected transformed assistant message")
+        }
+        let calls = assistant.content.compactMap { block -> ToolCall? in
+            if case .toolCall(let call) = block { call } else { nil }
+        }
+        let results = transformed.compactMap { message -> ToolResultMessage? in
+            if case .toolResult(let result) = message { result } else { nil }
+        }
+
+        XCTAssertEqual(
+            calls.map(\.id),
+            ["calla-c65a0dc80edb1b80", "calla"]
+        )
+        XCTAssertEqual(Set(calls.map(\.id)).count, 2)
+        XCTAssertEqual(results.count, 2)
+        XCTAssertEqual(
+            results.first(where: { $0.toolName == "first" })?.toolCallId,
+            calls.first(where: { $0.name == "first" })?.id
+        )
+        XCTAssertEqual(
+            results.first(where: { $0.toolName == "second" })?.toolCallId,
+            calls.first(where: { $0.name == "second" })?.id
+        )
+    }
+
+    func testDynamicRefreshFailureLeavesPublishedAndStoredModelsUnchanged() async {
+        let previous = pricedModel(api: "openai-completions", id: "previous")
+        let fetched = pricedModel(api: "openai-completions", id: "fetched")
+        let store = RejectingModelCatalogStore(
+            entry: StoredModelCatalog(models: [previous])
+        )
+        let provider = DynamicModelProvider(
+            id: previous.provider,
+            initialModels: [previous],
+            store: store,
+            fetch: { _ in StoredModelCatalog(models: [fetched]) },
+            stream: { _, _, _ in AssistantEventStream() }
+        )
+
+        do {
+            try await provider.refresh()
+            XCTFail("Expected model catalog persistence to fail")
+        } catch {}
+
+        let published = await provider.models
+        let stored = try? await store.read(provider: previous.provider)
+        XCTAssertEqual(published, [previous])
+        XCTAssertEqual(stored?.models, [previous])
+    }
+
     func testHTTPFailureAfterStartPreservesReducerPartialInError() async throws {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [FailingStreamingURLProtocol.self]
@@ -353,6 +498,50 @@ final class ProviderRegressionTests: XCTestCase {
         XCTAssertEqual(terminal, result)
     }
 
+    func testCodexPoolPartitionsByCredentialAndEndpoint() async throws {
+        let factory = CompletingCodexFactory()
+        let pool = CodexWebSocketPool { url, headers in
+            await factory.make(url: url, headers: headers)
+        }
+        let firstModel = pricedModel(
+            api: "openai-codex-responses",
+            baseURL: URL(string: "https://first.example/v1")!
+        )
+        let secondModel = pricedModel(
+            api: "openai-codex-responses",
+            baseURL: URL(string: "https://second.example/v1")!
+        )
+        let provider = CodexWebSocketProvider(
+            id: firstModel.provider,
+            models: [firstModel, secondModel],
+            pool: pool
+        )
+
+        for (model, credential) in [
+            (firstModel, "credential-a"),
+            (firstModel, "credential-a"),
+            (firstModel, "credential-b"),
+            (secondModel, "credential-b"),
+        ] {
+            let stream = await provider.stream(
+                model: model,
+                context: Context(),
+                options: StreamOptions(
+                    apiKey: credential,
+                    sessionID: "shared-session"
+                )
+            )
+            for try await _ in stream {}
+            let result = await stream.result()
+            XCTAssertEqual(result.stopReason, .stop)
+        }
+
+        let created = await factory.count()
+        let endpoints = await factory.endpoints()
+        XCTAssertEqual(created, 3)
+        XCTAssertEqual(Set(endpoints).count, 2)
+    }
+
     func testCodexFailureAfterStartPreservesReducerPartial() async throws {
         let connection = FailingCodexConnection(frames: [
             Data(
@@ -428,13 +617,17 @@ final class ProviderRegressionTests: XCTestCase {
         )
     }
 
-    private func pricedModel(api: String) -> Model {
+    private func pricedModel(
+        api: String,
+        id: String = "priced",
+        baseURL: URL = URL(string: "https://example.com/v1")!
+    ) -> Model {
         Model(
-            id: "priced",
+            id: id,
             name: "Priced",
             api: api,
             provider: "provider",
-            baseURL: URL(string: "https://example.com/v1")!,
+            baseURL: baseURL,
             cost: ModelCost(input: 2, output: 4, cacheRead: 1, cacheWrite: 3),
             contextWindow: 1_000,
             maximumTokens: 100
@@ -478,6 +671,62 @@ private func isTextEnd(_ event: AssistantEvent) -> Bool {
 
 private func isThinkingEnd(_ event: AssistantEvent) -> Bool {
     if case .thinkingEnd = event { true } else { false }
+}
+
+private actor RejectingModelCatalogStore: ModelCatalogStore {
+    private enum Failure: Error { case writeRejected }
+    private var entry: StoredModelCatalog?
+
+    init(entry: StoredModelCatalog?) {
+        self.entry = entry
+    }
+
+    func read(provider: String) throws -> StoredModelCatalog? { entry }
+
+    func write(provider: String, entry: StoredModelCatalog) throws {
+        throw Failure.writeRejected
+    }
+
+    func delete(provider: String) {
+        entry = nil
+    }
+}
+
+private actor CompletingCodexFactory {
+    private var createdEndpoints: [URL] = []
+
+    func make(
+        url: URL,
+        headers: [String: String]
+    ) -> any WebSocketConnection {
+        createdEndpoints.append(url)
+        return CompletingCodexConnection(completionCount: 2)
+    }
+
+    func count() -> Int { createdEndpoints.count }
+    func endpoints() -> [URL] { createdEndpoints }
+}
+
+private actor CompletingCodexConnection: WebSocketConnection {
+    nonisolated let identifier = UUID()
+    private var frames: [Data]
+
+    init(completionCount: Int) {
+        frames = (0..<completionCount).map { _ in
+            Data(#"{"type":"response.completed","response":{"id":"done"}}"#.utf8)
+        }
+    }
+
+    func send(_ data: Data) {}
+
+    func receive() throws -> Data {
+        guard !frames.isEmpty else {
+            throw ProviderError.invalidResponse("No completion frame")
+        }
+        return frames.removeFirst()
+    }
+
+    func close() {}
 }
 
 private actor FailingCodexConnection: WebSocketConnection {
