@@ -29,6 +29,24 @@ final class ZetaMigrationTests: XCTestCase {
         )
     }
 
+    func testSourceCannotAlsoBeDestination() throws {
+        let source = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: source) }
+        let settings = source.appendingPathComponent("settings.json")
+        let original = Data(#"{"theme":"unchanged"}"#.utf8)
+        try original.write(to: settings)
+
+        XCTAssertThrowsError(try PiMigrator(source: source, destination: source).migrate()) { error in
+            XCTAssertEqual(
+                error.localizedDescription,
+                "Migration source and destination must be different directories"
+            )
+        }
+        XCTAssertEqual(try Data(contentsOf: settings), original)
+    }
+
     func testInvalidInputRollsBackDestination() throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString)

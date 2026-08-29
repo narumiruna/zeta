@@ -69,6 +69,34 @@ final class ZetaConfigTests: XCTestCase {
         XCTAssertEqual(try String(contentsOf: blockedAgentDirectory, encoding: .utf8), "blocker")
     }
 
+    func testTrustPersistenceFailureDoesNotPublishCandidate() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let blockedDirectory = directory.appendingPathComponent("not-a-directory")
+        try Data("blocker".utf8).write(to: blockedDirectory)
+        let trustURL = blockedDirectory.appendingPathComponent("trust.json")
+        let store = try TrustStore(url: trustURL)
+        let rejectedDirectory = directory.appendingPathComponent("rejected")
+
+        do {
+            try await store.set(.trusted, for: rejectedDirectory)
+            XCTFail("Expected persistence failure")
+        } catch {}
+        let rejectedDecision = await store.decision(for: rejectedDirectory)
+        XCTAssertNil(rejectedDecision)
+
+        try FileManager.default.removeItem(at: blockedDirectory)
+        try FileManager.default.createDirectory(at: blockedDirectory, withIntermediateDirectories: true)
+        let acceptedDirectory = directory.appendingPathComponent("accepted")
+        try await store.set(.denied, for: acceptedDirectory)
+        let persisted = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(contentsOf: trustURL)) as? [String: Bool]
+        )
+        XCTAssertNil(persisted[rejectedDirectory.standardizedFileURL.path])
+        XCTAssertEqual(persisted[acceptedDirectory.standardizedFileURL.path], false)
+    }
+
     func testGlobalModificationDoesNotPersistProjectOverrides() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }

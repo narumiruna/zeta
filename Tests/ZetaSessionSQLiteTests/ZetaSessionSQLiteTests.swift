@@ -436,6 +436,50 @@ final class ZetaSessionSQLiteTests: XCTestCase {
         XCTAssertEqual(before, after)
     }
 
+    func testLeaseProtectedMutationsRejectAnotherSessionsLease() async throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("\(UUID().uuidString).sqlite")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let repository = try SQLiteSessionRepository(url: url)
+        try await repository.createSession(SQLiteSessionMetadata(id: "a", createdAt: 1, cwd: "/tmp"))
+        try await repository.createSession(SQLiteSessionMetadata(id: "b", createdAt: 2, cwd: "/tmp"))
+        let leaseA = try await repository.acquireLease(sessionID: "a", ownerID: "owner-a", now: 1)
+        let leaseB = try await repository.acquireLease(sessionID: "b", ownerID: "owner-b", now: 1)
+        _ = try await repository.append(
+            sessionID: "b", id: "root", parentID: nil, type: "message", timestamp: 2,
+            payload: ["text": "root"], lease: leaseB, now: 2)
+
+        await assertThrowsStaleLease {
+            _ = try await repository.append(
+                sessionID: "b", id: "rejected", parentID: "root", type: "message", timestamp: 3,
+                payload: ["text": "rejected"], lease: leaseA, now: 3)
+        }
+        await assertThrowsStaleLease {
+            _ = try await repository.appendRecord(
+                sessionID: "b", id: "rejected-record", lane: "main", runID: nil, type: "event",
+                operationKind: nil, timestamp: 4, payload: [:], lease: leaseA, now: 4)
+        }
+        await assertThrowsStaleLease {
+            try await repository.createLane(
+                sessionID: "b", lane: "rejected-lane", leafID: "root", lease: leaseA, now: 5)
+        }
+        await assertThrowsStaleLease {
+            try await repository.setName(sessionID: "b", name: "rejected", lease: leaseA, now: 6)
+        }
+        await assertThrowsStaleLease {
+            try await repository.setLabel(
+                sessionID: "b", entryID: "root", label: "rejected", lease: leaseA, now: 7)
+        }
+
+        let entries = try await repository.entries(sessionID: "b")
+        let records = try await repository.records(sessionID: "b")
+        let name = try await repository.name(sessionID: "b")
+        let label = try await repository.label(sessionID: "b", entryID: "root")
+        XCTAssertEqual(entries.map(\.id), ["root"])
+        XCTAssertEqual(records, [])
+        XCTAssertNil(name)
+        XCTAssertNil(label)
+    }
+
     func testStaleLeaseCannotRenewAfterTakeover() async throws {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("\(UUID().uuidString).sqlite")
         defer { try? FileManager.default.removeItem(at: url) }
@@ -458,5 +502,17 @@ final class ZetaSessionSQLiteTests: XCTestCase {
         guard sqlite3_exec(database, sql, nil, nil, nil) == SQLITE_OK else {
             throw SQLiteRepositoryError.execute(String(cString: sqlite3_errmsg(database)))
         }
+    }
+}
+
+private func assertThrowsStaleLease(_ operation: () async throws -> Void) async {
+    do {
+        try await operation()
+        XCTFail("Expected stale lease")
+    } catch {
+        XCTAssertEqual(
+            (error as? SQLiteRepositoryError)?.errorDescription,
+            SQLiteRepositoryError.staleLease.errorDescription
+        )
     }
 }

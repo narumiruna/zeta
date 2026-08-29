@@ -41,17 +41,19 @@ public actor TrustStore {
     }
 
     public func set(_ decision: TrustDecision, for directory: URL) throws {
-        decisions[directory.standardizedFileURL.path] = decision
-        try persist()
+        var candidate = decisions
+        candidate[directory.standardizedFileURL.path] = decision
+        try persist(candidate)
+        decisions = candidate
     }
 
-    private func persist() throws {
+    private func persist(_ candidate: [String: TrustDecision]) throws {
         try FileManager.default.createDirectory(
             at: url.deletingLastPathComponent(),
             withIntermediateDirectories: true,
             attributes: [.posixPermissions: 0o700]
         )
-        let values = decisions.mapValues { $0 == .trusted }
+        let values = candidate.mapValues { $0 == .trusted }
         let data = try JSONSerialization.data(
             withJSONObject: values,
             options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]

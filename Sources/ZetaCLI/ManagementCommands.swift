@@ -24,7 +24,7 @@ extension ZetaCLI {
                 return try await runAuth(Array(arguments.dropFirst()))
             }
             if command == "migrate" {
-                let locations = migrationLocations(arguments: arguments)
+                let locations = try migrationLocations(arguments: arguments)
                 let report = try PiMigrator(
                     source: locations.source,
                     destination: locations.destination
@@ -189,24 +189,17 @@ extension ZetaCLI {
 
     static func migrationLocations(
         arguments: [String],
-        home: URL = FileManager.default.homeDirectoryForCurrentUser,
-        workingDirectory: URL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath),
-        environment: [String: String] = ProcessInfo.processInfo.environment
-    ) -> (source: URL, destination: URL) {
-        let paths = ZetaPaths(
-            home: home,
-            workingDirectory: workingDirectory,
-            environment: environment
-        )
+        home: URL = FileManager.default.homeDirectoryForCurrentUser
+    ) throws -> (source: URL, destination: URL) {
+        guard let destination = value(after: "--destination", in: arguments) else {
+            throw CLIArgumentError.missingValue("--destination")
+        }
         return (
             URL(
                 fileURLWithPath: value(after: "--source", in: arguments)
                     ?? home.appendingPathComponent(".pi/agent").path
             ),
-            URL(
-                fileURLWithPath: value(after: "--destination", in: arguments)
-                    ?? paths.agentDirectory.path
-            )
+            URL(fileURLWithPath: destination)
         )
     }
 

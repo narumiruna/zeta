@@ -282,10 +282,16 @@ public struct BedrockProvider: AIProvider {
                     String(decoding: message.payload, as: UTF8.self)
                 )
             }
-            guard let value = try? OrderedJSON.decode(message.payload),
-                case .object(let object) = value
-            else {
-                continue
+            let value: JSONValue
+            do {
+                value = try OrderedJSON.decode(message.payload)
+            } catch {
+                throw ProviderError.invalidResponse("Malformed Bedrock event JSON")
+            }
+            guard case .object(let object) = value else {
+                throw ProviderError.invalidResponse(
+                    "Bedrock event payload must be a JSON object"
+                )
             }
 
             if case .object(let blockStart)? = object["contentBlockStart"],

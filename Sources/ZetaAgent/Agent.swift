@@ -349,11 +349,22 @@ public actor Agent {
         while continueTurns && !Task.isCancelled {
             await emit(.turnStart)
             let model = internalState.model
+            var failedToolCallIDs: Set<String> = []
             let liveMessages =
                 retrying
-                ? internalState.messages.filter {
-                    if case .assistant(let message) = $0, message.stopReason == .error { return false }
-                    return true
+                ? internalState.messages.filter { message in
+                    switch message {
+                    case .assistant(let assistant) where assistant.stopReason == .error:
+                        failedToolCallIDs.formUnion(
+                            assistant.content.compactMap {
+                                if case .toolCall(let call) = $0 { call.id } else { nil }
+                            })
+                        return false
+                    case .toolResult(let result) where failedToolCallIDs.contains(result.toolCallId):
+                        return false
+                    default:
+                        return true
+                    }
                 }
                 : internalState.messages
             let transformedMessages =
@@ -432,10 +443,32 @@ public actor Agent {
             let toolCalls: [ToolCall] = assistant.content.compactMap {
                 if case .toolCall(let call) = $0 { call } else { nil }
             }
-            let toolResults =
-                assistant.stopReason == .length
-                ? await truncatedToolResults(toolCalls)
-                : await execute(calls: toolCalls, assistant: assistant)
+            let toolResults: [ToolResultMessage]
+            switch assistant.stopReason {
+            case .stop, .toolUse:
+                toolResults = await execute(calls: toolCalls, assistant: assistant)
+            case .length:
+                toolResults = await unexecutedToolResults(
+                    toolCalls,
+                    explanation:
+                        "Tool call was not executed because the model response reached its length limit and arguments may be truncated"
+                )
+            case .error:
+                toolResults = await unexecutedToolResults(
+                    toolCalls,
+                    explanation: "Tool call was not executed because the provider response failed"
+                )
+            case .aborted:
+                toolResults = await unexecutedToolResults(
+                    toolCalls,
+                    explanation: "Tool call was not executed because the provider response was aborted"
+                )
+            case .pending, .deferred:
+                toolResults = await unexecutedToolResults(
+                    toolCalls,
+                    explanation: "Tool call was not executed because the provider response did not complete"
+                )
+            }
             for result in toolResults {
                 internalState.messages.append(.toolResult(result))
                 newMessages.append(.toolResult(result))
@@ -476,7 +509,9 @@ public actor Agent {
                     await emit(.messageEnd(.user(message)))
                 }
                 continueTurns = true
-            } else if !toolCalls.isEmpty && assistant.stopReason != .length {
+            } else if !toolCalls.isEmpty
+                && (assistant.stopReason == .stop || assistant.stopReason == .toolUse)
+            {
                 continueTurns = true
             } else {
                 let next = drain(&followUps, mode: followUpMode)
@@ -670,8 +705,9 @@ public actor Agent {
         )
     }
 
-    private func truncatedToolResults(
-        _ calls: [ToolCall]
+    private func unexecutedToolResults(
+        _ calls: [ToolCall],
+        explanation: String
     ) async -> [ToolResultMessage] {
         var results: [ToolResultMessage] = []
         for call in calls {
@@ -686,9 +722,7 @@ public actor Agent {
             results.append(
                 await finishError(
                     call: call,
-                    error: AgentError.blocked(
-                        "Tool call was not executed because the model response reached its length limit and arguments may be truncated"
-                    ),
+                    error: AgentError.blocked(explanation),
                     terminate: false
                 )
             )

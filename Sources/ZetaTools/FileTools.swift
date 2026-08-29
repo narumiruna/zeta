@@ -44,6 +44,8 @@ public struct EditResult: Sendable, Equatable {
     public let updated: String
 }
 
+package let maximumImageBytes = 20 * 1_024 * 1_024
+
 package enum FileReadContent: Sendable, Equatable {
     case text(String)
     case image(data: Data, mimeType: String)
@@ -162,7 +164,7 @@ public struct FileTools: @unchecked Sendable {
         return .text(try read(path: path, offset: offset, limit: limit))
     }
 
-    private func readImage(path: String) throws -> FileReadContent? {
+    package func readImage(path: String) throws -> FileReadContent? {
         let url = try regularFileURL(path)
         let handle: FileHandle
         do {
@@ -174,10 +176,28 @@ public struct FileTools: @unchecked Sendable {
         do {
             let prefix = try handle.read(upToCount: 12) ?? Data()
             guard let mimeType = imageMIMEType(prefix) else { return nil }
+
+            var status = stat()
+            guard fstat(handle.fileDescriptor, &status) == 0,
+                status.st_size >= 0,
+                UInt64(status.st_size) <= UInt64(maximumImageBytes)
+            else {
+                throw FileToolError.unreadable(path)
+            }
+
             try handle.seek(toOffset: 0)
             var data = Data()
-            while let chunk = try handle.read(upToCount: 64 * 1_024), !chunk.isEmpty {
+            data.reserveCapacity(Int(status.st_size))
+            while data.count <= maximumImageBytes,
+                let chunk = try handle.read(
+                    upToCount: min(64 * 1_024, maximumImageBytes + 1 - data.count)
+                ),
+                !chunk.isEmpty
+            {
                 data.append(chunk)
+            }
+            guard data.count <= maximumImageBytes else {
+                throw FileToolError.unreadable(path)
             }
             return .image(data: data, mimeType: mimeType)
         } catch {

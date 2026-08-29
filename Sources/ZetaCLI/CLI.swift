@@ -594,21 +594,25 @@ public enum ZetaCLI {
             text += String(decoding: data, as: UTF8.self)
                 .trimmingCharacters(in: .whitespacesAndNewlines)
         }
+        let fileTools = FileTools(
+            workingDirectory: URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        )
         for path in parsed.files {
             let url = URL(fileURLWithPath: path).standardizedFileURL
-            let data = try Data(contentsOf: url)
-            guard !data.isEmpty else { continue }
-            if let mime = imageMIME(data) {
+            if case .image(let data, let mimeType)? = try fileTools.readImage(path: url.path) {
                 images.append(
-                    .image(data: data.base64EncodedString(), mimeType: mime)
+                    .image(data: data.base64EncodedString(), mimeType: mimeType)
                 )
                 text += "<file name=\"\(url.path)\">\n[image attachment]\n</file>"
-            } else {
-                guard let contents = String(data: data, encoding: .utf8) else {
-                    throw CocoaError(.fileReadInapplicableStringEncoding)
-                }
-                text += "<file name=\"\(url.path)\">\n\(contents)\n</file>"
+                continue
             }
+
+            let data = try Data(contentsOf: url)
+            guard !data.isEmpty else { continue }
+            guard let contents = String(data: data, encoding: .utf8) else {
+                throw CocoaError(.fileReadInapplicableStringEncoding)
+            }
+            text += "<file name=\"\(url.path)\">\n\(contents)\n</file>"
         }
         text += parsed.messages.first ?? ""
         return InitialPrompt(text: text, images: images)
@@ -686,7 +690,7 @@ public enum ZetaCLI {
         Management:
           zeta install|remove|update|list [source] [-l] [--approve]
           zeta auth <check|print-api-key|print-bearer-token> --provider <id>
-          zeta migrate [--source <path>] [--destination <path>]
+          zeta migrate [--source <path>] --destination <path>
 
           -h, --help                  Show help
           -v, --version               Show version

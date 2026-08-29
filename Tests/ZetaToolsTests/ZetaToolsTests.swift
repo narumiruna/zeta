@@ -85,6 +85,30 @@ final class ZetaToolsTests: XCTestCase {
         XCTAssertEqual(mimeType, "image/png")
     }
 
+    func testReadContentRejectsOversizedSparseImageBeforeBuffering() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let file = directory.appendingPathComponent("oversized.png")
+        XCTAssertTrue(
+            FileManager.default.createFile(
+                atPath: file.path,
+                contents: Data([0x89, 0x50, 0x4E, 0x47])
+            )
+        )
+        let handle = try FileHandle(forWritingTo: file)
+        try handle.truncate(atOffset: UInt64(maximumImageBytes + 1))
+        try handle.close()
+        let tools = FileTools(workingDirectory: directory)
+        let start = ContinuousClock.now
+
+        XCTAssertThrowsError(try tools.readContent(path: "oversized.png")) { error in
+            XCTAssertEqual(error as? FileToolError, .unreadable("oversized.png"))
+        }
+
+        XCTAssertLessThan(start.duration(to: .now), .seconds(1))
+    }
+
     func testOverwriteWritePreservesPOSIXModesAndNewFilesUseSafeDefaults() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -400,6 +424,73 @@ final class ZetaToolsTests: XCTestCase {
         )
         let found = try await search.find(pattern: "*.txt")
         XCTAssertEqual(found, ["sub/file.txt"])
+    }
+
+    func testSearchFallbackBoundsLinesAndDecodesUTF8AcrossChunks() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        var content = Data(repeating: 0x61, count: defaultMaximumBytes + 1)
+        content.append(0x0A)
+        content.append(Data(repeating: 0x62, count: 16 * 1_024 - 1))
+        content.append(Data("é needle\n".utf8))
+        content.append(Data("needle second\n".utf8))
+        try content.write(to: directory.appendingPathComponent("large.txt"))
+        let search = SearchTools(workingDirectory: directory, useExternalCommands: false)
+
+        let matches = try await search.grep(pattern: "é needle", maximumMatches: 1)
+
+        XCTAssertEqual(matches.count, 1)
+        XCTAssertEqual(matches[0].path, "large.txt")
+        XCTAssertEqual(matches[0].line, 2)
+        XCTAssertTrue(matches[0].text.hasSuffix("... [truncated]"))
+    }
+
+    func testSearchFallbackEnforcesOutputByteLimitAtWholeLines() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let line = "needle " + String(repeating: "x", count: 30 * 1_024)
+        try Data("\(line)\n\(line)\n".utf8)
+            .write(to: directory.appendingPathComponent("large.txt"))
+        let search = SearchTools(workingDirectory: directory, useExternalCommands: false)
+
+        let matches = try await search.grep(pattern: "needle")
+
+        XCTAssertEqual(matches.count, 1)
+        XCTAssertEqual(matches[0].line, 1)
+        XCTAssertTrue(matches[0].text.hasSuffix("... [truncated]"))
+    }
+
+    func testSearchFallbackRejectsInvalidUTF8WithoutKeepingEarlierMatches() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        var content = Data("needle\n".utf8)
+        content.append(0xFF)
+        try content.write(to: directory.appendingPathComponent("invalid.txt"))
+        let search = SearchTools(workingDirectory: directory, useExternalCommands: false)
+
+        let matches = try await search.grep(pattern: "needle")
+
+        XCTAssertEqual(matches, [])
+    }
+
+    func testSearchFallbackObservesCancellationBeforeReading() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try Data("needle\n".utf8).write(to: directory.appendingPathComponent("file.txt"))
+        let search = SearchTools(workingDirectory: directory, useExternalCommands: false)
+        let task = Task { () throws -> [SearchMatch] in
+            withUnsafeCurrentTask { $0?.cancel() }
+            return try await search.grep(pattern: "needle")
+        }
+
+        do {
+            _ = try await task.value
+            XCTFail("Expected cancellation")
+        } catch is CancellationError {}
     }
 
     func testEditPreservesBOMAndCRLF() async throws {

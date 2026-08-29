@@ -1,6 +1,11 @@
 import Foundation
 import ZetaCore
 
+private enum HTTPProviderCredential {
+    case apiKey(String)
+    case bearerToken(String)
+}
+
 public struct ProviderConfiguration: Sendable {
     public let id: String
     public let api: String
@@ -48,16 +53,17 @@ public struct HTTPProvider: AIProvider {
                 let requestEnvironment = environment().merging(options.environment) {
                     _, override in override
                 }
-                let apiKey =
-                    options.apiKey
-                    ?? configuration.apiKeyEnvironmentVariables.lazy.compactMap {
-                        requestEnvironment[$0]
-                    }.first
-                guard let apiKey else { throw ProviderError.missingCredential(configuration.id) }
+                let credential =
+                    options.apiKey.map(HTTPProviderCredential.apiKey)
+                    ?? options.bearerToken.map(HTTPProviderCredential.bearerToken)
+                    ?? environmentCredential(model: model, environment: requestEnvironment)
+                guard let credential else {
+                    throw ProviderError.missingCredential(configuration.id)
+                }
                 let request = try await buildRequest(
                     model: model,
                     context: context,
-                    apiKey: apiKey,
+                    credential: credential,
                     options: options,
                     environment: requestEnvironment
                 )
@@ -140,6 +146,38 @@ public struct HTTPProvider: AIProvider {
         options: StreamOptions,
         environment: [String: String]? = nil
     ) async throws -> URLRequest {
+        try await buildRequest(
+            model: model,
+            context: context,
+            credential: .apiKey(apiKey),
+            options: options,
+            environment: environment
+        )
+    }
+
+    func buildRequest(
+        model: Model,
+        context: Context,
+        bearerToken: String,
+        options: StreamOptions,
+        environment: [String: String]? = nil
+    ) async throws -> URLRequest {
+        try await buildRequest(
+            model: model,
+            context: context,
+            credential: .bearerToken(bearerToken),
+            options: options,
+            environment: environment
+        )
+    }
+
+    private func buildRequest(
+        model: Model,
+        context: Context,
+        credential: HTTPProviderCredential,
+        options: StreamOptions,
+        environment: [String: String]? = nil
+    ) async throws -> URLRequest {
         let requestEnvironment =
             environment
             ?? self.environment().merging(options.environment) { _, override in override }
@@ -179,16 +217,21 @@ public struct HTTPProvider: AIProvider {
             "Content-Type": "application/json",
         ])
         headers.merge(configuration.defaultHeaders.mapValues(Optional.some))
-        switch model.api {
-        case "anthropic-messages":
-            headers["x-api-key"] = apiKey
+        if model.api == "anthropic-messages" {
             headers["anthropic-version"] = "2023-06-01"
-        case "google-generative-ai", "google-vertex":
-            headers["x-goog-api-key"] = apiKey
-        case "azure-openai-responses":
-            headers["api-key"] = apiKey
-        default:
-            headers["Authorization"] = "Bearer \(apiKey)"
+        }
+        switch (model.api, credential) {
+        case ("anthropic-messages", .apiKey(let value)):
+            headers["x-api-key"] = value
+        case ("anthropic-messages", .bearerToken(let value)):
+            headers["Authorization"] = "Bearer \(value)"
+        case ("google-generative-ai", .apiKey(let value)),
+            ("google-vertex", .apiKey(let value)):
+            headers["x-goog-api-key"] = value
+        case ("azure-openai-responses", .apiKey(let value)):
+            headers["api-key"] = value
+        case (_, .apiKey(let value)), (_, .bearerToken(let value)):
+            headers["Authorization"] = "Bearer \(value)"
         }
         headers.merge((model.headers ?? [:]).mapValues(Optional.some))
         headers.merge(options.headers)
@@ -205,6 +248,26 @@ public struct HTTPProvider: AIProvider {
             try ProviderPayloadBuilder.build(model: model, context: context, options: options)
         )
         return request
+    }
+
+    private func environmentCredential(
+        model: Model,
+        environment: [String: String]
+    ) -> HTTPProviderCredential? {
+        for variable in configuration.apiKeyEnvironmentVariables {
+            guard let value = environment[variable],
+                !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            else {
+                continue
+            }
+            if model.api == "anthropic-messages",
+                variable == "ANTHROPIC_AUTH_TOKEN" || variable == "ANTHROPIC_OAUTH_TOKEN"
+            {
+                return .bearerToken(value)
+            }
+            return .apiKey(value)
+        }
+        return nil
     }
 
     private func vertexEndpoint(

@@ -29,6 +29,9 @@ Export those databases with their matching Pi version before migration.
 
 ## Migration
 
+`zeta migrate --destination <path>` imports from Pi's default `~/.pi/agent` directory, and `--source` overrides that source.
+The destination is required because Zeta also uses `~/.pi/agent` by default for Pi path compatibility.
+Set `PI_CODING_AGENT_DIR` to the destination when running Zeta against the migrated data.
 `PiMigrator` copies settings, credential metadata, sessions, skills, prompts, themes, resource packages, and supported databases after creating a backup.
 Migration is idempotent for equal files.
 TypeScript extensions are reported but not executed or translated automatically.

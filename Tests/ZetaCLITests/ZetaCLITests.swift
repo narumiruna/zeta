@@ -140,22 +140,19 @@ final class ZetaCLITests: XCTestCase {
         XCTAssertFalse(BuiltinToolSchemas.schema(for: "edit").accepts(["path": "file", "edits": []]))
     }
 
-    func testMigrationDefaultsToRuntimeAgentDirectory() {
+    func testMigrationRequiresExplicitDestination() throws {
         let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        let locations = ZetaCLI.migrationLocations(
-            arguments: ["migrate"],
-            home: home,
-            workingDirectory: home,
-            environment: [:]
-        )
-        XCTAssertEqual(locations.destination, home.appendingPathComponent(".pi/agent"))
-        let overridden = ZetaCLI.migrationLocations(
+        XCTAssertThrowsError(
+            try ZetaCLI.migrationLocations(arguments: ["migrate"], home: home)
+        ) { error in
+            XCTAssertEqual(error.localizedDescription, "Missing value for --destination")
+        }
+        let locations = try ZetaCLI.migrationLocations(
             arguments: ["migrate", "--destination", "/tmp/custom-zeta-agent"],
-            home: home,
-            workingDirectory: home,
-            environment: [:]
+            home: home
         )
-        XCTAssertEqual(overridden.destination.path, "/tmp/custom-zeta-agent")
+        XCTAssertEqual(locations.source, home.appendingPathComponent(".pi/agent"))
+        XCTAssertEqual(locations.destination.path, "/tmp/custom-zeta-agent")
     }
 
     func testConcurrentRPCPromptsStartThenQueueWithoutDropping() async throws {
@@ -569,6 +566,76 @@ final class ZetaCLITests: XCTestCase {
         ])
         XCTAssertNil(apiKeyHeaders?["Authorization"] ?? nil)
         XCTAssertEqual(apiKeyHeaders?["x-goog-api-key"] ?? nil, "vertex-key")
+    }
+
+    func testAnthropicAuthenticationPreservesOAuthBearerKind() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = try AuthStore(url: directory.appendingPathComponent("auth.json"))
+        try await store.set(
+            provider: "anthropic",
+            credential: .oauth(
+                access: "stored-oauth",
+                refresh: "refresh",
+                expires: Int64.max,
+                extras: [:]
+            )
+        )
+
+        let stored = try await CLIProviderAuthenticationResolver.resolve(
+            provider: "anthropic",
+            api: "anthropic-messages",
+            store: store,
+            environment: ["ANTHROPIC_API_KEY": "environment-api-key"]
+        )
+        XCTAssertNil(stored.apiKey)
+        XCTAssertEqual(stored.bearerToken, "stored-oauth")
+
+        try await store.delete(provider: "anthropic")
+        let oauthEnvironment = try await CLIProviderAuthenticationResolver.resolve(
+            provider: "anthropic",
+            api: "anthropic-messages",
+            store: store,
+            environment: [
+                "ANTHROPIC_OAUTH_TOKEN": "environment-oauth",
+                "ANTHROPIC_API_KEY": "environment-api-key",
+            ]
+        )
+        let oauthOptions = oauthEnvironment.applying(
+            to: StreamOptions(),
+            for: Model(
+                id: "claude",
+                name: "Claude",
+                api: "anthropic-messages",
+                provider: "anthropic",
+                baseURL: URL(string: "https://api.anthropic.com")!,
+                contextWindow: 1_000,
+                maximumTokens: 100
+            )
+        )
+        XCTAssertNil(oauthOptions.apiKey)
+        XCTAssertEqual(oauthOptions.bearerToken, "environment-oauth")
+
+        let apiKeyEnvironment = try await CLIProviderAuthenticationResolver.resolve(
+            provider: "anthropic",
+            api: "anthropic-messages",
+            store: store,
+            environment: ["ANTHROPIC_API_KEY": "environment-api-key"]
+        )
+        let apiKeyOptions = apiKeyEnvironment.applying(
+            to: StreamOptions(),
+            for: Model(
+                id: "claude",
+                name: "Claude",
+                api: "anthropic-messages",
+                provider: "anthropic",
+                baseURL: URL(string: "https://api.anthropic.com")!,
+                contextWindow: 1_000,
+                maximumTokens: 100
+            )
+        )
+        XCTAssertEqual(apiKeyOptions.apiKey, "environment-api-key")
+        XCTAssertNil(apiKeyOptions.bearerToken)
     }
 
     func testAuthReadinessUsesRuntimeCredentialResolution() async throws {

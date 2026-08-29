@@ -22,6 +22,12 @@ public enum PiMigrationError: Error, LocalizedError, Sendable {
     }
 }
 
+private struct IdenticalMigrationLocationsError: Error, LocalizedError, Sendable {
+    var errorDescription: String? {
+        "Migration source and destination must be different directories"
+    }
+}
+
 public struct PiMigrator: Sendable {
     public let source: URL
     public let destination: URL
@@ -32,6 +38,12 @@ public struct PiMigrator: Sendable {
     }
 
     public func migrate() throws -> MigrationReport {
+        guard
+            source.standardizedFileURL.resolvingSymlinksInPath()
+                != destination.standardizedFileURL.resolvingSymlinksInPath()
+        else {
+            throw IdenticalMigrationLocationsError()
+        }
         guard FileManager.default.fileExists(atPath: source.path) else {
             throw PiMigrationError.sourceMissing
         }

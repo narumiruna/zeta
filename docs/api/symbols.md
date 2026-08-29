@@ -79,6 +79,7 @@ Regenerate it with `uv run python scripts/generate-api-docs.py`.
 | `init(_:)` | Initializer |
 | `init(_:timestamp:)` | Initializer |
 | `init(account:sessionID:)` | Initializer |
+| `init(apiKey:bearerToken:headers:temperature:maximumTokens:thinking:sessionID:timeout:cacheRetention:environment:transformHeaders:)` | Initializer |
 | `init(apiKey:headers:temperature:maximumTokens:thinking:sessionID:timeout:cacheRetention:environment:transformHeaders:)` | Initializer |
 | `init(bufferingPolicy:)` | Initializer |
 | `init(configuration:session:environment:)` | Initializer |
@@ -158,6 +159,7 @@ Regenerate it with `uv run python scripts/generate-api-docs.py`.
 | `arguments` | Instance Property |
 | `baseURL` | Instance Property |
 | `baseURLTemplate` | Instance Property |
+| `bearerToken` | Instance Property |
 | `cacheRead` | Instance Property |
 | `cacheRetention` | Instance Property |
 | `cacheWrite` | Instance Property |

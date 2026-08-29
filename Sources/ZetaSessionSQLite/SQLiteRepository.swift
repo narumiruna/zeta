@@ -189,7 +189,7 @@ public actor SQLiteSessionRepository {
         lease: WriterLease, now: Int64
     ) throws -> SQLiteEntry {
         try transaction {
-            _ = try renew(lease, now: now)
+            _ = try renew(lease, for: sessionID, now: now)
             let sequence = try nextSequence(sessionID)
             try execute(
                 "INSERT INTO entries(session_id,seq,id,parent_id,type,timestamp,payload) VALUES(?,?,?,?,?,?,?)",
@@ -242,7 +242,7 @@ public actor SQLiteSessionRepository {
         now: Int64
     ) throws -> SQLiteRecord {
         try transaction {
-            _ = try renew(lease, now: now)
+            _ = try renew(lease, for: sessionID, now: now)
             let sequence = try nextSequence(sessionID)
             try execute(
                 "INSERT INTO records(session_id,seq,id,lane,run_id,type,op_kind,timestamp,payload) VALUES(?,?,?,?,?,?,?,?,?)",
@@ -327,7 +327,7 @@ public actor SQLiteSessionRepository {
         now: Int64
     ) throws {
         try transaction {
-            _ = try renew(lease, now: now)
+            _ = try renew(lease, for: sessionID, now: now)
             if let leafID { try requireEntry(sessionID: sessionID, id: leafID) }
             try execute(
                 "INSERT INTO lanes(session_id,lane,leaf_id,open_operation_id) VALUES(?,?,?,NULL)",
@@ -380,6 +380,7 @@ public actor SQLiteSessionRepository {
         lease: WriterLease,
         now: Int64
     ) throws {
+        try requireLeaseSession(lease, for: sessionID)
         try requireEntry(sessionID: sessionID, id: entryID)
         try setFact(
             sessionID: sessionID,
@@ -682,7 +683,7 @@ public actor SQLiteSessionRepository {
         now: Int64
     ) throws {
         try transaction {
-            _ = try renew(lease, now: now)
+            _ = try renew(lease, for: sessionID, now: now)
             let sequence = try nextSequence(sessionID)
             try execute(
                 "INSERT INTO facts(session_id,seq,kind,key,value) VALUES(?,?,?,?,?)",
@@ -693,6 +694,15 @@ public actor SQLiteSessionRepository {
                 ]
             )
         }
+    }
+
+    private func renew(_ lease: WriterLease, for sessionID: String, now: Int64) throws -> WriterLease {
+        try requireLeaseSession(lease, for: sessionID)
+        return try renew(lease, now: now)
+    }
+
+    private func requireLeaseSession(_ lease: WriterLease, for sessionID: String) throws {
+        guard lease.sessionID == sessionID else { throw SQLiteRepositoryError.staleLease }
     }
 
     private func requireEntry(sessionID: String, id: String) throws {

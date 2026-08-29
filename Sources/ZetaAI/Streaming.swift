@@ -213,6 +213,7 @@ public enum CacheRetention: String, Codable, Sendable {
 
 public struct StreamOptions: Sendable {
     public var apiKey: String?
+    public var bearerToken: String?
     public var headers: [String: String?]
     public var temperature: Double?
     public var maximumTokens: Int?
@@ -224,13 +225,34 @@ public struct StreamOptions: Sendable {
     public var transformHeaders: HeaderTransform?
 
     public init(
-        apiKey: String? = nil, headers: [String: String?] = [:], temperature: Double? = nil, maximumTokens: Int? = nil,
-        thinking: ThinkingLevel? = nil, sessionID: String? = nil, timeout: Duration? = nil,
-        cacheRetention: CacheRetention = .short,
+        apiKey: String? = nil, headers: [String: String?] = [:], temperature: Double? = nil,
+        maximumTokens: Int? = nil, thinking: ThinkingLevel? = nil, sessionID: String? = nil,
+        timeout: Duration? = nil, cacheRetention: CacheRetention = .short,
         environment: [String: String] = [:],
         transformHeaders: HeaderTransform? = nil
     ) {
         self.apiKey = apiKey
+        self.bearerToken = nil
+        self.headers = headers
+        self.temperature = temperature
+        self.maximumTokens = maximumTokens
+        self.thinking = thinking
+        self.sessionID = sessionID
+        self.timeout = timeout
+        self.cacheRetention = cacheRetention
+        self.environment = environment
+        self.transformHeaders = transformHeaders
+    }
+
+    public init(
+        apiKey: String? = nil, bearerToken: String, headers: [String: String?] = [:],
+        temperature: Double? = nil, maximumTokens: Int? = nil, thinking: ThinkingLevel? = nil,
+        sessionID: String? = nil, timeout: Duration? = nil, cacheRetention: CacheRetention = .short,
+        environment: [String: String] = [:],
+        transformHeaders: HeaderTransform? = nil
+    ) {
+        self.apiKey = apiKey
+        self.bearerToken = bearerToken
         self.headers = headers
         self.temperature = temperature
         self.maximumTokens = maximumTokens

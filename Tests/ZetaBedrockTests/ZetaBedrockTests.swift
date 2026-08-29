@@ -164,6 +164,95 @@ final class ZetaBedrockTests: XCTestCase {
         XCTAssertEqual(events.filter { if case .error = $0 { true } else { false } }.count, 1)
     }
 
+    func testMalformedEventJSONFailsAndPreservesBedrockPartial() async throws {
+        var body = Data()
+        body.append(
+            eventMessage(
+                headers: [":message-type": "event", ":event-type": "chunk"],
+                payload: Data(
+                    #"{"contentBlockDelta":{"contentBlockIndex":0,"delta":{"text":"kept"}}}"#
+                        .utf8
+                )
+            )
+        )
+        body.append(
+            eventMessage(
+                headers: [":message-type": "event", ":event-type": "chunk"],
+                payload: Data("{".utf8)
+            )
+        )
+        BedrockStreamingURLProtocol.setBody(body)
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [BedrockStreamingURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        let credential = try XCTUnwrap(
+            CredentialResolver.aws(environment: [
+                "AWS_BEARER_TOKEN_BEDROCK": "synthetic-token"
+            ])
+        )
+        let model = Model(
+            id: "provider.model:0",
+            name: "Model",
+            api: "bedrock-converse-stream",
+            provider: "amazon-bedrock",
+            baseURL: URL(string: "https://bedrock.example.com")!,
+            contextWindow: 100,
+            maximumTokens: 10
+        )
+        let provider = BedrockProvider(
+            models: [model],
+            region: "us-east-1",
+            session: session
+        ) {
+            credential
+        }
+
+        let stream = await provider.stream(
+            model: model,
+            context: Context(),
+            options: StreamOptions()
+        )
+        var events: [AssistantEvent] = []
+        for try await event in stream { events.append(event) }
+
+        guard case .error(.error, let message) = events.last else {
+            return XCTFail("Expected malformed Bedrock event to fail")
+        }
+        XCTAssertEqual(message.content, [.text(text: "kept")])
+        XCTAssertEqual(message.stopReason, .error)
+        XCTAssertTrue(message.errorMessage?.contains("Malformed Bedrock event JSON") == true)
+    }
+
+    func testNonObjectEventJSONIsRejected() async throws {
+        let credential = try XCTUnwrap(
+            CredentialResolver.aws(environment: [
+                "AWS_BEARER_TOKEN_BEDROCK": "unused"
+            ])
+        )
+        let provider = BedrockProvider(models: [], region: "us-east-1") {
+            credential
+        }
+        var partial = AssistantMessage(
+            api: "bedrock-converse-stream",
+            provider: "amazon-bedrock",
+            model: "test-model"
+        )
+        var toolInputBuffers: [Int: String] = [:]
+
+        do {
+            try await provider.consume(
+                [bedrockMessage("[]")],
+                partial: &partial,
+                toolInputBuffers: &toolInputBuffers,
+                stream: AssistantEventStream()
+            )
+            XCTFail("Expected non-object Bedrock event JSON to fail")
+        } catch {
+            XCTAssertTrue(String(describing: error).contains("must be a JSON object"))
+        }
+        XCTAssertTrue(partial.content.isEmpty)
+    }
+
     func testToolUseStreamParsesFragmentedInputAndStopReason() async throws {
         let credential = try XCTUnwrap(
             CredentialResolver.aws(environment: [

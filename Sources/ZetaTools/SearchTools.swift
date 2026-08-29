@@ -113,7 +113,9 @@ public struct SearchTools: Sendable {
             try NSRegularExpression(pattern: globRegex($0), options: [.caseInsensitive])
         }
         var matches: [SearchMatch] = []
+        var outputBytes = 0
         for case let url as URL in enumerator {
+            try Task.checkCancellation()
             if url.pathComponents.contains(".git") {
                 enumerator.skipDescendants()
                 continue
@@ -128,22 +130,105 @@ public struct SearchTools: Sendable {
                 let range = NSRange(relative.startIndex..<relative.endIndex, in: relative)
                 guard fileExpression.firstMatch(in: relative, range: range) != nil else { continue }
             }
-            guard let text = try? String(contentsOf: url, encoding: .utf8) else { continue }
-            for (offset, line) in text.split(separator: "\n", omittingEmptySubsequences: false).enumerated() {
-                let value = String(line)
-                let range = NSRange(value.startIndex..<value.endIndex, in: value)
-                guard expression.firstMatch(in: value, range: range) != nil else { continue }
-                matches.append(
-                    SearchMatch(
-                        path: relative,
-                        line: offset + 1,
-                        text: Truncation.line(value).0
-                    )
+            guard
+                let result = try fallbackMatches(
+                    in: url,
+                    relativePath: relative,
+                    expression: expression,
+                    maximumMatches: maximumMatches - matches.count,
+                    maximumOutputBytes: defaultMaximumBytes - outputBytes
                 )
-                if matches.count == maximumMatches { return matches }
+            else {
+                continue
             }
+            matches += result.matches
+            outputBytes += result.outputBytes
+            if matches.count == maximumMatches || result.reachedByteLimit { return matches }
         }
         return matches
+    }
+
+    private func fallbackMatches(
+        in url: URL,
+        relativePath: String,
+        expression: NSRegularExpression,
+        maximumMatches: Int,
+        maximumOutputBytes: Int
+    ) throws -> FallbackFileMatches? {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+
+        var validator = StreamingUTF8Validator()
+        var line = Data()
+        var lineIsTooLong = false
+        var lineNumber = 1
+        var matches: [SearchMatch] = []
+        var outputBytes = 0
+        var reachedByteLimit = false
+
+        func matchCurrentLine() -> (SearchMatch, Int)? {
+            guard !lineIsTooLong,
+                let value = String(data: line, encoding: .utf8)
+            else {
+                return nil
+            }
+            let range = NSRange(value.startIndex..<value.endIndex, in: value)
+            guard expression.firstMatch(in: value, range: range) != nil else { return nil }
+            let rawOutputBytes =
+                relativePath.utf8.count + String(lineNumber).utf8.count + line.count + 3
+            return (
+                SearchMatch(
+                    path: relativePath,
+                    line: lineNumber,
+                    text: Truncation.line(value).0
+                ),
+                rawOutputBytes
+            )
+        }
+
+        func appendCurrentMatch() {
+            guard matches.count < maximumMatches, !reachedByteLimit,
+                let (match, byteCount) = matchCurrentLine()
+            else {
+                return
+            }
+            guard outputBytes + byteCount <= maximumOutputBytes else {
+                reachedByteLimit = true
+                return
+            }
+            matches.append(match)
+            outputBytes += byteCount
+        }
+
+        do {
+            while let chunk = try handle.read(upToCount: 16 * 1_024), !chunk.isEmpty {
+                try Task.checkCancellation()
+                for byte in chunk {
+                    guard validator.consume(byte) else { return nil }
+                    if byte == 0x0A {
+                        appendCurrentMatch()
+                        line.removeAll(keepingCapacity: true)
+                        lineIsTooLong = false
+                        lineNumber += 1
+                    } else if line.count < defaultMaximumBytes {
+                        line.append(byte)
+                    } else {
+                        lineIsTooLong = true
+                    }
+                }
+            }
+            guard validator.isComplete else { return nil }
+            appendCurrentMatch()
+            return FallbackFileMatches(
+                matches: matches,
+                outputBytes: outputBytes,
+                reachedByteLimit: reachedByteLimit
+            )
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            return nil
+        }
     }
 
     private func fallbackFind(
@@ -264,5 +349,53 @@ public struct SearchTools: Sendable {
             }
         }
         return output + "$"
+    }
+}
+
+private struct FallbackFileMatches {
+    let matches: [SearchMatch]
+    let outputBytes: Int
+    let reachedByteLimit: Bool
+}
+
+private struct StreamingUTF8Validator {
+    private var remainingContinuationBytes = 0
+    private var nextContinuationRange: ClosedRange<UInt8> = 0x80...0xBF
+
+    var isComplete: Bool { remainingContinuationBytes == 0 }
+
+    mutating func consume(_ byte: UInt8) -> Bool {
+        if remainingContinuationBytes > 0 {
+            guard nextContinuationRange.contains(byte) else { return false }
+            remainingContinuationBytes -= 1
+            nextContinuationRange = 0x80...0xBF
+            return true
+        }
+
+        switch byte {
+        case 0x00...0x7F:
+            return true
+        case 0xC2...0xDF:
+            remainingContinuationBytes = 1
+        case 0xE0:
+            remainingContinuationBytes = 2
+            nextContinuationRange = 0xA0...0xBF
+        case 0xE1...0xEC, 0xEE...0xEF:
+            remainingContinuationBytes = 2
+        case 0xED:
+            remainingContinuationBytes = 2
+            nextContinuationRange = 0x80...0x9F
+        case 0xF0:
+            remainingContinuationBytes = 3
+            nextContinuationRange = 0x90...0xBF
+        case 0xF1...0xF3:
+            remainingContinuationBytes = 3
+        case 0xF4:
+            remainingContinuationBytes = 3
+            nextContinuationRange = 0x80...0x8F
+        default:
+            return false
+        }
+        return true
     }
 }

@@ -222,6 +222,83 @@ final class ZetaAgentTests: XCTestCase {
         )
     }
 
+    func testFailedAndAbortedResponsesDoNotExecuteRetainedToolCalls() async throws {
+        let executionCount = IntegerCounter()
+        let tool = AgentTool(
+            definition: ToolDefinition(name: "danger", description: "danger", parameters: [:]),
+            label: "danger"
+        ) { _, _, _ in
+            await executionCount.increment()
+            return AgentToolResult(content: [.text(text: "executed")])
+        }
+
+        let failedProvider = FauxProvider(tokensPerSecond: 10_000)
+        let failedModel = await failedProvider.models[0]
+        await failedProvider.enqueue(
+            AssistantMessage(
+                content: [.toolCall(ToolCall(id: "failed", name: "danger"))],
+                api: failedModel.api,
+                provider: failedModel.provider,
+                model: failedModel.id,
+                stopReason: .error,
+                errorMessage: "stream disconnected"
+            )
+        )
+        await failedProvider.enqueue(
+            AssistantMessage(
+                content: [.text(text: "recovered")],
+                api: failedModel.api,
+                provider: failedModel.provider,
+                model: failedModel.id,
+                stopReason: .stop
+            )
+        )
+        let failedAgent = Agent(
+            state: AgentState(systemPrompt: "", model: failedModel, tools: [tool])
+        ) { model, context, options in
+            await failedProvider.stream(model: model, context: context, options: options)
+        }
+        await failedAgent.configureRetry(maximumRetries: 1, baseDelayMilliseconds: 0)
+        try await failedAgent.prompt(UserMessage("go"))
+        let countAfterFailure = await executionCount.value()
+        let failedCallMessageCounts = await failedProvider.calls().map(\.messageCount)
+        XCTAssertEqual(countAfterFailure, 0)
+        XCTAssertEqual(failedCallMessageCounts, [1, 1])
+        let failedResults = await failedAgent.state().messages.compactMap { message -> ToolResultMessage? in
+            if case .toolResult(let result) = message { result } else { nil }
+        }
+        XCTAssertEqual(failedResults.count, 1)
+        XCTAssertTrue(failedResults[0].isError)
+
+        let abortedProvider = FauxProvider(tokensPerSecond: 10_000)
+        let abortedModel = await abortedProvider.models[0]
+        await abortedProvider.enqueue(
+            AssistantMessage(
+                content: [.toolCall(ToolCall(id: "aborted", name: "danger"))],
+                api: abortedModel.api,
+                provider: abortedModel.provider,
+                model: abortedModel.id,
+                stopReason: .aborted,
+                errorMessage: "cancelled"
+            )
+        )
+        let abortedAgent = Agent(
+            state: AgentState(systemPrompt: "", model: abortedModel, tools: [tool])
+        ) { model, context, options in
+            await abortedProvider.stream(model: model, context: context, options: options)
+        }
+        try await abortedAgent.prompt(UserMessage("go"))
+        let countAfterAbort = await executionCount.value()
+        let abortedCallCount = await abortedProvider.callCount()
+        let abortedMessages = await abortedAgent.state().messages
+        XCTAssertEqual(countAfterAbort, 0)
+        XCTAssertEqual(abortedCallCount, 1)
+        guard case .toolResult(let abortedResult)? = abortedMessages.last else {
+            return XCTFail("Expected non-executed tool result")
+        }
+        XCTAssertTrue(abortedResult.isError)
+    }
+
     func testCompactionSummaryReplacesHistoryAndRetainsTail() async throws {
         let provider = FauxProvider(tokensPerSecond: 10_000)
         let model = await provider.models[0]

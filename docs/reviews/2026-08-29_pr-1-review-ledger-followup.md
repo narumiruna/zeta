@@ -587,3 +587,76 @@ Pinned source evidence: The same file's lines 235 through 255 migrate every pars
 Pinned test evidence: `packages/coding-agent/test/session-manager/file-operations.test.ts` lines 52 through 55 and 71 through 80 verify malformed-only input is rejected as a session while malformed records mixed into a session are skipped.
 
 Zeta evidence: `testV1MigrationSkipsMalformedJSONAndPreservesUndecodableObjects` verifies malformed JSON is skipped while parseable unknown and malformed typed objects survive migration and later materialization.
+
+## Thirteenth-round inline feedback
+
+### `3885964578`
+
+Concern: Failed or aborted provider responses can retain and execute completed tool calls.
+
+Outcome: Actionable and addressed by generating non-executed error results for every non-successful terminal reason, excluding those synthetic results from retry context, and continuing tool turns only after successful responses.
+
+Evidence: Agent regressions cover failed and aborted retained calls, zero tool executions, safe retry context, and no unintended continuation.
+
+### `3885964579`
+
+Concern: Image reads buffer unbounded files before base64 encoding.
+
+Outcome: Actionable and addressed with a 20 MiB limit checked from file metadata and while incrementally reading both tool and CLI image attachments.
+
+Evidence: A sparse oversized-image regression rejects the file before buffering it.
+
+### `3885964581`
+
+Concern: The no-`rg` grep fallback loads each candidate file completely.
+
+Outcome: Actionable and addressed with incremental 16 KiB reads, bounded line and output state, strict streaming UTF-8 validation, and cooperative cancellation.
+
+Evidence: Search regressions cover oversized lines, chunk-boundary Unicode, output limits, malformed UTF-8, and cancellation.
+
+### `3885964583`
+
+Concern: Anthropic OAuth credentials are emitted as `x-api-key` rather than bearer authorization.
+
+Outcome: Actionable and addressed by preserving API-key versus bearer credential kinds from storage and environment resolution through HTTP request construction.
+
+Evidence: AI and CLI regressions verify stored OAuth and `ANTHROPIC_OAUTH_TOKEN` produce `Authorization: Bearer`, while API keys continue to produce `x-api-key`.
+
+### `3885964586`
+
+Concern: A valid lease for one session can mutate another session.
+
+Outcome: Actionable and addressed by validating the lease session before every lease-protected entry, record, lane, name, label, and fact mutation.
+
+Evidence: SQLite regressions attempt every protected mutation with a different session's lease and verify stale-lease failures with no writes.
+
+### `3885964588`
+
+Concern: Malformed or non-object Bedrock event payloads are silently skipped.
+
+Outcome: Actionable and addressed by rejecting both cases as invalid provider responses while preserving accumulated stream partials.
+
+Evidence: Bedrock regressions cover malformed JSON after content and standalone non-object JSON.
+
+### `3885964591`
+
+Concern: A failed trust-store write still publishes the candidate in memory.
+
+Outcome: Actionable and addressed by persisting a candidate dictionary before replacing actor state.
+
+Evidence: A configuration regression injects a persistence failure and verifies the rejected decision remains absent from memory and later disk writes.
+
+### `3885964592`
+
+Concern: The migration command defaults source and destination to the same directory.
+
+Outcome: Actionable and addressed by requiring an explicit destination and rejecting equivalent source and destination paths.
+
+Evidence: CLI and migration regressions verify the missing-destination error, default Pi source, explicit destination, same-path rejection, and unchanged source data.
+
+## Thirteenth-round verification
+
+The focused strict-concurrency suite passed 170 tests with no failures.
+The complete repository gate passed 304 XCTest cases and 56 Swift Testing cases against the clean pinned oracle.
+The complete Address Sanitizer and Thread Sanitizer suites each passed the same 360 tests without findings.
+API compatibility and generated symbol documentation checks passed with 2,021 public symbols across 30 modules.

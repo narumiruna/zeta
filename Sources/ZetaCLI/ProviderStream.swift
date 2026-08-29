@@ -21,8 +21,19 @@ struct CLIResolvedProviderAuthentication: Sendable, Equatable {
         for (name, value) in headers {
             options.headers[name] = value
         }
+        if model.api == "anthropic-messages" {
+            if let apiKey {
+                options.apiKey = apiKey
+                options.bearerToken = nil
+            } else if let bearerToken {
+                options.apiKey = nil
+                options.bearerToken = bearerToken
+            }
+            return options
+        }
         guard model.api == "google-vertex" else {
             options.apiKey = apiKey ?? bearerToken ?? options.apiKey
+            options.bearerToken = nil
             return options
         }
 
@@ -30,7 +41,16 @@ struct CLIResolvedProviderAuthentication: Sendable, Equatable {
         let apiKey = apiKey
         let bearerToken = bearerToken
         let authenticationHeaders = headers
-        options.apiKey = apiKey ?? bearerToken ?? (headers.isEmpty ? options.apiKey : "<authenticated>")
+        if let apiKey {
+            options.apiKey = apiKey
+            options.bearerToken = nil
+        } else if let bearerToken {
+            options.apiKey = nil
+            options.bearerToken = bearerToken
+        } else if !headers.isEmpty {
+            options.apiKey = "<authenticated>"
+            options.bearerToken = nil
+        }
         options.transformHeaders = { headers in
             var result = try await previousTransform?(headers) ?? headers
             if let apiKey {
@@ -56,17 +76,60 @@ enum CLIProviderAuthenticationResolver {
         provider: String,
         api: String,
         explicitAPIKey: String? = nil,
+        explicitBearerToken: String? = nil,
         store: AuthStore,
         environment: [String: String]
     ) async throws -> CLIResolvedProviderAuthentication {
         let stored = try await store.resolveCredential(
             provider: provider,
             environment: environment,
-            fallbackVariables: BuiltinProviderFactory.environmentVariables[provider] ?? []
+            fallbackVariables: provider == "anthropic"
+                ? [] : BuiltinProviderFactory.environmentVariables[provider] ?? []
         )
-        let selectedAPIKey =
+        let hasExplicitAPIKey =
             explicitAPIKey?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
-            ? explicitAPIKey : stored.apiKey
+        let hasExplicitBearerToken =
+            explicitBearerToken?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+        let selectedAPIKey =
+            hasExplicitAPIKey ? explicitAPIKey : hasExplicitBearerToken ? nil : stored.apiKey
+        let selectedBearerToken =
+            hasExplicitAPIKey ? nil : hasExplicitBearerToken ? explicitBearerToken : stored.bearerToken
+
+        if provider == "anthropic" && api == "anthropic-messages" {
+            if let selectedAPIKey {
+                return CLIResolvedProviderAuthentication(
+                    apiKey: selectedAPIKey,
+                    headers: [:],
+                    environment: stored.environment
+                )
+            }
+            if let selectedBearerToken {
+                return CLIResolvedProviderAuthentication(
+                    bearerToken: selectedBearerToken,
+                    headers: [:],
+                    environment: stored.environment
+                )
+            }
+            for variable in ["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_OAUTH_TOKEN"] {
+                if let token = stored.environment[variable],
+                    !token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                {
+                    return CLIResolvedProviderAuthentication(
+                        bearerToken: token,
+                        headers: [:],
+                        environment: stored.environment
+                    )
+                }
+            }
+            let apiKey = stored.environment["ANTHROPIC_API_KEY"].flatMap {
+                $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0
+            }
+            return CLIResolvedProviderAuthentication(
+                apiKey: apiKey,
+                headers: [:],
+                environment: stored.environment
+            )
+        }
 
         if api == "google-vertex" || provider == "google-vertex" {
             if let explicitAPIKey,
@@ -78,9 +141,9 @@ enum CLIProviderAuthenticationResolver {
                     environment: stored.environment
                 )
             }
-            if let bearerToken = stored.bearerToken {
+            if let selectedBearerToken {
                 return CLIResolvedProviderAuthentication(
-                    bearerToken: bearerToken,
+                    bearerToken: selectedBearerToken,
                     headers: [:],
                     environment: stored.environment
                 )
@@ -106,13 +169,13 @@ enum CLIProviderAuthenticationResolver {
         if api == "bedrock-converse-stream" {
             var resolvedEnvironment = stored.environment
             if CredentialResolver.aws(environment: resolvedEnvironment) == nil,
-                let selectedAPIKey
+                let bearer = selectedAPIKey ?? selectedBearerToken
             {
-                resolvedEnvironment["AWS_BEARER_TOKEN_BEDROCK"] = selectedAPIKey
+                resolvedEnvironment["AWS_BEARER_TOKEN_BEDROCK"] = bearer
             }
             return CLIResolvedProviderAuthentication(
                 apiKey: selectedAPIKey,
-                bearerToken: stored.bearerToken,
+                bearerToken: selectedBearerToken,
                 headers: [:],
                 environment: resolvedEnvironment
             )
@@ -120,7 +183,7 @@ enum CLIProviderAuthenticationResolver {
 
         return CLIResolvedProviderAuthentication(
             apiKey: selectedAPIKey,
-            bearerToken: stored.bearerToken,
+            bearerToken: selectedBearerToken,
             headers: [:],
             environment: stored.environment
         )
@@ -268,6 +331,7 @@ actor CLIModelStreamDispatcher {
             let authentication = try await resolveAuthentication(
                 for: model,
                 requestAPIKey: options.apiKey,
+                requestBearerToken: options.bearerToken,
                 environment: currentEnvironment
             )
             let resolvedOptions = authentication.applying(to: options, for: model)
@@ -345,12 +409,14 @@ actor CLIModelStreamDispatcher {
     func resolveAuthentication(
         for model: Model,
         requestAPIKey: String? = nil,
+        requestBearerToken: String? = nil,
         environment: [String: String]? = nil
     ) async throws -> CLIResolvedProviderAuthentication {
         try await CLIProviderAuthenticationResolver.resolve(
             provider: model.provider,
             api: model.api,
             explicitAPIKey: explicitAPIKeys[model.provider] ?? requestAPIKey,
+            explicitBearerToken: requestBearerToken,
             store: authStore,
             environment: environment ?? self.environment()
         )
