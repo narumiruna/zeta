@@ -60,6 +60,14 @@ def parsed_pins(path: Path) -> dict[str, object]:
     return CHECK.resolved_pins(path)
 
 
+def graph_package(identity: str, *dependencies: dict[str, object]) -> dict[str, object]:
+    return {"identity": identity, "dependencies": list(dependencies)}
+
+
+def dependency_graph(*dependencies: dict[str, object]) -> dict[str, object]:
+    return {"identity": "root", "dependencies": list(dependencies)}
+
+
 class PackageDependencyPolicyTests(unittest.TestCase):
     def test_accepts_no_dependencies_without_resolved_file(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -259,7 +267,7 @@ class PackageDependencyPolicyTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            def resolve(command: list[str], **_: object) -> None:
+            def resolve(command: list[str], **_: object) -> object:
                 resolution_root = Path(command[command.index("--package-path") + 1])
                 copied_registry = (
                     resolution_root
@@ -271,6 +279,8 @@ class PackageDependencyPolicyTests(unittest.TestCase):
                     json.loads(copied_registry.read_text(encoding="utf-8")),
                     registry_configuration,
                 )
+                graph = dependency_graph() if "show-dependencies" in command else None
+                return mock.Mock(stdout=json.dumps(graph) if graph else None)
 
             with mock.patch.object(CHECK.subprocess, "run", side_effect=resolve):
                 pins = CHECK.independently_resolve(root, resolved)
@@ -295,21 +305,61 @@ class PackageDependencyPolicyTests(unittest.TestCase):
             write_resolved(resolved, committed_pins)
             expected_pins = parsed_pins(resolved)
 
-            def resolve(command: list[str], **_: object) -> None:
+            graph = dependency_graph(
+                graph_package("direct", graph_package("transitive"))
+            )
+
+            def resolve(command: list[str], **_: object) -> object:
                 resolution_root = Path(command[command.index("--package-path") + 1])
                 self.assertEqual(
                     parsed_pins(resolution_root / "Package.resolved"),
                     expected_pins,
                 )
-                self.assertLess(
-                    command.index("--force-resolved-versions"),
-                    command.index("resolve"),
-                )
+                self.assertIn("--force-resolved-versions", command)
+                output = json.dumps(graph) if "show-dependencies" in command else None
+                return mock.Mock(stdout=output)
 
             with mock.patch.object(CHECK.subprocess, "run", side_effect=resolve):
                 pins = CHECK.independently_resolve(root, resolved)
 
         self.assertEqual(pins, expected_pins)
+
+    def test_rejects_stale_pin_outside_forced_dependency_graph(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "Package.swift").write_text(
+                "// synthetic manifest\n",
+                encoding="utf-8",
+            )
+            resolved = root / "Package.resolved"
+            write_resolved(
+                resolved,
+                [
+                    pin("direct", {"version": "1.0.0", "revision": "direct-hash"}),
+                    pin(
+                        "transitive",
+                        {"version": "1.0.0", "revision": "transitive-hash"},
+                    ),
+                    pin("stale", {"version": "2.0.0", "revision": "stale-hash"}),
+                ],
+            )
+            graph = dependency_graph(
+                graph_package("direct", graph_package("transitive"))
+            )
+
+            def resolve(command: list[str], **_: object) -> object:
+                output = json.dumps(graph) if "show-dependencies" in command else None
+                return mock.Mock(stdout=output)
+
+            with mock.patch.object(CHECK.subprocess, "run", side_effect=resolve):
+                forced_pins = CHECK.independently_resolve(root, resolved)
+
+            with self.assertRaisesRegex(ValueError, "unexpected pins:.*stale"):
+                CHECK.check_dependency_policy(
+                    {"dependencies": [dependency("direct", "exact", "1.0.0")]},
+                    resolved,
+                    forced_pins,
+                )
 
     def test_requires_complete_independently_resolved_graph(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

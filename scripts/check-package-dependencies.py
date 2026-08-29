@@ -146,6 +146,32 @@ def resolved_pins(path: Path) -> dict[str, ResolvedPin]:
     return result
 
 
+def dependency_graph_identities(graph: Any) -> set[str]:
+    if not isinstance(graph, dict):
+        raise ValueError("resolved dependency graph root is invalid")
+    root_dependencies = graph.get("dependencies")
+    if not isinstance(root_dependencies, list):
+        raise ValueError("resolved dependency graph root has no dependency list")
+
+    identities: set[str] = set()
+    pending = list(root_dependencies)
+    while pending:
+        package = pending.pop()
+        if not isinstance(package, dict):
+            raise ValueError("resolved dependency graph contains an invalid package")
+        identity = package.get("identity")
+        dependencies = package.get("dependencies")
+        if not isinstance(identity, str) or not identity:
+            raise ValueError("resolved dependency graph contains a package without identity")
+        if not isinstance(dependencies, list):
+            raise ValueError(
+                f"resolved dependency graph package {identity!r} has no dependency list"
+            )
+        identities.add(identity.lower())
+        pending.extend(dependencies)
+    return identities
+
+
 def independently_resolve(
     package_path: Path, resolved_path: Path
 ) -> dict[str, ResolvedPin]:
@@ -159,6 +185,13 @@ def independently_resolve(
         resolution_root = Path(temporary)
         for candidate in package_path.glob("Package*.swift"):
             shutil.copy2(candidate, resolution_root / candidate.name)
+        for directory_name in ("Sources", "Tests", "Plugins"):
+            source_directory = package_path / directory_name
+            if source_directory.is_dir():
+                (resolution_root / directory_name).symlink_to(
+                    source_directory.resolve(),
+                    target_is_directory=True,
+                )
         shutil.copy2(resolved_path, resolution_root / "Package.resolved")
         configuration = package_path / ".swiftpm" / "configuration"
         if configuration.is_dir():
@@ -166,20 +199,30 @@ def independently_resolve(
                 configuration,
                 resolution_root / ".swiftpm" / "configuration",
             )
-        subprocess.run(
-            [
-                "swift",
-                "package",
-                "--package-path",
-                str(resolution_root),
-                "--scratch-path",
-                str(resolution_root / ".build"),
-                "--force-resolved-versions",
-                "resolve",
-            ],
+        swift_package = [
+            "swift",
+            "package",
+            "--package-path",
+            str(resolution_root),
+            "--scratch-path",
+            str(resolution_root / ".build"),
+            "--force-resolved-versions",
+        ]
+        subprocess.run([*swift_package, "resolve"], check=True)
+        graph_result = subprocess.run(
+            [*swift_package, "show-dependencies", "--format", "json"],
             check=True,
+            capture_output=True,
+            text=True,
         )
-        return resolved_pins(resolution_root / "Package.resolved")
+        pins = resolved_pins(resolution_root / "Package.resolved")
+        identities = dependency_graph_identities(json.loads(graph_result.stdout))
+        unpinned = sorted(identities - pins.keys())
+        if unpinned:
+            raise ValueError(
+                f"resolved dependency graph contains unpinned packages: {unpinned}"
+            )
+        return {identity: pins[identity] for identity in identities}
 
 
 def compare_resolution_graphs(
