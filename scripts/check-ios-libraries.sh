@@ -3,30 +3,26 @@ set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
 consumer_root="$root/Examples/iOSLibraryConsumer"
-artifacts_input="${ZETA_IOS_ARTIFACTS_DIR:-/tmp/zeta-ios-libraries}"
-if [[ "$artifacts_input" = /* ]]; then
-  artifacts_dir="$artifacts_input"
-else
-  artifacts_dir="$root/$artifacts_input"
-fi
-mkdir -p "$artifacts_dir"
-artifacts_dir="$(realpath "$artifacts_dir")"
-if [[ "$artifacts_dir" = "/" || "$artifacts_dir" = "$root" ]]; then
-  echo "FAIL: refusing unsafe iOS artifacts directory: $artifacts_dir" >&2
+if ! command -v uv >/dev/null 2>&1; then
+  echo "FAIL: required command is unavailable: uv" >&2
   exit 1
 fi
-rm -rf "$artifacts_dir"
-mkdir -p "$artifacts_dir"
-derived_root="${TMPDIR:-/tmp}/zeta-ios-libraries-derived-$$"
-rm -rf "$derived_root"
-mkdir -p "$derived_root"
+artifacts_input="${ZETA_IOS_ARTIFACTS_DIR:-/tmp/zeta-ios-libraries}"
+if [[ "$artifacts_input" != /* ]]; then
+  artifacts_input="$root/$artifacts_input"
+fi
+artifacts_dir="$(
+  uv run python "$root/scripts/ios_library_check_support.py" \
+    prepare-artifacts "$artifacts_input" "$root"
+)"
+derived_root="$(mktemp -d "${TMPDIR:-/tmp}/zeta-ios-libraries-derived.XXXXXX")"
 trap 'rm -rf "$derived_root"' EXIT
 
 if [[ -z "${DEVELOPER_DIR:-}" && -d /Applications/Xcode.app/Contents/Developer ]]; then
   export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
 fi
 
-for command in swift uv xcodebuild xcrun; do
+for command in swift xcodebuild xcrun; do
   if ! command -v "$command" >/dev/null 2>&1; then
     echo "FAIL: required command is unavailable: $command" >&2
     exit 1
@@ -147,25 +143,10 @@ common_build_settings=(
 )
 
 xcrun simctl list devices available -j >"$artifacts_dir/simulators-before.json"
-simulator_record="$(uv run python - "$artifacts_dir/simulators-before.json" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-payload = json.loads(Path(sys.argv[1]).read_text())
-candidates = []
-for runtime, devices in payload.get("devices", {}).items():
-    if not runtime.startswith("com.apple.CoreSimulator.SimRuntime.iOS-"):
-        continue
-    for device in devices:
-        state = device.get("state")
-        if state in {"Booted", "Shutdown"}:
-            candidates.append((state != "Booted", runtime, device["udid"], state, device["name"]))
-if not candidates:
-    raise SystemExit("no available iOS Simulator is installed")
-_, _, udid, state, name = sorted(candidates)[0]
-print(f"{udid}\t{state}\t{name}")
-PY
+simulator_record="$(
+  uv run python "$root/scripts/ios_library_check_support.py" \
+    select-simulator "$artifacts_dir/simulators-before.json" \
+    --minimum 17.0
 )"
 IFS=$'\t' read -r simulator_udid simulator_initial_state simulator_name <<<"$simulator_record"
 if [[ -z "$simulator_udid" || -z "$simulator_initial_state" ]]; then
