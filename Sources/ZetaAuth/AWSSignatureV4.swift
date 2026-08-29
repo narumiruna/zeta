@@ -88,7 +88,9 @@ public enum AWSSignatureV4 {
             .joined()
         let signedHeaders = headerNames.joined(separator: ";")
         components.percentEncodedQuery = canonicalQuery(components)
-        let canonicalURI = url.path.isEmpty ? "/" : awsEncodePath(url.path)
+        let canonicalURI =
+            components.percentEncodedPath.isEmpty
+            ? "/" : awsEncodePath(components.percentEncodedPath)
         let payloadHash = sha256(body)
         let canonicalRequest = [
             request.httpMethod ?? "GET",
@@ -168,10 +170,47 @@ public enum AWSSignatureV4 {
         ) ?? ""
     }
 
-    private static func awsEncodePath(_ value: String) -> String {
-        value.split(separator: "/", omittingEmptySubsequences: false)
-            .map { awsEncode(String($0)) }
+    private static func awsEncodePath(_ percentEncodedPath: String) -> String {
+        percentEncodedPath.split(separator: "/", omittingEmptySubsequences: false)
+            .map { awsEncodePathSegment($0) }
             .joined(separator: "/")
+    }
+
+    private static func awsEncodePathSegment(_ segment: Substring) -> String {
+        let encoded = Array(segment.utf8)
+        var decoded: [UInt8] = []
+        decoded.reserveCapacity(encoded.count)
+        var index = 0
+        while index < encoded.count {
+            if encoded[index] == 0x25,
+                index + 2 < encoded.count,
+                let high = hexValue(encoded[index + 1]),
+                let low = hexValue(encoded[index + 2])
+            {
+                decoded.append(high << 4 | low)
+                index += 3
+            } else {
+                decoded.append(encoded[index])
+                index += 1
+            }
+        }
+        return decoded.map { byte in
+            switch byte {
+            case 0x41...0x5A, 0x61...0x7A, 0x30...0x39, 0x2D, 0x2E, 0x5F, 0x7E:
+                String(UnicodeScalar(byte))
+            default:
+                String(format: "%%%02X", byte)
+            }
+        }.joined()
+    }
+
+    private static func hexValue(_ byte: UInt8) -> UInt8? {
+        switch byte {
+        case 0x30...0x39: byte - 0x30
+        case 0x41...0x46: byte - 0x41 + 10
+        case 0x61...0x66: byte - 0x61 + 10
+        default: nil
+        }
     }
 
     private static func sha256(_ data: Data) -> String {

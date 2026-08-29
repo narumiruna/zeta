@@ -121,8 +121,65 @@ final class ZetaUnixTransportTests: XCTestCase {
         await serverConnection.close()
     }
 
+    func testConcurrentServerPendingLimitClosesStalledPeerAndReleasesEveryReservation() async throws {
+        var descriptors = [Int32](repeating: -1, count: 2)
+        guard socketpair(AF_UNIX, SOCK_STREAM, 0, &descriptors) == 0 else {
+            return XCTFail("socketpair failed: \(errno)")
+        }
+        let lifecycleQueue = DispatchQueue(label: "zeta.unix.test.suspended-server-lifecycle")
+        lifecycleQueue.suspend()
+        var resumed = false
+        defer {
+            if !resumed { lifecycleQueue.resume() }
+            Darwin.close(descriptors[1])
+        }
+        let connection = UnixServerConnection(
+            descriptor: descriptors[0],
+            maximumPendingBytes: 32,
+            queue: lifecycleQueue
+        )
+        let sends = (0..<64).map { _ in
+            Task { await serverSendOutcome(connection, Data([0x41])) }
+        }
+
+        try await waitUntil { connection.isClosed }
+        XCTAssertEqual(connection.pendingByteCount, 32)
+        lifecycleQueue.resume()
+        resumed = true
+
+        var outcomes: [ServerSendOutcome] = []
+        for send in sends { outcomes.append(await send.value) }
+        XCTAssertTrue(outcomes.contains(.pendingLimit))
+        XCTAssertFalse(outcomes.contains(.sent))
+        XCTAssertFalse(outcomes.contains(.other))
+        XCTAssertEqual(connection.pendingByteCount, 0)
+        let lateOutcome = await serverSendOutcome(connection, Data([0x42]))
+        XCTAssertEqual(lateOutcome, .closed)
+        await connection.close()
+    }
+
     func testRejectsOverlongPath() {
         XCTAssertThrowsError(try UnixServerListener(path: "/tmp/" + String(repeating: "x", count: 104)) { _ in })
+    }
+}
+
+private enum ServerSendOutcome: Equatable, Sendable {
+    case sent
+    case pendingLimit
+    case closed
+    case other
+}
+
+private func serverSendOutcome(_ connection: UnixServerConnection, _ data: Data) async -> ServerSendOutcome {
+    do {
+        try await connection.send(data)
+        return .sent
+    } catch UnixTransportError.pendingBytesExceeded {
+        return .pendingLimit
+    } catch UnixTransportError.closed {
+        return .closed
+    } catch {
+        return .other
     }
 }
 

@@ -68,6 +68,69 @@ final class NewestCLISessionFeedbackTests: XCTestCase {
         try await rpcSession.drainPersistenceErrors()
     }
 
+    func testRPCPromptQueueEnforcesCountAndEncodedByteLimitsAndClearReleasesBudget() async throws {
+        let provider = QueueHeldProvider()
+        let model = provider.model
+        let agent = Agent(state: AgentState(systemPrompt: "", model: model)) {
+            model, context, options in
+            await provider.stream(model: model, context: context, options: options)
+        }
+        let runtime = CLIRPCRuntime(
+            agent: agent,
+            models: [model],
+            workingDirectory: FileManager.default.temporaryDirectory,
+            promptQueueMaximumCount: 1,
+            promptQueueMaximumBytes: 16
+        )
+
+        let active = await runtime.handle(
+            StrictRPCRequest(command: .prompt, fields: ["message": "active"])
+        )
+        XCTAssertTrue(active.success)
+        await provider.waitUntilFirstCallStarts()
+
+        let full = await runtime.handle(
+            StrictRPCRequest(command: .prompt, fields: ["message": "12345678"])
+        )
+        XCTAssertTrue(full.success)
+        let countRejected = await runtime.handle(
+            StrictRPCRequest(command: .prompt, fields: ["message": "x"])
+        )
+        XCTAssertFalse(countRejected.success)
+        XCTAssertTrue(countRejected.error?.contains("queue limit exceeded") == true)
+
+        let cleared = await runtime.handle(StrictRPCRequest(command: .clearQueue))
+        XCTAssertTrue(cleared.success)
+        let png = Data([0x89, 0x50, 0x4E, 0x47]).base64EncodedString()
+        let imageRejected = await runtime.handle(
+            StrictRPCRequest(
+                command: .prompt,
+                fields: [
+                    "message": "123456789",
+                    "images": .array([
+                        .object([
+                            "type": "image",
+                            "data": .string(png),
+                            "mimeType": "image/png",
+                        ])
+                    ]),
+                ]
+            )
+        )
+        XCTAssertFalse(imageRejected.success)
+        XCTAssertTrue(imageRejected.error?.contains("16 encoded payload bytes") == true)
+
+        let afterClear = await runtime.handle(
+            StrictRPCRequest(command: .prompt, fields: ["message": "éééééééé"])
+        )
+        XCTAssertTrue(afterClear.success)
+        await provider.finishFirstCall()
+        await runtime.waitForIdle()
+
+        let finalMessages = await agent.state().messages
+        XCTAssertEqual(finalMessages.compactMap(userMessageText), ["active", "éééééééé"])
+    }
+
     func testCycleModelPersistsBeforeUpdatingOrAcknowledging() async throws {
         let root = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -299,6 +362,81 @@ final class NewestCLISessionFeedbackTests: XCTestCase {
         XCTAssertEqual(loadedParent, "/synthetic/parent.jsonl")
     }
 
+    func testInteractiveNewSessionMaterializationFailurePreservesAgentAndController() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let model = model(id: "interactive-new-failure")
+        let originalMessages = messages(model: model)
+        let session = try self.session(
+            root: root,
+            injectFailure: { operation in
+                if operation == .materializeNewSession {
+                    throw InjectedFailure.materializeNewSession
+                }
+            }
+        )
+        let originalFile = await session.currentFile()
+        let originalHeader = await session.exportSnapshot().header
+        let agent = agent(
+            model: model,
+            messages: originalMessages,
+            provider: FauxProvider(models: [model])
+        )
+
+        do {
+            try await InteractiveSessionCommands.newSession(agent: agent, session: session)
+            XCTFail("Expected replacement materialization to fail")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("materializeNewSession"))
+        }
+
+        let unchangedMessages = await agent.state().messages
+        let unchangedFile = await session.currentFile()
+        let unchangedHeader = await session.exportSnapshot().header
+        XCTAssertEqual(unchangedMessages, originalMessages)
+        XCTAssertEqual(unchangedFile, originalFile)
+        XCTAssertEqual(unchangedHeader, originalHeader)
+    }
+
+    func testRPCNewSessionMaterializationFailurePreservesAgentAndController() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let model = model(id: "rpc-new-failure")
+        let originalMessages = messages(model: model)
+        let session = try self.session(
+            root: root,
+            injectFailure: { operation in
+                if operation == .materializeNewSession {
+                    throw InjectedFailure.materializeNewSession
+                }
+            }
+        )
+        let originalFile = await session.currentFile()
+        let originalHeader = await session.exportSnapshot().header
+        let agent = agent(
+            model: model,
+            messages: originalMessages,
+            provider: FauxProvider(models: [model])
+        )
+        let runtime = CLIRPCRuntime(
+            agent: agent,
+            models: [model],
+            workingDirectory: root,
+            session: session
+        )
+
+        let response = await runtime.handle(StrictRPCRequest(command: .newSession))
+
+        XCTAssertFalse(response.success)
+        XCTAssertTrue(response.error?.contains("materializeNewSession") == true)
+        let unchangedMessages = await agent.state().messages
+        let unchangedFile = await session.currentFile()
+        let unchangedHeader = await session.exportSnapshot().header
+        XCTAssertEqual(unchangedMessages, originalMessages)
+        XCTAssertEqual(unchangedFile, originalFile)
+        XCTAssertEqual(unchangedHeader, originalHeader)
+    }
+
     func testExportHTMLWritesRequestedPathAndRetainsInlineResponse() async throws {
         let root = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -414,6 +552,13 @@ final class NewestCLISessionFeedbackTests: XCTestCase {
         }
     }
 
+    private func userMessageText(_ message: Message) -> String? {
+        guard case .user(let user) = message else { return nil }
+        return user.content.compactMap { block in
+            if case .text(let text, _) = block { text } else { nil }
+        }.joined()
+    }
+
     private func retryValues(_ agent: Agent) async -> (Int, Int, Int) {
         let maximum = await agent.maximumRetries
         let base = await agent.retryBaseDelayMilliseconds
@@ -440,10 +585,79 @@ final class NewestCLISessionFeedbackTests: XCTestCase {
     }
 }
 
+private actor QueueHeldProvider {
+    let model = Model(
+        id: "queue-held",
+        name: "Queue Held",
+        api: "faux",
+        provider: "queue-held",
+        baseURL: URL(string: "https://example.invalid")!,
+        contextWindow: 128_000,
+        maximumTokens: 1_000
+    )
+    private var calls = 0
+    private var firstStream: AssistantEventStream?
+
+    func stream(
+        model: Model,
+        context: Context,
+        options: StreamOptions
+    ) async -> AssistantEventStream {
+        calls += 1
+        let stream = AssistantEventStream()
+        await stream.emit(
+            .start(
+                AssistantMessage(
+                    api: model.api,
+                    provider: model.provider,
+                    model: model.id
+                )
+            )
+        )
+        if calls == 1 {
+            firstStream = stream
+        } else {
+            await finish(stream, text: "response \(calls)", model: model)
+        }
+        return stream
+    }
+
+    func waitUntilFirstCallStarts() async {
+        while firstStream == nil {
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+    }
+
+    func finishFirstCall() async {
+        guard let firstStream else { return }
+        await finish(firstStream, text: "response 1", model: model)
+    }
+
+    private func finish(
+        _ stream: AssistantEventStream,
+        text: String,
+        model: Model
+    ) async {
+        await stream.emit(
+            .done(
+                reason: .stop,
+                message: AssistantMessage(
+                    content: [.text(text: text)],
+                    api: model.api,
+                    provider: model.provider,
+                    model: model.id,
+                    stopReason: .stop
+                )
+            )
+        )
+    }
+}
+
 private enum InjectedFailure: Error, LocalizedError {
     case recordMessage
     case recordModel
     case materializeName
+    case materializeNewSession
     case recordCompaction
 
     var errorDescription: String? {
@@ -451,6 +665,7 @@ private enum InjectedFailure: Error, LocalizedError {
         case .recordMessage: "injected recordMessage failure"
         case .recordModel: "injected recordModel failure"
         case .materializeName: "injected materializeName failure"
+        case .materializeNewSession: "injected materializeNewSession failure"
         case .recordCompaction: "injected recordCompaction failure"
         }
     }

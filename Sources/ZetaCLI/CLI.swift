@@ -443,7 +443,17 @@ public enum ZetaCLI {
                 guard case .object(let object) = arguments, case .string(let path)? = object["path"] else {
                     throw FileToolError.invalidPath("path")
                 }
-                return AgentToolResult(content: [.text(text: try files.read(path: path))])
+                let offset = try integerArgument(object["offset"], name: "offset", minimum: 1) ?? 1
+                let limit = try integerArgument(object["limit"], name: "limit", minimum: 0)
+                switch try files.readContent(path: path, offset: offset, limit: limit) {
+                case .text(let text):
+                    return AgentToolResult(content: [.text(text: text)])
+                case .image(let data, let mimeType):
+                    return AgentToolResult(content: [
+                        .text(text: "Read image file [\(mimeType)]"),
+                        .image(data: data.base64EncodedString(), mimeType: mimeType),
+                    ])
+                }
             },
             AgentTool(
                 definition: ToolDefinition(
@@ -616,6 +626,22 @@ public enum ZetaCLI {
         return InitialPrompt(text: text, images: images)
     }
 
+    private static func integerArgument(
+        _ value: JSONValue?,
+        name: String,
+        minimum: Int64
+    ) throws -> Int? {
+        guard let value else { return nil }
+        guard case .number(let number) = value,
+            let integer = number.safeIntegerValue,
+            integer >= minimum,
+            integer <= Int64(Int.max)
+        else {
+            throw FileToolError.invalidPath("\(name) must be an integer of at least \(minimum)")
+        }
+        return Int(integer)
+    }
+
     static func imageMIME(_ data: Data) -> String? {
         let bytes = [UInt8](data.prefix(12))
         if bytes.starts(with: [0x89, 0x50, 0x4E, 0x47]) { return "image/png" }
@@ -758,10 +784,13 @@ enum InteractiveSessionCommands {
         agent: Agent,
         session: PersistentSessionController?
     ) async throws {
+        let replacement = try await session?.prepareNewSession()
         await agent.abort()
         await agent.waitForIdle()
         try await agent.reset()
-        _ = try await session?.newSession()
+        if let replacement {
+            await session?.publishNewSession(replacement)
+        }
     }
 
     static func exit(agent: Agent) async {

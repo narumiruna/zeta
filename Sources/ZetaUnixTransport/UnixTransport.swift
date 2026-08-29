@@ -227,8 +227,10 @@ public func createUnixTransportFactory(path: String, maximumPendingBytes: Int = 
 public final class UnixServerConnection: ServerByteConnection, @unchecked Sendable {
     public let id = UUID().uuidString
     private let descriptor: Int32
-    private let queue = DispatchQueue(label: "zeta.unix.server.lifecycle")
+    private let maximumPendingBytes: Int
+    private let queue: DispatchQueue
     private let lock = NSLock()
+    private var pendingBytes = 0
     private var closed = false
     private var descriptorClosed = false
     private var notifyOnClose = false
@@ -237,7 +239,15 @@ public final class UnixServerConnection: ServerByteConnection, @unchecked Sendab
     private var dataHandler: (@Sendable (Data) -> Void)?
     private var closeHandler: (@Sendable () -> Void)?
 
-    fileprivate init(descriptor: Int32) { self.descriptor = descriptor }
+    init(
+        descriptor: Int32,
+        maximumPendingBytes: Int = 64 * 1_024 * 1_024,
+        queue: DispatchQueue = DispatchQueue(label: "zeta.unix.server.lifecycle")
+    ) {
+        self.descriptor = descriptor
+        self.maximumPendingBytes = maximumPendingBytes
+        self.queue = queue
+    }
 
     public func start(onData: @escaping @Sendable (Data) -> Void, onClose: @escaping @Sendable () -> Void) {
         let source: DispatchSourceRead? = lock.withLock {
@@ -267,9 +277,23 @@ public final class UnixServerConnection: ServerByteConnection, @unchecked Sendab
 
     public func send(_ bytes: Data) async throws {
         let copy = Data(bytes)
-        guard !lock.withLock({ closed }) else { throw UnixTransportError.closed }
+        do {
+            try lock.withLock {
+                guard !closed else { throw UnixTransportError.closed }
+                guard copy.count <= maximumPendingBytes,
+                    pendingBytes <= maximumPendingBytes - copy.count
+                else {
+                    throw UnixTransportError.pendingBytesExceeded
+                }
+                pendingBytes += copy.count
+            }
+        } catch UnixTransportError.pendingBytesExceeded {
+            beginClose(notify: true)
+            throw UnixTransportError.pendingBytesExceeded
+        }
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             queue.async {
+                defer { self.releasePendingBytes(copy.count) }
                 guard !self.lock.withLock({ self.closed }) else {
                     continuation.resume(throwing: UnixTransportError.closed)
                     return
@@ -290,6 +314,13 @@ public final class UnixServerConnection: ServerByteConnection, @unchecked Sendab
         await withCheckedContinuation { continuation in
             beginClose(notify: false, waiter: continuation)
         }
+    }
+
+    var pendingByteCount: Int { lock.withLock { pendingBytes } }
+    var isClosed: Bool { lock.withLock { closed } }
+
+    private func releasePendingBytes(_ count: Int) {
+        lock.withLock { pendingBytes -= count }
     }
 
     private func beginClose(

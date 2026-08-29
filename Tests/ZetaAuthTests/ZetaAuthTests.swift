@@ -211,6 +211,65 @@ final class ZetaAuthTests: XCTestCase {
         XCTAssertTrue(requestBody.contains("refresh_token=refresh"))
     }
 
+    func testAWSSigningPreservesEncodedBedrockModelSeparator() throws {
+        var request = URLRequest(
+            url: URL(
+                string:
+                    "https://bedrock.example.com/runtime/model/arn%3Aaws%3Abedrock%3Aus-east-1%3A123%3Amodel%2Fprofile/converse-stream"
+            )!
+        )
+        request.httpMethod = "POST"
+        let signed = try AWSSignatureV4.sign(
+            request: request,
+            body: Data("{}".utf8),
+            service: "bedrock",
+            region: "us-east-1",
+            credential: AWSCredential(
+                accessKeyID: "access",
+                secretAccessKey: "secret"
+            ),
+            date: ISO8601DateFormatter().date(from: "2024-01-02T03:04:05Z")!
+        )
+        let canonicalURI = signed.canonicalRequest.split(
+            separator: "\n",
+            omittingEmptySubsequences: false
+        )[1]
+
+        XCTAssertEqual(
+            canonicalURI,
+            "/runtime/model/arn%3Aaws%3Abedrock%3Aus-east-1%3A123%3Amodel%2Fprofile/converse-stream"
+        )
+        XCTAssertFalse(canonicalURI.contains("%252F"))
+        XCTAssertEqual(
+            signed.signature,
+            "4bdc45cde52ccf671f04d994c458cc39f20cc30458bc25eb54c9e6685cd2887a"
+        )
+    }
+
+    func testAWSCanonicalPathNormalizesPercentEncodingExactlyOnce() throws {
+        var request = URLRequest(
+            url: URL(string: "https://example.com/a%2fb/%7e/%252F/a%20b")!
+        )
+        request.httpMethod = "GET"
+        let signed = try AWSSignatureV4.sign(
+            request: request,
+            body: Data(),
+            service: "execute-api",
+            region: "us-east-1",
+            credential: AWSCredential(
+                accessKeyID: "access",
+                secretAccessKey: "secret"
+            ),
+            date: Date(timeIntervalSince1970: 0)
+        )
+        let canonicalURI = signed.canonicalRequest.split(
+            separator: "\n",
+            omittingEmptySubsequences: false
+        )[1]
+
+        XCTAssertEqual(canonicalURI, "/a%2Fb/~/%252F/a%20b")
+    }
+
     func testAWSSigningIsDeterministic() throws {
         var request = URLRequest(
             url: URL(string: "https://iam.amazonaws.com/?Action=ListUsers&Version=2010-05-08")!

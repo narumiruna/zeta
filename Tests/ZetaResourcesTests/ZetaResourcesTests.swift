@@ -1,3 +1,4 @@
+import Darwin
 import XCTest
 
 @testable import ZetaResources
@@ -83,6 +84,39 @@ final class ZetaResourcesTests: XCTestCase {
         ).load()
         XCTAssertEqual(allowed.prompts.map(\.name), ["global"])
         XCTAssertEqual(allowed.skills.map(\.name), ["packaged"])
+    }
+
+    func testFIFOResourcesAndPackageNodesAreRejectedWithoutBlocking() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let home = root.appendingPathComponent("home")
+        let agent = home.appendingPathComponent(".pi/agent")
+        let packages = agent.appendingPathComponent("packages")
+        let package = packages.appendingPathComponent("unsafe-package")
+        let workingDirectory = root.appendingPathComponent("project")
+        try FileManager.default.createDirectory(at: package, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: workingDirectory, withIntermediateDirectories: true)
+        try Data(#"{"name":"unsafe","pi":{"prompts":[]}}"#.utf8).write(
+            to: package.appendingPathComponent("package.json")
+        )
+        XCTAssertEqual(mkfifo(package.appendingPathComponent("blocked.md").path, 0o600), 0)
+        XCTAssertEqual(mkfifo(agent.appendingPathComponent("AGENTS.md").path, 0o600), 0)
+        try Data(#"{"unsafe":{"directory":"unsafe-package"}}"#.utf8).write(
+            to: packages.appendingPathComponent("packages.json")
+        )
+        let start = ContinuousClock.now
+
+        let snapshot = ResourceLoader(
+            home: home,
+            workingDirectory: workingDirectory,
+            agentDirectory: agent,
+            trusted: false
+        ).load()
+
+        XCTAssertLessThan(start.duration(to: .now), .seconds(1))
+        XCTAssertTrue(snapshot.context.isEmpty)
+        XCTAssertTrue(snapshot.prompts.isEmpty)
+        XCTAssertTrue(snapshot.diagnostics.contains { $0.message.contains("unsafe symbolic link or file type") })
     }
 
     func testCRLFAndLFFrontmatterPreserveResourceBodies() throws {

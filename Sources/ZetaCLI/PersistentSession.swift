@@ -22,6 +22,11 @@ struct DeferredPersistenceError: LocalizedError, Sendable, Equatable {
     }
 }
 
+struct PreparedSessionReplacement: Sendable {
+    fileprivate let manager: SessionManager
+    let file: URL?
+}
+
 actor PersistentSessionController {
     typealias FailureInjector = @Sendable (PersistentSessionOperation) throws -> Void
 
@@ -125,8 +130,7 @@ actor PersistentSessionController {
         throw DeferredPersistenceError(failures: failures)
     }
 
-    @discardableResult
-    func newSession(parentSession: String? = nil) async throws -> URL? {
+    func prepareNewSession(parentSession: String? = nil) async throws -> PreparedSessionReplacement {
         try drainPersistenceErrors()
         let currentFile = await manager.file
         let root =
@@ -139,9 +143,22 @@ actor PersistentSessionController {
         )
         try injectFailure(.materializeNewSession)
         try await replacement.materialize()
-        manager = replacement
+        return PreparedSessionReplacement(
+            manager: replacement,
+            file: await replacement.file
+        )
+    }
+
+    func publishNewSession(_ replacement: PreparedSessionReplacement) {
+        manager = replacement.manager
         errors = []
-        return await replacement.file
+    }
+
+    @discardableResult
+    func newSession(parentSession: String? = nil) async throws -> URL? {
+        let replacement = try await prepareNewSession(parentSession: parentSession)
+        publishNewSession(replacement)
+        return replacement.file
     }
 
     func recordCompaction(

@@ -64,7 +64,7 @@ public actor AssistantEventStream: AsyncSequence {
             latestPartial = message
         case .done(let reason, let message):
             guard started, [.stop, .length, .toolUse, .deferred].contains(reason), message.stopReason == reason else {
-                finishProtocolError("Invalid done event")
+                finishProtocolError("Invalid done event", preserving: message)
                 return
             }
             settle(message, event: event)
@@ -73,7 +73,7 @@ public actor AssistantEventStream: AsyncSequence {
             guard started, [.error, .aborted].contains(reason), message.stopReason == reason,
                 message.errorMessage != nil
             else {
-                finishProtocolError("Invalid error event")
+                finishProtocolError("Invalid error event", preserving: message)
                 return
             }
             settle(message, event: event)
@@ -134,9 +134,16 @@ public actor AssistantEventStream: AsyncSequence {
         terminalWaiters.removeAll()
     }
 
-    private func finishProtocolError(_ text: String) {
+    private func finishProtocolError(_ text: String, preserving partial: AssistantMessage) {
+        var message = partial
+        message.stopReason = .error
+        message.errorMessage = text
+        terminal = message
+        latestPartial = message
         finished = true
         continuation.finish(throwing: StreamProtocolError(text))
+        terminalWaiters.forEach { $0.resume(returning: message) }
+        terminalWaiters.removeAll()
     }
 }
 

@@ -17,6 +17,74 @@ final class ZetaToolsTests: XCTestCase {
         XCTAssertTrue(result.partialBoundaryLine)
     }
 
+    func testReadBoundsDefaultsAndPreservesOffsetLimitSemantics() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let content = (1...2_500).map { "line-\($0)" }.joined(separator: "\n")
+        try Data(content.utf8).write(to: directory.appendingPathComponent("lines.txt"))
+        let tools = FileTools(workingDirectory: directory)
+
+        let bounded = try tools.read(path: "lines.txt")
+
+        XCTAssertEqual(bounded.split(separator: "\n").count, defaultMaximumLines)
+        XCTAssertTrue(bounded.hasSuffix("line-2000"))
+        XCTAssertLessThanOrEqual(bounded.utf8.count, defaultMaximumBytes)
+        XCTAssertEqual(
+            try tools.read(path: "lines.txt", offset: 2_000, limit: 2),
+            "line-2000\nline-2001"
+        )
+        XCTAssertEqual(try tools.read(path: "lines.txt", offset: 3_000), "")
+        XCTAssertEqual(try tools.read(path: "lines.txt", limit: 0), "")
+    }
+
+    func testReadStopsAtByteLimitWithoutAllocatingLargeSparseFile() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let file = directory.appendingPathComponent("sparse.txt")
+        FileManager.default.createFile(atPath: file.path, contents: nil)
+        let handle = try FileHandle(forWritingTo: file)
+        try handle.truncate(atOffset: 8 * 1_024 * 1_024 * 1_024)
+        try handle.close()
+        let tools = FileTools(workingDirectory: directory)
+        let start = ContinuousClock.now
+
+        let content = try tools.read(path: "sparse.txt")
+
+        XCTAssertEqual(content, "")
+        XCTAssertLessThan(start.duration(to: .now), .seconds(2))
+    }
+
+    func testReadRejectsFIFOWithoutBlocking() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let fifo = directory.appendingPathComponent("input.txt")
+        XCTAssertEqual(mkfifo(fifo.path, 0o600), 0)
+        let tools = FileTools(workingDirectory: directory)
+        let start = ContinuousClock.now
+
+        XCTAssertThrowsError(try tools.read(path: "input.txt"))
+
+        XCTAssertLessThan(start.duration(to: .now), .seconds(1))
+    }
+
+    func testReadContentDetectsImagesBeforeTextDecoding() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let data = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
+        try data.write(to: directory.appendingPathComponent("image.png"))
+        let tools = FileTools(workingDirectory: directory)
+
+        guard case .image(let loaded, let mimeType) = try tools.readContent(path: "image.png") else {
+            return XCTFail("Expected image content")
+        }
+        XCTAssertEqual(loaded, data)
+        XCTAssertEqual(mimeType, "image/png")
+    }
+
     func testEditMatchesOriginalAndRejectsOverlap() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)

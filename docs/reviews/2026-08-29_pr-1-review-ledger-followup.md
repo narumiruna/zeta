@@ -422,6 +422,64 @@ Outcome: Addressed by rendering `errorMessage` for error or aborted assistants w
 
 Evidence: Interactive transcript regression verifies the visible diagnostic.
 
+## Eleventh-round inline feedback
+
+### `3885890797`
+
+Concern: File reads allocate complete large files before applying limits.
+
+Outcome: Addressed by incremental text reading with 2,000-line and 50 KiB limits before buffering the result.
+
+Evidence: Sparse-file regression verifies bounded memory-facing output and offset behavior.
+
+### `3885890802`
+
+Concern: Package archives accept FIFOs and other special files.
+
+Outcome: Addressed by allowing only regular files and directories in archive listings and validated package trees.
+
+Evidence: FIFO, device-shaped archive, and package-tree regressions reject publication and avoid blocking.
+
+### `3885890804`
+
+Concern: Server connection queued writes have no pending-byte budget.
+
+Outcome: Addressed with atomic pending-byte reservation, exact release, limit rejection, and connection closure while preserving the public initializer.
+
+Evidence: Concurrent slow-peer regressions verify bounded admission and settlement.
+
+### `3885890807`
+
+Concern: Stream protocol errors do not settle `result()` waiters.
+
+Outcome: Addressed by synthesizing a terminal error assistant, resuming every waiter, and terminating iterator delivery consistently.
+
+Evidence: Stream regression races invalid terminal events with result waiters.
+
+### `3885890811`
+
+Concern: Prompts queued behind an RPC run are unbounded.
+
+Outcome: Addressed with 64-prompt and 16 MiB encoded-content budgets that are released on dequeue or clear.
+
+Evidence: RPC queue regressions verify rejection, byte accounting, and `clear_queue` recovery.
+
+### `3885890812`
+
+Concern: SigV4 canonical paths decode encoded separators.
+
+Outcome: Addressed by canonicalizing `percentEncodedPath` so `%2F` remains within the model path segment and is encoded exactly once.
+
+Evidence: Deterministic SigV4 regression covers a slash-bearing Bedrock model identifier.
+
+### `3885890813`
+
+Concern: Interactive `/new` clears live history before replacement materialization succeeds.
+
+Outcome: Addressed with two-phase replacement that materializes first, resets the agent second, and publishes the controller last.
+
+Evidence: Interactive and RPC failure regressions verify old messages and session ownership remain unchanged.
+
 ## Ninth-round inline feedback
 
 ### `3885868033`

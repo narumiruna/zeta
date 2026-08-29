@@ -43,6 +43,11 @@ public struct EditResult: Sendable, Equatable {
     public let updated: String
 }
 
+package enum FileReadContent: Sendable, Equatable {
+    case text(String)
+    case image(data: Data, mimeType: String)
+}
+
 public actor FileMutationCoordinator {
     public static let shared = FileMutationCoordinator()
     private var active: Set<String> = []
@@ -98,15 +103,97 @@ public struct FileTools: @unchecked Sendable {
 
     public func read(path: String, offset: Int = 1, limit: Int? = nil) throws -> String {
         guard offset >= 1 else { throw FileToolError.invalidPath("offset must be at least 1") }
-        let url = try resolve(path)
-        guard let data = fileManager.contents(atPath: url.path) else {
+        if let limit, limit < 0 {
+            throw FileToolError.invalidPath("limit must not be negative")
+        }
+        let maximumLines = min(limit ?? defaultMaximumLines, defaultMaximumLines)
+        guard maximumLines > 0 else { return "" }
+        let url = try regularFileURL(path)
+        let handle: FileHandle
+        do {
+            handle = try FileHandle(forReadingFrom: url)
+        } catch {
             throw FileToolError.unreadable(path)
         }
-        let text = String(decoding: data, as: UTF8.self)
-        let lines = text.components(separatedBy: "\n")
-        let start = min(offset - 1, lines.count)
-        let end = min(lines.count, start + (limit ?? lines.count))
-        return lines[start..<end].joined(separator: "\n")
+        defer { try? handle.close() }
+
+        var lineNumber = 1
+        var selectedLines = 0
+        var output = Data()
+        var line = Data()
+        do {
+            while let chunk = try handle.read(upToCount: 16 * 1_024), !chunk.isEmpty {
+                for byte in chunk {
+                    if lineNumber < offset {
+                        if byte == 0x0A { lineNumber += 1 }
+                        continue
+                    }
+                    if byte == 0x0A {
+                        guard append(line: line, lineNumber: selectedLines, to: &output) else {
+                            return String(decoding: output, as: UTF8.self)
+                        }
+                        selectedLines += 1
+                        if selectedLines >= maximumLines {
+                            return String(decoding: output, as: UTF8.self)
+                        }
+                        line.removeAll(keepingCapacity: true)
+                        lineNumber += 1
+                    } else {
+                        let separatorBytes = selectedLines == 0 ? 0 : 1
+                        guard output.count + separatorBytes + line.count + 1 <= defaultMaximumBytes else {
+                            return String(decoding: output, as: UTF8.self)
+                        }
+                        line.append(byte)
+                    }
+                }
+            }
+            if lineNumber >= offset, selectedLines < maximumLines {
+                _ = append(line: line, lineNumber: selectedLines, to: &output)
+            }
+            return String(decoding: output, as: UTF8.self)
+        } catch {
+            throw FileToolError.unreadable(path)
+        }
+    }
+
+    package func readContent(path: String, offset: Int = 1, limit: Int? = nil) throws -> FileReadContent {
+        if let image = try readImage(path: path) { return image }
+        return .text(try read(path: path, offset: offset, limit: limit))
+    }
+
+    private func readImage(path: String) throws -> FileReadContent? {
+        let url = try regularFileURL(path)
+        let handle: FileHandle
+        do {
+            handle = try FileHandle(forReadingFrom: url)
+        } catch {
+            throw FileToolError.unreadable(path)
+        }
+        defer { try? handle.close() }
+        do {
+            let prefix = try handle.read(upToCount: 12) ?? Data()
+            guard let mimeType = imageMIMEType(prefix) else { return nil }
+            try handle.seek(toOffset: 0)
+            var data = Data()
+            while let chunk = try handle.read(upToCount: 64 * 1_024), !chunk.isEmpty {
+                data.append(chunk)
+            }
+            return .image(data: data, mimeType: mimeType)
+        } catch {
+            throw FileToolError.unreadable(path)
+        }
+    }
+
+    private func regularFileURL(_ path: String) throws -> URL {
+        let url = try resolve(path)
+        let resolved = url.resolvingSymlinksInPath()
+        guard
+            let values = try? resolved.resourceValues(forKeys: [.isRegularFileKey]),
+            values.isRegularFile == true
+        else {
+            throw FileToolError.unreadable(path)
+        }
+        return resolved
     }
 
     public func write(path: String, content: String) throws {
@@ -182,6 +269,29 @@ public struct FileTools: @unchecked Sendable {
             return value.lastPathComponent + (isDirectory ? "/" : "")
         }.sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }.prefix(limit).map { $0 }
     }
+}
+
+private func append(line: Data, lineNumber: Int, to output: inout Data) -> Bool {
+    let separatorBytes = lineNumber == 0 ? 0 : 1
+    guard output.count + separatorBytes + line.count <= defaultMaximumBytes else { return false }
+    if separatorBytes == 1 { output.append(0x0A) }
+    output.append(line)
+    return true
+}
+
+private func imageMIMEType(_ data: Data) -> String? {
+    let bytes = [UInt8](data.prefix(12))
+    if bytes.starts(with: [0x89, 0x50, 0x4E, 0x47]) { return "image/png" }
+    if bytes.starts(with: [0xFF, 0xD8, 0xFF]) { return "image/jpeg" }
+    if bytes.starts(with: Array("GIF8".utf8)) { return "image/gif" }
+    if bytes.starts(with: Array("BM".utf8)) { return "image/bmp" }
+    if bytes.count >= 12,
+        String(decoding: bytes[0..<4], as: UTF8.self) == "RIFF",
+        String(decoding: bytes[8..<12], as: UTF8.self) == "WEBP"
+    {
+        return "image/webp"
+    }
+    return nil
 }
 
 private struct NormalizedText {

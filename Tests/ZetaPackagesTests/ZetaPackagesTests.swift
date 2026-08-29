@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import XCTest
 
@@ -401,6 +402,84 @@ final class ZetaPackagesTests: XCTestCase {
         XCTAssertTrue(packages.isEmpty)
         let leftovers = try FileManager.default.contentsOfDirectory(atPath: installed.path)
         XCTAssertFalse(leftovers.contains(where: { $0.hasPrefix(".staging-") }))
+    }
+
+    func testInstallRejectsFIFOInClonedPackageTreeWithoutBlocking() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let executableDirectory = root.appendingPathComponent("bin")
+        let installed = root.appendingPathComponent("installed")
+        try FileManager.default.createDirectory(at: executableDirectory, withIntermediateDirectories: true)
+        let fakeGit = executableDirectory.appendingPathComponent("git")
+        let script = """
+            #!/bin/sh
+            for argument in "$@"; do destination="$argument"; done
+            mkdir -p "$destination"
+            printf '%s' '{"name":"test","pi":{"skills":[]}}' > "$destination/package.json"
+            mkfifo "$destination/blocked.md"
+            """
+        try Data(script.utf8).write(to: fakeGit)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: fakeGit.path)
+        let originalPath = ProcessInfo.processInfo.environment["PATH"]
+        setenv("PATH", "\(executableDirectory.path):\(originalPath ?? "")", 1)
+        defer {
+            if let originalPath {
+                setenv("PATH", originalPath, 1)
+            } else {
+                unsetenv("PATH")
+            }
+        }
+        let manager = try ResourcePackageManager(root: installed)
+        let start = ContinuousClock.now
+
+        do {
+            try await manager.install(.git(url: "/unused", reference: nil))
+            XCTFail("Expected FIFO package node rejection")
+        } catch PackageManagerError.unsafeArchive {
+        } catch {
+            XCTFail("Expected unsafe archive error, got \(error)")
+        }
+
+        XCTAssertLessThan(start.duration(to: .now), .seconds(2))
+        let packages = await manager.list()
+        XCTAssertTrue(packages.isEmpty)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: installed.path), [])
+    }
+
+    func testNPMArchiveRejectsFIFOMemberWithoutExtraction() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = root.appendingPathComponent("source")
+        let package = source.appendingPathComponent("package")
+        let archive = root.appendingPathComponent("archive.tgz")
+        try FileManager.default.createDirectory(at: package, withIntermediateDirectories: true)
+        try Data(#"{"name":"test","pi":{"skills":[]}}"#.utf8).write(
+            to: package.appendingPathComponent("package.json")
+        )
+        XCTAssertEqual(mkfifo(package.appendingPathComponent("blocked.md").path, 0o600), 0)
+        try runProcess("/usr/bin/tar", ["-czf", archive.path, "package"], at: source)
+        NPMArchiveURLProtocol.configure(
+            archiveStatus: 200,
+            archiveChunks: [try Data(contentsOf: archive)]
+        )
+        let installed = root.appendingPathComponent("installed")
+        let manager = try ResourcePackageManager(
+            root: installed,
+            session: npmTestSession(),
+            maximumCompressedArchiveBytes: 1_000_000
+        )
+
+        do {
+            try await manager.install(.npm(name: "test", version: nil))
+            XCTFail("Expected FIFO archive member rejection")
+        } catch PackageManagerError.unsafeArchive {
+        } catch {
+            XCTFail("Expected unsafe archive error, got \(error)")
+        }
+
+        let packages = await manager.list()
+        XCTAssertTrue(packages.isEmpty)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: installed.path), [])
     }
 
     func testNPMArchiveDownloadRejectsCompressedSizeLimitWithoutPublication() async throws {

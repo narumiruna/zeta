@@ -498,6 +498,47 @@ final class ProviderRegressionTests: XCTestCase {
         XCTAssertEqual(terminal, result)
     }
 
+    func testProtocolErrorSettlesConcurrentResultWaitersAndFailsThenTerminatesIterator() async throws {
+        let stream = AssistantEventStream()
+        let initial = AssistantMessage(
+            content: [.text(text: "kept")],
+            api: "test-api",
+            provider: "test-provider",
+            model: "test-model"
+        )
+        await stream.emit(.start(initial))
+        var iterator = stream.makeAsyncIterator()
+        guard let first = try await iterator.next(), case .start = first else {
+            return XCTFail("Expected start event")
+        }
+        let resultWaiters = (0..<32).map { _ in
+            Task { await stream.result() }
+        }
+        for _ in 0..<3 { await Task.yield() }
+
+        var invalid = initial
+        invalid.stopReason = .length
+        await stream.emit(.done(reason: .stop, message: invalid))
+
+        for waiter in resultWaiters {
+            let result = await waiter.value
+            XCTAssertEqual(result.content, initial.content)
+            XCTAssertEqual(result.stopReason, .error)
+            XCTAssertEqual(result.errorMessage, "Invalid done event")
+        }
+        do {
+            _ = try await iterator.next()
+            XCTFail("Expected stream protocol error")
+        } catch let error as StreamProtocolError {
+            XCTAssertEqual(error, StreamProtocolError("Invalid done event"))
+        }
+        let afterFailure = try await iterator.next()
+        XCTAssertNil(afterFailure)
+        let lateResult = await stream.result()
+        XCTAssertEqual(lateResult.stopReason, .error)
+        XCTAssertEqual(lateResult.errorMessage, "Invalid done event")
+    }
+
     func testDefaultAssistantEventBufferIsBoundedAndRetainsTerminalState() async throws {
         let stream = AssistantEventStream()
         var partial = AssistantMessage(

@@ -93,14 +93,12 @@ public struct ResourceLoader: Sendable {
     ) -> [URL] {
         let registry = root.appendingPathComponent("packages.json")
         guard FileManager.default.fileExists(atPath: registry.path) else { return [] }
-        guard (try? root.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) != true,
-            (try? registry.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) != true
-        else {
+        guard isDirectory(root), isRegularFile(registry) else {
             diagnostics.append(
                 ResourceDiagnostic(
                     severity: .error,
                     path: registry.path,
-                    message: "Package registry root must not contain symbolic links"
+                    message: "Package registry must contain only regular files and directories"
                 )
             )
             return []
@@ -139,7 +137,7 @@ public struct ResourceLoader: Sendable {
                     ResourceDiagnostic(
                         severity: .error,
                         path: package.path,
-                        message: "Package \(key) is missing or contains an unsafe symbolic link"
+                        message: "Package \(key) is missing or contains an unsafe symbolic link or file type"
                     )
                 )
                 return nil
@@ -150,6 +148,16 @@ public struct ResourceLoader: Sendable {
 
     private func loadPackage(_ root: URL, into snapshot: inout ResourceSnapshot) {
         let manifestURL = root.appendingPathComponent("package.json")
+        guard isRegularFile(manifestURL) else {
+            snapshot.diagnostics.append(
+                ResourceDiagnostic(
+                    severity: .error,
+                    path: manifestURL.path,
+                    message: "Installed package manifest is not a regular file"
+                )
+            )
+            return
+        }
         let manifest: InstalledResourceManifest
         do {
             manifest = try JSONDecoder().decode(
@@ -224,7 +232,9 @@ public struct ResourceLoader: Sendable {
     private func loadContext() -> [String] {
         var output: [String] = []
         let global = agentDirectory.appendingPathComponent("AGENTS.md")
-        if let text = try? String(contentsOf: global, encoding: .utf8) { output.append(text) }
+        if isRegularFile(global), let text = try? String(contentsOf: global, encoding: .utf8) {
+            output.append(text)
+        }
         var directories: [URL] = []
         var current = workingDirectory
         while current.path != "/" {
@@ -236,9 +246,11 @@ public struct ResourceLoader: Sendable {
             let agents = directory.appendingPathComponent("AGENTS.md")
             let claude = directory.appendingPathComponent("CLAUDE.md")
             let selected =
-                FileManager.default.fileExists(atPath: override.path)
-                ? override : FileManager.default.fileExists(atPath: agents.path) ? agents : claude
-            if let text = try? String(contentsOf: selected, encoding: .utf8) { output.append(text) }
+                isRegularFile(override)
+                ? override : isRegularFile(agents) ? agents : claude
+            if isRegularFile(selected), let text = try? String(contentsOf: selected, encoding: .utf8) {
+                output.append(text)
+            }
         }
         return output
     }
@@ -252,6 +264,7 @@ public struct ResourceLoader: Sendable {
     }
 
     private func loadPrompt(_ url: URL, diagnostics: inout [ResourceDiagnostic]) -> PromptTemplate? {
+        guard isRegularFile(url) else { return nil }
         do {
             let parsed = frontmatter(try String(contentsOf: url, encoding: .utf8))
             return PromptTemplate(
@@ -275,6 +288,7 @@ public struct ResourceLoader: Sendable {
     }
 
     private func loadSkill(_ url: URL, diagnostics: inout [ResourceDiagnostic]) -> Skill? {
+        guard isRegularFile(url) else { return nil }
         do {
             let parsed = frontmatter(try String(contentsOf: url, encoding: .utf8))
             let name = parsed.metadata["name"] ?? url.deletingLastPathComponent().lastPathComponent
@@ -295,37 +309,35 @@ public struct ResourceLoader: Sendable {
     }
 
     private func skillFiles(_ path: URL) -> [URL] {
-        var isDirectory: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: path.path, isDirectory: &isDirectory) else { return [] }
-        if !isDirectory.boolValue { return path.lastPathComponent == "SKILL.md" ? [path] : [] }
-        guard
+        if isRegularFile(path) { return path.lastPathComponent == "SKILL.md" ? [path] : [] }
+        guard isDirectory(path),
             let enumerator = FileManager.default.enumerator(
                 at: path,
-                includingPropertiesForKeys: [.isRegularFileKey],
+                includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey],
                 options: [.skipsHiddenFiles]
             )
         else { return [] }
         return enumerator.compactMap { $0 as? URL }
-            .filter { $0.lastPathComponent == "SKILL.md" }
+            .filter { $0.lastPathComponent == "SKILL.md" && isRegularFile($0) }
             .sorted { $0.path < $1.path }
     }
 
     private func resourceFiles(_ path: URL, extensions: Set<String>) -> [URL] {
-        var isDirectory: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: path.path, isDirectory: &isDirectory) else { return [] }
-        if isDirectory.boolValue { return files(path, extensions: extensions) }
-        return extensions.contains(path.pathExtension.lowercased()) ? [path] : []
+        if isDirectory(path) { return files(path, extensions: extensions) }
+        return isRegularFile(path) && extensions.contains(path.pathExtension.lowercased()) ? [path] : []
     }
 
     private func files(_ directory: URL, extensions: Set<String>) -> [URL] {
-        guard
+        guard isDirectory(directory),
             let values = try? FileManager.default.contentsOfDirectory(
                 at: directory,
-                includingPropertiesForKeys: [.isRegularFileKey],
+                includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey],
                 options: [.skipsHiddenFiles]
             )
         else { return [] }
-        return values.filter { extensions.contains($0.pathExtension.lowercased()) }.sorted { $0.path < $1.path }
+        return values.filter {
+            isRegularFile($0) && extensions.contains($0.pathExtension.lowercased())
+        }.sorted { $0.path < $1.path }
     }
 
     private func validatedResourcePath(_ entry: String, root: URL) -> URL? {
@@ -334,7 +346,7 @@ public struct ResourceLoader: Sendable {
             return nil
         }
         let path = root.appendingPathComponent(entry).standardizedFileURL
-        guard isContained(path, in: root), FileManager.default.fileExists(atPath: path.path) else { return nil }
+        guard isContained(path, in: root), isRegularFile(path) || isDirectory(path) else { return nil }
         return path
     }
 
@@ -350,22 +362,38 @@ public struct ResourceLoader: Sendable {
     }
 
     private func isValidatedPackageTree(_ root: URL) -> Bool {
-        var isDirectory: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: root.path, isDirectory: &isDirectory), isDirectory.boolValue,
-            (try? root.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) != true,
+        guard isDirectory(root),
             let enumerator = FileManager.default.enumerator(
                 at: root,
-                includingPropertiesForKeys: [.isSymbolicLinkKey]
+                includingPropertiesForKeys: [
+                    .isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey,
+                ]
             )
         else {
             return false
         }
         for case let url as URL in enumerator {
-            if (try? url.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) == true {
-                return false
-            }
+            guard isRegularFile(url) || isDirectory(url) else { return false }
         }
         return true
+    }
+
+    private func isRegularFile(_ url: URL) -> Bool {
+        guard
+            let values = try? url.resourceValues(
+                forKeys: [.isRegularFileKey, .isSymbolicLinkKey]
+            )
+        else { return false }
+        return values.isRegularFile == true && values.isSymbolicLink != true
+    }
+
+    private func isDirectory(_ url: URL) -> Bool {
+        guard
+            let values = try? url.resourceValues(
+                forKeys: [.isDirectoryKey, .isSymbolicLinkKey]
+            )
+        else { return false }
+        return values.isDirectory == true && values.isSymbolicLink != true
     }
 
     private func frontmatter(_ value: String) -> (metadata: [String: String], body: String) {

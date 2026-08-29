@@ -9,7 +9,15 @@ import ZetaModes
 import ZetaSessions
 import ZetaTools
 
+private struct QueuedRPCPrompt: Sendable {
+    let message: UserMessage
+    let encodedBytes: Int
+}
+
 public actor CLIRPCRuntime {
+    private static let defaultPromptQueueMaximumCount = 64
+    private static let defaultPromptQueueMaximumBytes = 16 * 1_024 * 1_024
+
     private let agent: Agent
     private let models: [Model]
     private let shell: ShellTool
@@ -23,7 +31,10 @@ public actor CLIRPCRuntime {
     private let session: PersistentSessionController?
     private var promptTask: Task<Void, Never>?
     private var promptRunID: UUID?
-    private var queuedPrompts: [UserMessage] = []
+    private let promptQueueMaximumCount: Int
+    private let promptQueueMaximumBytes: Int
+    private var queuedPrompts: [QueuedRPCPrompt] = []
+    private var queuedPromptBytes = 0
     private var activeBash: (id: UUID, task: Task<ShellResult, Error>)?
     private var sessionMutationInProgress = false
     private var compactionInProgress = false
@@ -35,8 +46,12 @@ public actor CLIRPCRuntime {
         workingDirectory: URL,
         session: PersistentSessionController? = nil,
         compactionSettings: ZetaConfig.CompactionSettings? = nil,
-        retrySettings: RetrySettings? = nil
+        retrySettings: RetrySettings? = nil,
+        promptQueueMaximumCount: Int = CLIRPCRuntime.defaultPromptQueueMaximumCount,
+        promptQueueMaximumBytes: Int = CLIRPCRuntime.defaultPromptQueueMaximumBytes
     ) {
+        precondition(promptQueueMaximumCount > 0)
+        precondition(promptQueueMaximumBytes > 0)
         let defaults = Settings()
         let compactionSettings = compactionSettings ?? defaults.compaction
         let retrySettings = retrySettings ?? defaults.retry
@@ -44,6 +59,8 @@ public actor CLIRPCRuntime {
         self.models = models
         self.session = session
         self.workingDirectory = workingDirectory
+        self.promptQueueMaximumCount = promptQueueMaximumCount
+        self.promptQueueMaximumBytes = promptQueueMaximumBytes
         autoCompaction = compactionSettings.enabled
         retryPolicy = retrySettings
         autoRetry = retrySettings.enabled
@@ -117,7 +134,7 @@ public actor CLIRPCRuntime {
             }
             let message = try userMessage(request.fields)
             if promptTask != nil {
-                queuedPrompts.append(message)
+                try enqueuePrompt(message)
                 return ["queued": true]
             }
             if (await agent.state()).isStreaming {
@@ -143,26 +160,31 @@ public actor CLIRPCRuntime {
             await agent.abort()
             return ["aborted": true]
         case .clearQueue:
-            queuedPrompts.removeAll()
+            clearQueuedPrompts()
             await agent.clearQueues()
             return ["cleared": true]
         case .newSession:
-            guard !compactionInProgress else {
+            guard !sessionMutationInProgress, !compactionInProgress else {
                 throw AgentError.blocked("Agent is busy")
             }
-            queuedPrompts.removeAll()
+            sessionMutationInProgress = true
+            defer { sessionMutationInProgress = false }
+            let replacement = try await session?.prepareNewSession(
+                parentSession: optionalString("parentSession", request.fields)
+            )
+            clearQueuedPrompts()
             promptTask?.cancel()
             await agent.abort()
             await agent.waitForIdle()
             if let promptTask { await promptTask.value }
             try await agent.reset()
-            let file = try await session?.newSession(
-                parentSession: optionalString("parentSession", request.fields)
-            )
+            if let replacement {
+                await session?.publishNewSession(replacement)
+            }
             sessionName = nil
             return [
                 "created": true,
-                "path": file.map { .string($0.path) } ?? .null,
+                "path": replacement?.file.map { .string($0.path) } ?? .null,
             ]
         case .getState:
             return try await stateJSON()
@@ -453,16 +475,48 @@ public actor CLIRPCRuntime {
                 if !Task.isCancelled {
                     try await compactIfNeeded()
                 }
-                next = queuedPrompts.isEmpty ? nil : queuedPrompts.removeFirst()
+                next = dequeuePrompt()
             }
         } catch {
             deferredErrors.append(error.localizedDescription)
-            queuedPrompts.removeAll()
+            clearQueuedPrompts()
         }
         if promptRunID == id {
             promptRunID = nil
             promptTask = nil
         }
+    }
+
+    private func enqueuePrompt(_ message: UserMessage) throws {
+        let encodedBytes = message.content.reduce(into: 0) { total, block in
+            switch block {
+            case .text(let text, _): total += text.utf8.count
+            case .image(let data, _): total += data.utf8.count
+            default: break
+            }
+        }
+        guard queuedPrompts.count < promptQueueMaximumCount,
+            encodedBytes <= promptQueueMaximumBytes - queuedPromptBytes
+        else {
+            throw AgentError.blocked(
+                "RPC prompt queue limit exceeded (maximum \(promptQueueMaximumCount) prompts or "
+                    + "\(promptQueueMaximumBytes) encoded payload bytes)"
+            )
+        }
+        queuedPrompts.append(QueuedRPCPrompt(message: message, encodedBytes: encodedBytes))
+        queuedPromptBytes += encodedBytes
+    }
+
+    private func dequeuePrompt() -> UserMessage? {
+        guard !queuedPrompts.isEmpty else { return nil }
+        let queued = queuedPrompts.removeFirst()
+        queuedPromptBytes -= queued.encodedBytes
+        return queued.message
+    }
+
+    private func clearQueuedPrompts() {
+        queuedPrompts.removeAll()
+        queuedPromptBytes = 0
     }
 
     private func compactIfNeeded() async throws {

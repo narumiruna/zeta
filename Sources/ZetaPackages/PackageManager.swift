@@ -338,8 +338,8 @@ public actor ResourcePackageManager {
             as: UTF8.self
         )
         guard
-            !verbose.split(separator: "\n").contains(where: { line in
-                line.first == "l" || line.contains(" -> ") || line.contains(" link to ")
+            verbose.split(separator: "\n").allSatisfy({ line in
+                line.first == "-" || line.first == "d"
             })
         else {
             throw PackageManagerError.unsafeArchive
@@ -382,14 +382,23 @@ public actor ResourcePackageManager {
     }
 
     private func validatePackageTree(_ directory: URL) throws {
-        guard
+        let keys: Set<URLResourceKey> = [
+            .isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey,
+        ]
+        let rootValues = try directory.resourceValues(forKeys: keys)
+        guard rootValues.isDirectory == true, rootValues.isSymbolicLink != true,
             let enumerator = FileManager.default.enumerator(
                 at: directory,
-                includingPropertiesForKeys: [.isSymbolicLinkKey]
+                includingPropertiesForKeys: Array(keys)
             )
-        else { return }
+        else {
+            throw PackageManagerError.unsafeArchive
+        }
         for case let url as URL in enumerator {
-            if try url.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink == true {
+            let values = try url.resourceValues(forKeys: keys)
+            guard values.isSymbolicLink != true,
+                values.isRegularFile == true || values.isDirectory == true
+            else {
                 throw PackageManagerError.unsafeArchive
             }
         }
