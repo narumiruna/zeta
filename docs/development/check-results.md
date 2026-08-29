@@ -2,6 +2,7 @@
 
 ## Final local record
 
+This historical baseline predates the dependencies accepted by [ADR 0003](../adr/0003-command-line-and-logging-dependencies.md).
 These checks ran on 2026-08-28 on macOS arm64 with the Xcode Swift toolchain.
 The pinned Pi oracle remained clean at `56700d42ed65a94a80af7376adb19a9298065164`.
 No provider credential was present or printed.

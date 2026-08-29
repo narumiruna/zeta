@@ -42,6 +42,15 @@ final class ZetaCLITests: XCTestCase {
         XCTAssertEqual(model.model, "openai/gpt")
         XCTAssertEqual(model.thinking, .high)
         XCTAssertTrue(model.thinkingSpecified)
+
+        let repeated = try CLIArguments.parse([
+            "@one.md", "--exclude-tools", "read,write", "-xt", "bash", "message",
+        ])
+        XCTAssertEqual(repeated.files, ["one.md"])
+        XCTAssertEqual(repeated.excludedTools, ["read", "write", "bash"])
+        XCTAssertEqual(repeated.messages, ["message"])
+        XCTAssertTrue(try CLIArguments.parse(["--no-approve", "--approve"]).approve == true)
+        XCTAssertTrue(try CLIArguments.parse(["-a", "-na"]).approve == false)
     }
 
     func testJSONUpdateIsDeltaOnly() throws {

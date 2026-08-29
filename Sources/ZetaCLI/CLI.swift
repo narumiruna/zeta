@@ -7,6 +7,7 @@ import ZetaBedrock
 import ZetaCompaction
 import ZetaConfig
 import ZetaCore
+import ZetaLogging
 import ZetaModes
 import ZetaResources
 import ZetaTUI
@@ -15,6 +16,7 @@ import ZetaTools
 
 public enum ZetaCLI {
     public static let version = BuildVersion.current
+    private static let logger = ZetaLogger(label: "works.earendil.zeta.cli")
 
     public static func runWithSignals(
         arguments: [String] = Array(CommandLine.arguments.dropFirst())
@@ -33,6 +35,7 @@ public enum ZetaCLI {
     }
 
     public static func run(arguments: [String] = Array(CommandLine.arguments.dropFirst())) async -> Int32 {
+        logger.debug("CLI run started", metadata: ["argument_count": "\(arguments.count)"])
         setenv("PI_CODING_AGENT", "true", 1)
         setenv("AI_AGENT", "pi", 1)
         do {
@@ -68,6 +71,7 @@ public enum ZetaCLI {
                 stdinIsTTY: stdinIsTTY,
                 stdoutIsTTY: stdoutIsTTY
             )
+            logger.debug("CLI mode selected", metadata: ["mode": mode.rawValue])
             let globalSettingsStore = try SettingsStore(paths: paths, includeProject: false)
             let globalSettings = await globalSettingsStore.current()
             let trustStore = try TrustStore(url: paths.trust)
@@ -198,8 +202,13 @@ public enum ZetaCLI {
                 )
             }
             await pluginRuntime.stop()
+            logger.debug("CLI run finished", metadata: ["exit_code": "\(result)"])
             return result
         } catch {
+            logger.debug(
+                "CLI run failed",
+                metadata: ["error_type": String(reflecting: type(of: error))]
+            )
             FileHandle.standardError.write(Data("\(error.localizedDescription)\n".utf8))
             return 1
         }

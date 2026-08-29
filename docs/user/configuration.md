@@ -24,6 +24,13 @@ BOM and line-ending styles are preserved.
 Shell timeout and cancellation terminate the child process.
 Output is limited by line and UTF-8 byte count, and full truncated shell output is written to a temporary file.
 
+## Diagnostic logging
+
+Zeta writes structured diagnostic logs to standard error through `swift-log`.
+The default minimum level is `warning`.
+Set `ZETA_LOG_LEVEL` to `trace`, `debug`, `info`, `notice`, `warning`, `error`, or `critical` to change it.
+Logs remain separate from JSONL protocol output and telemetry.
+
 ## Project trust
 
 Project settings, packages, and executable plugins are ignored until trust is granted.
