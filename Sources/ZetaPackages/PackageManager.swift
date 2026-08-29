@@ -97,20 +97,35 @@ public enum PackageManagerError: Error, LocalizedError, Sendable {
     }
 }
 
+enum PackageInternalError: Error, LocalizedError, Sendable {
+    case unsafeRegistryDirectory(String)
+    case rollbackFailed(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .unsafeRegistryDirectory(let value):
+            "Package registry contains an unsafe directory: \(value)"
+        case .rollbackFailed(let value):
+            "Package rollback failed: \(value)"
+        }
+    }
+}
+
 public actor ResourcePackageManager {
     private let root: URL
     private let session: URLSession
     private var installed: [String: InstalledPackage] = [:]
 
     public init(root: URL, session: URLSession = .shared) throws {
-        self.root = root
+        let standardizedRoot = root.standardizedFileURL
+        self.root = standardizedRoot
         self.session = session
         try FileManager.default.createDirectory(
-            at: root,
+            at: standardizedRoot,
             withIntermediateDirectories: true,
             attributes: [.posixPermissions: 0o700]
         )
-        let indexURL = root.appendingPathComponent("packages.json")
+        let indexURL = standardizedRoot.appendingPathComponent("packages.json")
         if FileManager.default.fileExists(atPath: indexURL.path) {
             installed = try JSONDecoder().decode(
                 [String: InstalledPackage].self,
@@ -151,9 +166,6 @@ public actor ResourcePackageManager {
         try validateResourcePaths(manifest, root: staging)
         let destination = root.appendingPathComponent(safeName(source.identifier))
         let backup = root.appendingPathComponent(".backup-\(UUID().uuidString)")
-        if FileManager.default.fileExists(atPath: destination.path) {
-            try FileManager.default.moveItem(at: destination, to: backup)
-        }
         var nextInstalled = installed
         nextInstalled[source.identifier] = InstalledPackage(
             source: source.identifier,
@@ -161,38 +173,65 @@ public actor ResourcePackageManager {
             pinned: source.pinned,
             installedAt: ISO8601DateFormatter().string(from: Date())
         )
+        var movedPreviousPackage = false
+        var publishedNewPackage = false
         do {
-            try FileManager.default.moveItem(at: staging, to: destination)
-            try persistIndex(nextInstalled)
-            installed = nextInstalled
-            try? FileManager.default.removeItem(at: backup)
-        } catch {
-            try? FileManager.default.removeItem(at: destination)
-            if FileManager.default.fileExists(atPath: backup.path) {
-                try? FileManager.default.moveItem(at: backup, to: destination)
+            if FileManager.default.fileExists(atPath: destination.path) {
+                try FileManager.default.moveItem(at: destination, to: backup)
+                movedPreviousPackage = true
             }
-            throw error
+            try FileManager.default.moveItem(at: staging, to: destination)
+            publishedNewPackage = true
+            try persistIndex(nextInstalled)
+        } catch {
+            let operationError = error
+            do {
+                if publishedNewPackage {
+                    try FileManager.default.removeItem(at: destination)
+                }
+                if movedPreviousPackage {
+                    try FileManager.default.moveItem(at: backup, to: destination)
+                }
+            } catch {
+                throw PackageInternalError.rollbackFailed(
+                    "\(operationError.localizedDescription); \(error.localizedDescription)"
+                )
+            }
+            throw operationError
+        }
+        installed = nextInstalled
+        if movedPreviousPackage {
+            try? FileManager.default.removeItem(at: backup)
         }
     }
 
     public func remove(_ identifier: String, trusted: Bool = true) throws {
         guard trusted else { throw PackageManagerError.untrusted }
         guard let value = installed[identifier] else { return }
-        let destination = root.appendingPathComponent(value.directory)
+        let destination = try installedPackageURL(directory: value.directory)
         let backup = root.appendingPathComponent(".backup-\(UUID().uuidString)")
         var nextInstalled = installed
         nextInstalled[identifier] = nil
+        var movedPackage = false
         do {
             try FileManager.default.moveItem(at: destination, to: backup)
+            movedPackage = true
             try persistIndex(nextInstalled)
-            installed = nextInstalled
-            try? FileManager.default.removeItem(at: backup)
         } catch {
-            if FileManager.default.fileExists(atPath: backup.path) {
-                try? FileManager.default.moveItem(at: backup, to: destination)
+            let operationError = error
+            if movedPackage {
+                do {
+                    try FileManager.default.moveItem(at: backup, to: destination)
+                } catch {
+                    throw PackageInternalError.rollbackFailed(
+                        "\(operationError.localizedDescription); \(error.localizedDescription)"
+                    )
+                }
             }
-            throw error
+            throw operationError
         }
+        installed = nextInstalled
+        try? FileManager.default.removeItem(at: backup)
     }
 
     public func updateAll(trusted: Bool = true) async throws {
@@ -367,6 +406,19 @@ public actor ResourcePackageManager {
         value.unicodeScalars.map { scalar in
             CharacterSet.alphanumerics.contains(scalar) ? String(scalar) : "-"
         }.joined()
+    }
+
+    private func installedPackageURL(directory: String) throws -> URL {
+        guard !directory.isEmpty, directory != ".", directory != "..",
+            !directory.contains("/"), !directory.contains("\\")
+        else {
+            throw PackageInternalError.unsafeRegistryDirectory(directory)
+        }
+        let destination = root.appendingPathComponent(directory).standardizedFileURL
+        guard destination.deletingLastPathComponent() == root else {
+            throw PackageInternalError.unsafeRegistryDirectory(directory)
+        }
+        return destination
     }
 
     private var indexURL: URL { root.appendingPathComponent("packages.json") }

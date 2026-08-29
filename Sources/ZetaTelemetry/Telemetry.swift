@@ -9,7 +9,37 @@ public enum TelemetryAttributeValue: Sendable, Equatable, Codable {
     case numbers([Double])
     case booleans([Bool])
 
+    private enum ArrayCodingKeys: String, CodingKey {
+        case type
+        case value
+    }
+
+    private enum ArrayType: String, Codable {
+        case strings = "string[]"
+        case numbers = "number[]"
+        case booleans = "boolean[]"
+    }
+
     public init(from decoder: any Decoder) throws {
+        if let tagged = try? decoder.container(keyedBy: ArrayCodingKeys.self),
+            tagged.contains(.type)
+        {
+            switch try tagged.decode(ArrayType.self, forKey: .type) {
+            case .strings:
+                self = .strings(try tagged.decode([String].self, forKey: .value))
+            case .numbers:
+                let value = try tagged.decode([Double].self, forKey: .value)
+                guard value.allSatisfy(\.isFinite) else {
+                    throw DecodingError.dataCorruptedError(
+                        forKey: .value, in: tagged, debugDescription: "Telemetry numbers must be finite")
+                }
+                self = .numbers(value)
+            case .booleans:
+                self = .booleans(try tagged.decode([Bool].self, forKey: .value))
+            }
+            return
+        }
+
         let container = try decoder.singleValueContainer()
         if let value = try? container.decode(String.self) {
             self = .string(value)
@@ -32,24 +62,49 @@ public enum TelemetryAttributeValue: Sendable, Equatable, Codable {
     }
 
     public func encode(to encoder: any Encoder) throws {
-        var container = encoder.singleValueContainer()
         switch self {
-        case let .string(value): try container.encode(value)
-        case let .number(value):
-            guard value.isFinite else {
-                throw EncodingError.invalidValue(
-                    value, .init(codingPath: encoder.codingPath, debugDescription: "Telemetry numbers must be finite"))
+        case let .strings(value) where value.isEmpty:
+            var container = encoder.container(keyedBy: ArrayCodingKeys.self)
+            try container.encode(ArrayType.strings, forKey: .type)
+            try container.encode(value, forKey: .value)
+        case let .numbers(value) where value.isEmpty:
+            var container = encoder.container(keyedBy: ArrayCodingKeys.self)
+            try container.encode(ArrayType.numbers, forKey: .type)
+            try container.encode(value, forKey: .value)
+        case let .booleans(value) where value.isEmpty:
+            var container = encoder.container(keyedBy: ArrayCodingKeys.self)
+            try container.encode(ArrayType.booleans, forKey: .type)
+            try container.encode(value, forKey: .value)
+        default:
+            var container = encoder.singleValueContainer()
+            switch self {
+            case let .string(value): try container.encode(value)
+            case let .number(value):
+                guard value.isFinite else {
+                    throw EncodingError.invalidValue(
+                        value,
+                        .init(
+                            codingPath: encoder.codingPath,
+                            debugDescription: "Telemetry numbers must be finite"
+                        )
+                    )
+                }
+                try container.encode(value)
+            case let .boolean(value): try container.encode(value)
+            case let .strings(value): try container.encode(value)
+            case let .numbers(value):
+                guard value.allSatisfy(\.isFinite) else {
+                    throw EncodingError.invalidValue(
+                        value,
+                        .init(
+                            codingPath: encoder.codingPath,
+                            debugDescription: "Telemetry numbers must be finite"
+                        )
+                    )
+                }
+                try container.encode(value)
+            case let .booleans(value): try container.encode(value)
             }
-            try container.encode(value)
-        case let .boolean(value): try container.encode(value)
-        case let .strings(value): try container.encode(value)
-        case let .numbers(value):
-            guard value.allSatisfy(\.isFinite) else {
-                throw EncodingError.invalidValue(
-                    value, .init(codingPath: encoder.codingPath, debugDescription: "Telemetry numbers must be finite"))
-            }
-            try container.encode(value)
-        case let .booleans(value): try container.encode(value)
         }
     }
 }

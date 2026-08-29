@@ -156,6 +156,110 @@ final class ProviderRegressionTests: XCTestCase {
         XCTAssertEqual(duplicateCompleted.filter(isThinkingEnd).count, 0)
     }
 
+    func testOpenAIResponsesOutputItemsSeedAndBalanceParallelFunctionCalls() throws {
+        var reducer = ProviderEventReducer(model: pricedModel(api: "openai-responses"))
+        _ = try reducer.consume([
+            "type": "response.reasoning_summary_text.delta",
+            "output_index": 0,
+            "delta": "thought",
+        ])
+
+        let firstStart = try reducer.consume([
+            "type": "response.output_item.added",
+            "output_index": 1,
+            "item": [
+                "type": "function_call",
+                "id": "fc-a",
+                "call_id": "call-a",
+                "name": "read",
+                "arguments": "",
+            ],
+        ])
+        let secondStart = try reducer.consume([
+            "type": "response.output_item.added",
+            "output_index": 2,
+            "item": [
+                "type": "function_call",
+                "id": "fc-b",
+                "call_id": "call-b",
+                "name": "write",
+                "arguments": "",
+            ],
+        ])
+        XCTAssertEqual(firstStart.compactMap(toolCallStartIndex), [1])
+        XCTAssertEqual(secondStart.compactMap(toolCallStartIndex), [2])
+        let firstStartedCall = firstStart.first.flatMap { toolCall(in: $0) }
+        let secondStartedCall = secondStart.first.flatMap { toolCall(in: $0) }
+        XCTAssertEqual(firstStartedCall?.id, "call-a|fc-a")
+        XCTAssertEqual(firstStartedCall?.name, "read")
+        XCTAssertEqual(secondStartedCall?.id, "call-b|fc-b")
+        XCTAssertEqual(secondStartedCall?.name, "write")
+
+        let secondDelta = try reducer.consume([
+            "type": "response.function_call_arguments.delta",
+            "output_index": 2,
+            "delta": "{\"path\":\"B\"}",
+        ])
+        let firstDelta = try reducer.consume([
+            "type": "response.function_call_arguments.delta",
+            "output_index": 1,
+            "delta": "{\"path\":\"A\"}",
+        ])
+        XCTAssertEqual(secondDelta.compactMap(toolCallDeltaIndex), [2])
+        XCTAssertEqual(firstDelta.compactMap(toolCallDeltaIndex), [1])
+
+        let firstArgumentsDone = try reducer.consume([
+            "type": "response.function_call_arguments.done",
+            "output_index": 1,
+            "arguments": "{\"path\":\"A\"}",
+        ])
+        let secondArgumentsDone = try reducer.consume([
+            "type": "response.function_call_arguments.done",
+            "output_index": 2,
+            "arguments": "{\"path\":\"B\"}",
+        ])
+        XCTAssertTrue(firstArgumentsDone.compactMap(toolCallEndIndex).isEmpty)
+        XCTAssertTrue(secondArgumentsDone.compactMap(toolCallEndIndex).isEmpty)
+
+        let firstEnd = try reducer.consume([
+            "type": "response.output_item.done",
+            "output_index": 1,
+            "item": [
+                "type": "function_call",
+                "id": "fc-a",
+                "call_id": "call-a",
+                "name": "read",
+                "arguments": "{\"path\":\"A\"}",
+            ],
+        ])
+        let secondEnd = try reducer.consume([
+            "type": "response.output_item.done",
+            "output_index": 2,
+            "item": [
+                "type": "function_call",
+                "id": "fc-b",
+                "call_id": "call-b",
+                "name": "write",
+                "arguments": "{\"path\":\"B\"}",
+            ],
+        ])
+        XCTAssertEqual(firstEnd.compactMap(toolCallEndIndex), [1])
+        XCTAssertEqual(secondEnd.compactMap(toolCallEndIndex), [2])
+
+        let completed = try reducer.consume([
+            "type": "response.completed",
+            "response": ["id": "response-1"],
+        ])
+        XCTAssertTrue(completed.compactMap(toolCallEndIndex).isEmpty)
+        guard case .toolCall(let first) = reducer.partial.content[1],
+            case .toolCall(let second) = reducer.partial.content[2]
+        else {
+            return XCTFail("Expected parallel Responses tool calls")
+        }
+        XCTAssertEqual(first, ToolCall(id: "call-a|fc-a", name: "read", arguments: ["path": "A"]))
+        XCTAssertEqual(second, ToolCall(id: "call-b|fc-b", name: "write", arguments: ["path": "B"]))
+    }
+
     func testHTTPFailureAfterStartPreservesReducerPartialInError() async throws {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [FailingStreamingURLProtocol.self]
@@ -204,6 +308,28 @@ final class ProviderRegressionTests: XCTestCase {
             maximumTokens: 100
         )
     }
+}
+
+private func toolCallStartIndex(_ event: AssistantEvent) -> Int? {
+    if case .toolCallStart(let index, _) = event { index } else { nil }
+}
+
+private func toolCallDeltaIndex(_ event: AssistantEvent) -> Int? {
+    if case .toolCallDelta(let index, _, _) = event { index } else { nil }
+}
+
+private func toolCallEndIndex(_ event: AssistantEvent) -> Int? {
+    if case .toolCallEnd(let index, _, _) = event { index } else { nil }
+}
+
+private func toolCall(in event: AssistantEvent) -> ToolCall? {
+    guard case .toolCallStart(let index, let partial) = event,
+        partial.content.indices.contains(index),
+        case .toolCall(let call) = partial.content[index]
+    else {
+        return nil
+    }
+    return call
 }
 
 private func isTextStart(_ event: AssistantEvent) -> Bool {

@@ -169,9 +169,73 @@ final class ZetaClientTests: XCTestCase {
         XCTAssertTrue(rejected)
         try await exclusive.dispose()
     }
+
+    func testRequestCancellationReturnsBeforeResponseAndRacesResumeOnce() async throws {
+        let box = ControlledTransportBox()
+        let client = try PiClient { handlers in
+            let transport = ControlledTransport(handlers: handlers)
+            await box.set(transport)
+            return transport
+        }
+        try await client.connect()
+        let transport = await box.wait()
+
+        let firstOutcome = RequestOutcomeBox()
+        let cancelledRequest = Task {
+            await firstOutcome.set(await listOutcome(from: client))
+        }
+        try await waitUntil { await transport.listCount == 1 }
+        cancelledRequest.cancel()
+        try await waitUntil { await firstOutcome.value != nil }
+        let cancelledValue = await firstOutcome.value
+        XCTAssertEqual(cancelledValue, .cancelled)
+
+        await transport.completeList(at: 0)
+        await cancelledRequest.value
+
+        let completedRequest = Task { try await client.listSessions() }
+        try await waitUntil { await transport.listCount == 2 }
+        await transport.completeList(at: 1)
+        let completedValue = try await completedRequest.value
+        XCTAssertEqual(completedValue, [])
+        completedRequest.cancel()
+
+        let disconnectedRequest = Task { await listOutcome(from: client) }
+        try await waitUntil { await transport.listCount == 3 }
+        await client.disconnect()
+        disconnectedRequest.cancel()
+        await transport.completeList(at: 2)
+        let disconnectedValue = await disconnectedRequest.value
+        XCTAssertEqual(disconnectedValue, .disconnected)
+    }
 }
 
 private enum ConnectTestFailure: Error { case expected }
+
+private enum RequestOutcome: Equatable, Sendable {
+    case success
+    case cancelled
+    case disconnected
+    case otherFailure
+}
+
+private actor RequestOutcomeBox {
+    private(set) var value: RequestOutcome?
+    func set(_ value: RequestOutcome) { self.value = value }
+}
+
+private func listOutcome(from client: PiClient) async -> RequestOutcome {
+    do {
+        _ = try await client.listSessions()
+        return .success
+    } catch is CancellationError {
+        return .cancelled
+    } catch PiClientError.disconnected {
+        return .disconnected
+    } catch {
+        return .otherFailure
+    }
+}
 
 private actor CompletionCounter {
     private(set) var count = 0
@@ -245,8 +309,10 @@ private actor ControlledTransport: ByteTransport {
     private let handlers: ByteTransportHandlers
     private let decoder = try! ClientMessageDecoder()
     private var attachments: [RequestEnvelope] = []
+    private var lists: [RequestEnvelope] = []
     private(set) var detachCount = 0
     var attachCount: Int { attachments.count }
+    var listCount: Int { lists.count }
 
     init(handlers: ByteTransportHandlers) { self.handlers = handlers }
 
@@ -259,6 +325,8 @@ private actor ControlledTransport: ByteTransport {
                     try encodeServerMessage(.hello(try ServerHello(connectionID: "connection", snapshot: snapshot))))
             case .request(let request):
                 switch request.request {
+                case .list:
+                    lists.append(request)
                 case .attach:
                     attachments.append(request)
                 case .detach(let id):
@@ -280,6 +348,13 @@ private actor ControlledTransport: ByteTransport {
                 try! encodeServerMessage(
                     .response(.success(id: request.id, result: .attach(try! makeSnapshot(id: id))))))
         }
+    }
+
+    func completeList(at index: Int) {
+        guard lists.indices.contains(index) else { return }
+        handlers.onData(
+            try! encodeServerMessage(
+                .response(.success(id: lists[index].id, result: .list([])))))
     }
 
     func close() {}

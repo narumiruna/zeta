@@ -85,7 +85,88 @@ final class ZetaPluginAPITests: XCTestCase {
         XCTAssertTrue(registrations.isEmpty)
     }
 
+    func testTimedOutRequestInvalidatesHostBeforeQueuedRequest() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let script = directory.appendingPathComponent("delayed.py")
+        let source = #"""
+            #!/usr/bin/env python3
+            import base64,json,sys,time
+            for line in sys.stdin:
+                request=json.loads(line)
+                method=request.get("method")
+                if method == "slow":
+                    open("slow-started", "w").close()
+                    time.sleep(1.5)
+                value = b"[]" if method == "initialize" else method.encode()
+                response={"id":request.get("id"),"type":"response","generation":request["generation"],"payload":base64.b64encode(value).decode()}
+                print(json.dumps(response,separators=(',',':')),flush=True)
+            """#
+        try Data(source.utf8).write(to: script)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o700],
+            ofItemAtPath: script.path
+        )
+        let manifest = PluginManifest(
+            name: "delayed",
+            version: "1",
+            executable: script.lastPathComponent,
+            capabilities: []
+        )
+        var configuration = PluginHost.Configuration()
+        configuration.requestTimeout = .seconds(1)
+        let host = PluginHost(configuration: configuration)
+        try await host.start(manifest: manifest, baseDirectory: directory, trusted: true)
+
+        let first = Task { try await host.request(method: "slow") }
+        let marker = directory.appendingPathComponent("slow-started").path
+        try await waitUntil { FileManager.default.fileExists(atPath: marker) }
+        let second = Task { try await host.request(method: "fast") }
+
+        do {
+            _ = try await first.value
+            XCTFail("Expected first request to time out")
+        } catch {
+            XCTAssertEqual(error as? PluginError, .timedOut)
+        }
+        do {
+            _ = try await second.value
+            XCTFail("Expected queued request to observe the invalidated host")
+        } catch {
+            guard let pluginError = error as? PluginError,
+                case .crashed = pluginError
+            else {
+                return XCTFail("Expected crashed host, got \(error)")
+            }
+        }
+
+        try await host.start(manifest: manifest, baseDirectory: directory, trusted: true)
+        let restartedResponse = try await host.request(method: "fast")
+        XCTAssertEqual(restartedResponse, Data("fast".utf8))
+        await host.stop()
+    }
+
     func testManifestRequiresIdentityAndExecutable() {
         XCTAssertThrowsError(try PluginManifest(name: "", version: "1", executable: "", capabilities: []).validate())
     }
+}
+
+private func waitUntil(
+    timeout: Duration = .seconds(2),
+    _ condition: () -> Bool
+) async throws {
+    let clock = ContinuousClock()
+    let deadline = clock.now.advanced(by: timeout)
+    while !condition() {
+        guard clock.now < deadline else {
+            throw PluginTestError.timedOutWaitingForCondition
+        }
+        try await Task.sleep(for: .milliseconds(1))
+    }
+}
+
+private enum PluginTestError: Error {
+    case timedOutWaitingForCondition
 }

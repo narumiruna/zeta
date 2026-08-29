@@ -188,6 +188,66 @@ final class ZetaTUITests: XCTestCase {
         XCTAssertTrue(terminal.output.contains("\u{1B}]8;;\u{07}"))
         tui.stop()
     }
+
+    func testInputMutationAndRenderingStaySerializedUnderStress() throws {
+        let terminal = VirtualTerminal(columns: 20, rows: 5)
+        let component = SerializationCheckingInput()
+        let tui = TUI(terminal: terminal, root: Container([component]))
+        component.onInput = { tui.requestRender() }
+        tui.setFocus(component)
+        try tui.start()
+
+        DispatchQueue.concurrentPerform(iterations: 1_000) { index in
+            if index.isMultiple(of: 2) {
+                terminal.send("x")
+            } else {
+                tui.requestRender(force: index.isMultiple(of: 11))
+            }
+        }
+
+        let snapshot = component.snapshot
+        XCTAssertEqual(snapshot.inputCount, 500)
+        XCTAssertFalse(snapshot.overlapped)
+        tui.stop()
+    }
+}
+
+private final class SerializationCheckingInput: Focusable, @unchecked Sendable {
+    var focused = false
+    var onInput: (@Sendable () -> Void)?
+
+    private let lock = NSLock()
+    private var active = false
+    private var overlapDetected = false
+    private var storedInputCount = 0
+
+    var snapshot: (inputCount: Int, overlapped: Bool) {
+        lock.withLock { (storedInputCount, overlapDetected) }
+    }
+
+    func render(width: Int) -> [String] {
+        beginOperation()
+        defer { endOperation() }
+        return ["inputs: \(lock.withLock { storedInputCount })"]
+    }
+
+    func handleInput(_ data: String) {
+        beginOperation()
+        defer { endOperation() }
+        lock.withLock { storedInputCount += 1 }
+        onInput?()
+    }
+
+    private func beginOperation() {
+        lock.withLock {
+            if active { overlapDetected = true }
+            active = true
+        }
+    }
+
+    private func endOperation() {
+        lock.withLock { active = false }
+    }
 }
 
 private final class InputRecorder: @unchecked Sendable {

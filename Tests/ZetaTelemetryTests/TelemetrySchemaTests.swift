@@ -68,10 +68,21 @@ import Testing
         let values: [TelemetryAttributeValue] = [
             .string("text"), .number(1.5), .boolean(true),
             .strings(["a", "b"]), .numbers([1, 2]), .booleans([true, false]),
+            .strings([]), .numbers([]), .booleans([]),
         ]
         for value in values {
             #expect(try JSONDecoder().decode(TelemetryAttributeValue.self, from: JSONEncoder().encode(value)) == value)
         }
+    }
+
+    @Test func nonemptyArraysPreserveScalarArrayEncodingCompatibility() throws {
+        let encoder = JSONEncoder()
+        #expect(
+            String(decoding: try encoder.encode(TelemetryAttributeValue.strings(["a"])), as: UTF8.self) == #"["a"]"#)
+        #expect(String(decoding: try encoder.encode(TelemetryAttributeValue.numbers([1])), as: UTF8.self) == "[1]")
+        #expect(
+            String(decoding: try encoder.encode(TelemetryAttributeValue.booleans([true])), as: UTF8.self) == "[true]")
+        #expect(try JSONDecoder().decode(TelemetryAttributeValue.self, from: Data("[]".utf8)) == .strings([]))
     }
 }
 

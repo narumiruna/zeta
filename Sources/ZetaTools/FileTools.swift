@@ -126,7 +126,10 @@ public struct FileTools: @unchecked Sendable {
             }
             try Task.checkCancellation()
             let hasBOM = data.starts(with: [0xEF, 0xBB, 0xBF])
-            let raw = String(decoding: hasBOM ? data.dropFirst(3) : data[...], as: UTF8.self)
+            let contentBytes = hasBOM ? data.dropFirst(3) : data[...]
+            guard let raw = String(bytes: contentBytes, encoding: .utf8) else {
+                throw FileToolError.unreadable(path)
+            }
             let bom = hasBOM ? "\u{FEFF}" : ""
             let newline = raw.contains("\r\n") ? "\r\n" : "\n"
             let normalized = raw.replacingOccurrences(of: "\r\n", with: "\n")

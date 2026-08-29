@@ -22,11 +22,11 @@ public final class OAuthCallbackServer: @unchecked Sendable {
     }
 
     public func start() async throws -> URL {
-        if let listener, let port = listener.port {
+        if let listener = lock.withLock({ self.listener }), let port = listener.port {
             return URL(string: "http://127.0.0.1:\(port.rawValue)/callback")!
         }
         let listener = try NWListener(using: .tcp, on: .any)
-        self.listener = listener
+        lock.withLock { self.listener = listener }
         listener.newConnectionHandler = { [weak self] connection in
             self?.accept(connection)
         }
@@ -47,7 +47,7 @@ public final class OAuthCallbackServer: @unchecked Sendable {
         while true {
             try Task.checkCancellation()
             let state = lock.withLock {
-                (listenerReady, listenerFailure, listener.port?.rawValue)
+                (listenerReady, listenerFailure, self.listener?.port?.rawValue)
             }
             if let failure = state.1 { throw failure }
             if state.0, let port = state.2, port != 0 {
@@ -60,22 +60,28 @@ public final class OAuthCallbackServer: @unchecked Sendable {
     }
 
     public func waitForCallback() async throws -> OAuthCallback {
-        guard listener != nil || pendingResult != nil else {
-            throw OAuthError.invalidCallback
-        }
-        if let pending = lock.withLock({ () -> Result<OAuthCallback, Error>? in
-            defer { pendingResult = nil }
-            return pendingResult
-        }) {
-            return try pending.get()
-        }
-        return try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { continuation in
-                lock.withLock { self.continuation = continuation }
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { callback in
+                let immediate: Result<OAuthCallback, Error>? = lock.withLock {
+                    if let pendingResult {
+                        self.pendingResult = nil
+                        return pendingResult
+                    }
+                    guard listener != nil, continuation == nil else {
+                        return .failure(OAuthError.invalidCallback)
+                    }
+                    continuation = callback
+                    return nil
+                }
+                if let immediate { callback.resume(with: immediate) }
             }
         } onCancel: { [weak self] in
             self?.finish(.failure(CancellationError()))
         }
+    }
+
+    var isWaitingForCallback: Bool {
+        lock.withLock { continuation != nil }
     }
 
     public func stop() {
@@ -127,16 +133,18 @@ public final class OAuthCallbackServer: @unchecked Sendable {
     }
 
     private func finish(_ result: Result<OAuthCallback, Error>) {
-        let continuation: CheckedContinuation<OAuthCallback, Error>? = lock.withLock {
+        let transition: (CheckedContinuation<OAuthCallback, Error>?, NWListener?)? = lock.withLock {
             guard !settled else { return nil }
             settled = true
-            let value = self.continuation
-            self.continuation = nil
-            if value == nil { pendingResult = result }
-            return value
+            let callback = continuation
+            continuation = nil
+            if callback == nil { pendingResult = result }
+            let activeListener = listener
+            listener = nil
+            return (callback, activeListener)
         }
-        listener?.cancel()
-        listener = nil
-        continuation?.resume(with: result)
+        guard let transition else { return }
+        transition.1?.cancel()
+        transition.0?.resume(with: result)
     }
 }

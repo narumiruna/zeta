@@ -135,6 +135,30 @@ final class ZetaConfigTests: XCTestCase {
         XCTAssertNil(empty.bearerToken)
     }
 
+    func testCredentialHelperDrainsLargeOutputWithoutDeadlock() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = try AuthStore(url: directory.appendingPathComponent("auth.json"))
+        try await store.set(
+            provider: "helper",
+            credential: .apiKey(
+                key: "!awk 'BEGIN { for (i=0; i<200000; i++) printf \"x\" }'",
+                environment: nil
+            )
+        )
+
+        let credential = try await store.resolveAPIKey(
+            provider: "helper",
+            environment: [:],
+            fallbackVariables: []
+        )
+
+        XCTAssertEqual(credential?.count, 200_000)
+        XCTAssertEqual(credential?.first, "x")
+        XCTAssertEqual(credential?.last, "x")
+    }
+
     func testCredentialKindsDoNotExposeSecretsInList() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let store = try AuthStore(url: directory.appendingPathComponent("auth.json"))

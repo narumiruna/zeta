@@ -5,12 +5,14 @@ import ZetaCompaction
 import ZetaCore
 import ZetaExport
 import ZetaModes
+import ZetaSessions
 import ZetaTools
 
 public actor CLIRPCRuntime {
     private let agent: Agent
     private let models: [Model]
     private let shell: ShellTool
+    private let workingDirectory: URL
     private var autoCompaction = true
     private var autoRetry = true
     private var sessionName: String?
@@ -31,6 +33,7 @@ public actor CLIRPCRuntime {
         self.agent = agent
         self.models = models
         self.session = session
+        self.workingDirectory = workingDirectory
         shell = ShellTool(workingDirectory: workingDirectory)
     }
 
@@ -59,7 +62,7 @@ public actor CLIRPCRuntime {
             guard !sessionMutationInProgress, !compactionInProgress else {
                 throw AgentError.blocked("An agent operation is in progress")
             }
-            let message = UserMessage(try requiredString("message", request.fields))
+            let message = try userMessage(request.fields)
             if promptTask != nil {
                 queuedPrompts.append(message)
                 return ["queued": true]
@@ -78,10 +81,10 @@ public actor CLIRPCRuntime {
             promptTask = Task { await self.runPrompt(message, id: id) }
             return ["accepted": true]
         case .steer:
-            await agent.steer(UserMessage(try requiredString("message", request.fields)))
+            await agent.steer(try userMessage(request.fields))
             return ["queued": true]
         case .followUp:
-            await agent.followUp(UserMessage(try requiredString("message", request.fields)))
+            await agent.followUp(try userMessage(request.fields))
             return ["queued": true]
         case .abort:
             await agent.abort()
@@ -174,7 +177,10 @@ public actor CLIRPCRuntime {
                 return ["compacted": false]
             }
             let summary = try await agent.compact(
-                summaryPrompt: Compaction.summaryPrompt(preparation: preparation),
+                summaryPrompt: Compaction.summaryPrompt(
+                    preparation: preparation,
+                    customInstructions: optionalString("customInstructions", request.fields)
+                ),
                 retainedTail: preparation.retainedTail
             )
             try await session?.recordCompaction(
@@ -235,17 +241,13 @@ public actor CLIRPCRuntime {
             ]
         case .exportHTML:
             let state = await agent.state()
-            let data = try state.messages.map(encoded)
-            var lines = Data()
-            for value in data {
-                lines.append(OrderedJSON.encode(value))
-                lines.append(0x0A)
-            }
+            let exported = try await exportJSONL(messages: state.messages)
             let html = SessionExporter.standaloneHTML(
                 title: sessionName ?? "Zeta Session",
-                sessionJSONL: lines,
+                sessionJSONL: exported.data,
                 renderedTranscript: state.messages.map(String.init(describing:))
-                    .joined(separator: "\n\n")
+                    .joined(separator: "\n\n"),
+                leafID: exported.leafID
             )
             return ["html": .string(html)]
         case .switchSession:
@@ -355,6 +357,90 @@ public actor CLIRPCRuntime {
         try await session?.recordCompaction(
             summary: summary,
             preparation: preparation
+        )
+    }
+
+    private func userMessage(_ fields: OrderedJSONObject) throws -> UserMessage {
+        var content: [ContentBlock] = [.text(text: try requiredString("message", fields))]
+        guard let value = fields["images"] else {
+            return UserMessage(content: content, timestamp: timestamp())
+        }
+        guard case .array(let images) = value else {
+            throw RPCProtocolError.invalidType
+        }
+        for image in images {
+            guard case .object(let object) = image,
+                object.count == 3,
+                case .string("image")? = object["type"],
+                case .string(let data)? = object["data"],
+                case .string(let mimeType)? = object["mimeType"],
+                !data.isEmpty,
+                let base64 = try? Base64Content(rawValue: data),
+                !base64.data.isEmpty,
+                let detectedMIME = ZetaCLI.imageMIME(base64.data),
+                Self.mimeTypesMatch(declared: mimeType, detected: detectedMIME)
+            else {
+                throw RPCProtocolError.invalidType
+            }
+            content.append(.image(data: data, mimeType: mimeType))
+        }
+        return UserMessage(content: content, timestamp: timestamp())
+    }
+
+    private func exportJSONL(messages: [Message]) async throws -> (data: Data, leafID: String?) {
+        let header: SessionHeader
+        let entries: [SessionEntry]
+        let leafID: String?
+        if let session {
+            let snapshot = await session.exportSnapshot()
+            header = snapshot.header
+            entries = snapshot.entries
+            leafID = snapshot.leafID
+        } else {
+            header = SessionHeader(
+                id: UUID().uuidString.lowercased(),
+                timestamp: ISO8601DateFormatter().string(from: Date()),
+                cwd: workingDirectory.path
+            )
+            var parentID: String?
+            entries = messages.enumerated().map { index, message in
+                let id = String(format: "%08x", index + 1)
+                defer { parentID = id }
+                return .message(
+                    SessionEntryBase(
+                        id: id,
+                        parentId: parentID,
+                        timestamp: Self.timestamp(for: message)
+                    ),
+                    message
+                )
+            }
+            leafID = entries.last?.base.id
+        }
+        var data = try SessionExporter.jsonLines([header])
+        data.append(try SessionExporter.jsonLines(entries))
+        return (data, leafID)
+    }
+
+    private static func mimeTypesMatch(declared: String, detected: String) -> Bool {
+        let declared = declared.lowercased()
+        return declared == detected || (declared == "image/jpg" && detected == "image/jpeg")
+    }
+
+    private func timestamp() -> Int64 {
+        Int64(Date().timeIntervalSince1970 * 1_000)
+    }
+
+    private static func timestamp(for message: Message) -> String {
+        let milliseconds: Int64 =
+            switch message {
+            case .user(let value): value.timestamp
+            case .assistant(let value): value.timestamp
+            case .toolResult(let value): value.timestamp
+            case .custom(let value): value.timestamp
+            }
+        return ISO8601DateFormatter().string(
+            from: Date(timeIntervalSince1970: Double(milliseconds) / 1_000)
         )
     }
 

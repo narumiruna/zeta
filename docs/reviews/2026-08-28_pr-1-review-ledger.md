@@ -586,6 +586,148 @@ Final outcome: Addressed by aborting and draining the active agent run when exit
 
 Evidence: Interactive CLI regressions verify prompt cancellation and terminal settlement.
 
+## Fourth-round inline feedback
+
+### `3885588589`
+
+Concern: Package replacement deletes the previous backup before the registry index is durable.
+
+Initial outcome: Actionable and not yet addressed.
+
+Final outcome: Addressed by retaining the backup through successful index persistence and restoring it on failure.
+
+Evidence: Package rollback regressions inject index write failures for install, remove, and update.
+
+### `3885588590`
+
+Concern: TUI input mutation races component rendering.
+
+Initial outcome: Actionable and not yet addressed.
+
+Final outcome: Addressed by serializing input handling, component state, rendering, and terminal writes on reentrancy-aware executors.
+
+Evidence: TUI stress coverage passes under ThreadSanitizer.
+
+### `3885588592`
+
+Concern: OAuth callback continuation installation races a completed callback.
+
+Initial outcome: Actionable and not yet addressed.
+
+Final outcome: Addressed by consuming a pending result or installing the continuation in one locked transition.
+
+Evidence: OAuth regressions exercise both callback-before-waiter and waiter-before-callback orders.
+
+### `3885588593`
+
+Concern: Credential helper output can deadlock a full pipe before process exit.
+
+Initial outcome: Actionable and not yet addressed.
+
+Final outcome: Addressed by draining helper output asynchronously while the process runs and retaining cancellation handling.
+
+Evidence: AuthStore regression coverage resolves a helper output larger than the pipe buffer.
+
+### `3885588594`
+
+Concern: A plugin timeout leaves a late response queued for the next request.
+
+Initial outcome: Actionable and not yet addressed.
+
+Final outcome: Addressed by invalidating and stopping the plugin host on read timeout or failure before releasing queued requests.
+
+Evidence: Plugin host regressions verify a late response cannot contaminate a subsequent call.
+
+### `3885588596`
+
+Concern: OpenAI Responses function-call metadata is lost before argument deltas.
+
+Initial outcome: Actionable and not yet addressed.
+
+Final outcome: Addressed by seeding call ID, name, namespace, and output-index mapping from `response.output_item.added`.
+
+Evidence: Provider regressions verify interleaved parallel calls and balanced tool events.
+
+### `3885588597`
+
+Concern: RPC image attachments are accepted but discarded.
+
+Initial outcome: Actionable and not yet addressed.
+
+Final outcome: Addressed by strict canonical base64 and MIME validation followed by `ContentBlock.image` construction for prompt, steer, and follow-up.
+
+Evidence: RPC image regressions cover valid and invalid attachments for all three commands.
+
+### `3885588598`
+
+Concern: Repeated compactions map projected indexes into the raw branch incorrectly.
+
+Initial outcome: Actionable and not yet addressed.
+
+Final outcome: Addressed by resolving retained entries against the same projected context sequence used by the agent.
+
+Evidence: A two-compaction reload regression verifies summarized history is not resurrected.
+
+### `3885588599`
+
+Concern: RPC compaction ignores custom instructions.
+
+Initial outcome: Actionable and not yet addressed.
+
+Final outcome: Addressed by forwarding `customInstructions` to the summary prompt builder.
+
+Evidence: RPC compaction regression verifies the custom text reaches the provider prompt.
+
+### `3885588600`
+
+Concern: Empty telemetry arrays lose their scalar variant during Codable round trips.
+
+Initial outcome: Actionable and not yet addressed.
+
+Final outcome: Addressed with tagged encoding for empty string, number, and boolean arrays while retaining legacy nonempty encoding.
+
+Evidence: Telemetry schema regressions verify all empty variants round-trip exactly.
+
+### `3885588601`
+
+Concern: Package removal trusts unsafe registry directory paths.
+
+Initial outcome: Actionable and not yet addressed.
+
+Final outcome: Addressed by validating a single contained path component before any filesystem mutation.
+
+Evidence: Package regressions cover traversal, absolute, separator, and external-target variants.
+
+### `3885588602`
+
+Concern: File editing silently replaces invalid UTF-8 bytes.
+
+Initial outcome: Actionable and not yet addressed.
+
+Final outcome: Addressed by requiring lossless UTF-8 decoding before text replacement.
+
+Evidence: File-tool regression verifies rejection leaves every original byte unchanged.
+
+### `3885588604`
+
+Concern: Cancelled client requests remain pending until server response or disconnect.
+
+Initial outcome: Actionable and not yet addressed.
+
+Final outcome: Addressed by atomically removing and cancelling the pending continuation with double-settlement protection.
+
+Evidence: Client regressions cover cancellation racing response and disconnect.
+
+### `3885588605`
+
+Concern: HTML export embeds bare messages instead of coding-agent JSONL.
+
+Initial outcome: Actionable and not yet addressed.
+
+Final outcome: Addressed by exporting a version 3 header and `SessionEntry` records from persistent state or a valid synthesized in-memory session.
+
+Evidence: Export regressions reopen the downloaded JSONL through session format detection and `SessionManager`.
+
 ## Check feedback
 
 ### Repository gates

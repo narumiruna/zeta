@@ -140,7 +140,10 @@ let package = Package(
         .testTarget(name: "ZetaTestSupportTests", dependencies: ["ZetaTestSupport"]),
         .testTarget(
             name: "ZetaCLITests",
-            dependencies: ["ZetaCLI", "ZetaAgent", "ZetaAI", "ZetaCore", "ZetaModes"]
+            dependencies: [
+                "ZetaCLI", "ZetaAgent", "ZetaAI", "ZetaCompaction", "ZetaCore", "ZetaModes",
+                "ZetaSessionFormat", "ZetaSessions",
+            ]
         ),
         .testTarget(
             name: "ZetaCompatibilityTests",

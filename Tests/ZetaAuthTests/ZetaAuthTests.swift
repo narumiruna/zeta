@@ -98,12 +98,32 @@ final class ZetaAuthTests: XCTestCase {
             URLQueryItem(name: "state", value: "state"),
         ]
         let callback = Task { try await server.waitForCallback() }
-        await Task.yield()
+        try await waitUntil { server.isWaitingForCallback }
         _ = try await URLSession.shared.data(from: components.url!)
         let callbackValue = try await callback.value
         XCTAssertEqual(
             callbackValue,
             OAuthCallback(code: "code", state: "state")
+        )
+    }
+
+    func testOAuthCallbackCompletedBeforeWaiterIsPreserved() async throws {
+        let server = OAuthCallbackServer(expectedState: "early-state")
+        var components = URLComponents(
+            url: try await server.start(),
+            resolvingAgainstBaseURL: false
+        )!
+        components.queryItems = [
+            URLQueryItem(name: "code", value: "early-code"),
+            URLQueryItem(name: "state", value: "early-state"),
+        ]
+
+        _ = try await URLSession.shared.data(from: components.url!)
+
+        let callback = try await server.waitForCallback()
+        XCTAssertEqual(
+            callback,
+            OAuthCallback(code: "early-code", state: "early-state")
         )
     }
 
@@ -185,6 +205,21 @@ final class ZetaAuthTests: XCTestCase {
         XCTAssertEqual(signed.signature.count, 64)
         XCTAssertTrue(signed.canonicalRequest.contains("Action=ListUsers&Version=2010-05-08"))
         XCTAssertNotNil(signed.request.value(forHTTPHeaderField: "Authorization"))
+    }
+}
+
+private func waitUntil(
+    timeout: Duration = .seconds(1),
+    _ condition: () -> Bool
+) async throws {
+    let clock = ContinuousClock()
+    let deadline = clock.now.advanced(by: timeout)
+    while !condition() {
+        guard clock.now < deadline else {
+            XCTFail("Timed out waiting for callback state")
+            return
+        }
+        try await Task.sleep(for: .milliseconds(1))
     }
 }
 

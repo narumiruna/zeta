@@ -86,6 +86,9 @@ actor PersistentSessionController {
     func currentEntries() async -> [SessionEntry] { await manager.allEntries() }
     func currentMessages() async throws -> [Message] { try await manager.context().messages }
     func currentFile() async -> URL? { await manager.file }
+    func exportSnapshot() async -> (header: SessionHeader, entries: [SessionEntry], leafID: String?) {
+        await (manager.header, manager.allEntries(), manager.leaf()?.base.id)
+    }
     func persistenceErrors() -> [String] { errors }
 
     @discardableResult
@@ -109,14 +112,11 @@ actor PersistentSessionController {
         preparation: CompactionPreparation
     ) async throws {
         let branch = try await manager.branch()
-        let messageEntries = branch.compactMap { entry -> SessionEntry? in
-            if case .message = entry { entry } else { nil }
+        let contextEntries = Self.projectedContextEntries(branch)
+        guard contextEntries.indices.contains(preparation.firstRetainedMessageIndex) else {
+            throw AgentError.blocked("Compaction context does not match the persistent session")
         }
-        guard !messageEntries.isEmpty else { return }
-        let retainedIndex = min(
-            preparation.firstRetainedMessageIndex,
-            messageEntries.count - 1
-        )
+        let firstKeptEntryID = contextEntries[preparation.firstRetainedMessageIndex].base.id
         let base = SessionEntryBase(
             id: String(UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(8)).lowercased(),
             parentId: await manager.leaf()?.base.id,
@@ -126,7 +126,7 @@ actor PersistentSessionController {
             .compaction(
                 base,
                 summary: summary,
-                firstKeptEntryID: messageEntries[retainedIndex].base.id,
+                firstKeptEntryID: firstKeptEntryID,
                 tokensBefore: preparation.estimatedTokensBefore,
                 details: nil,
                 usage: nil,
@@ -195,6 +195,30 @@ actor PersistentSessionController {
         let loaded = try SessionManager.load(file: URL(fileURLWithPath: path))
         manager = loaded
         return try await loaded.context().messages
+    }
+
+    private static func projectedContextEntries(_ branch: [SessionEntry]) -> [SessionEntry] {
+        let projected: [SessionEntry]
+        if let compactionIndex = branch.lastIndex(where: { entry in
+            if case .compaction = entry { true } else { false }
+        }), case .compaction(_, _, let firstKept, _, _, _, _) = branch[compactionIndex] {
+            var compacted = [branch[compactionIndex]]
+            if let keptIndex = branch[..<compactionIndex].firstIndex(where: { $0.base.id == firstKept }) {
+                compacted += branch[keptIndex..<compactionIndex]
+            }
+            compacted += branch.dropFirst(compactionIndex + 1)
+            projected = compacted
+        } else {
+            projected = branch
+        }
+        return projected.filter { entry in
+            switch entry {
+            case .message, .customMessage, .compaction, .branchSummary:
+                true
+            default:
+                false
+            }
+        }
     }
 
     private static func resolve(_ value: String, root: URL) throws -> SessionManager {

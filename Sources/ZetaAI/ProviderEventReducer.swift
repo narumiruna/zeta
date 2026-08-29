@@ -32,6 +32,9 @@ public struct ProviderEventReducer: Sendable {
         }
         let type = object.string("type") ?? eventName ?? ""
         var events = consumeGoogleParts(object)
+        if type == "response.output_item.added" {
+            events += startOpenAIResponseToolCall(object)
+        }
 
         if type == "content_block_start",
             case .object(let block)? = object["content_block"]
@@ -121,19 +124,7 @@ public struct ProviderEventReducer: Sendable {
             ?? (type.contains("function_call_arguments.delta")
                 ? object.string("delta") : nil)
         if let toolDelta {
-            let index =
-                object.integer("index")
-                ?? object.integer("output_index")
-                ?? latestToolIndex()
-                ?? partial.content.count
-            if index == partial.content.count {
-                let call = ToolCall(
-                    id: object.string("call_id") ?? "call-\(index)",
-                    name: object.string("name") ?? "tool"
-                )
-                ensureIndex(index, block: .toolCall(call))
-                events.append(.toolCallStart(index: index, partial: partial))
-            }
+            let index = toolContentIndex(for: object, type: type, events: &events)
             toolArgumentBuffers[index, default: ""] += toolDelta
             updateToolArguments(index)
             events.append(
@@ -141,14 +132,21 @@ public struct ProviderEventReducer: Sendable {
             )
         }
 
-        if type == "content_block_stop"
-            || type.contains("function_call_arguments.done")
-        {
-            let index =
-                object.integer("index")
-                ?? object.integer("output_index")
-                ?? latestToolIndex()
-                ?? 0
+        if type.contains("function_call_arguments.done") {
+            let index = toolContentIndex(for: object, type: type, events: &events)
+            if let arguments = object.string("arguments") {
+                let previous = toolArgumentBuffers[index] ?? ""
+                toolArgumentBuffers[index] = arguments
+                updateToolArguments(index)
+                if arguments.hasPrefix(previous) {
+                    let suffix = String(arguments.dropFirst(previous.count))
+                    if !suffix.isEmpty {
+                        events.append(.toolCallDelta(index: index, delta: suffix, partial: partial))
+                    }
+                }
+            }
+        } else if type == "content_block_stop" {
+            let index = object.integer("index") ?? latestToolIndex() ?? 0
             if partial.content.indices.contains(index) {
                 switch partial.content[index] {
                 case .text, .thinking:
@@ -164,14 +162,13 @@ public struct ProviderEventReducer: Sendable {
             }
         }
 
-        if type == "response.output_item.done"
-            || type == "response.output_text.done"
+        if type == "response.output_item.done" {
+            events += finishOpenAIResponseOutputItem(object)
+        } else if type == "response.output_text.done",
+            let outputIndex = object.integer("output_index"),
+            let contentIndex = openAIResponseContentIndices[outputIndex]
         {
-            if let outputIndex = object.integer("output_index"),
-                let contentIndex = openAIResponseContentIndices[outputIndex]
-            {
-                events += finishContentBlock(at: contentIndex)
-            }
+            events += finishContentBlock(at: contentIndex)
         }
 
         if let stop = object.pathString(["choices", "0", "finish_reason"])
@@ -201,6 +198,7 @@ public struct ProviderEventReducer: Sendable {
             || type == "response.done"
         {
             events += finishOpenAIContentBlocks()
+            events += finishOpenAIResponseToolCalls()
         }
         if type == "message_stop"
             || type == "response.completed"
@@ -343,6 +341,139 @@ public struct ProviderEventReducer: Sendable {
     ) -> String? {
         if let incoming, !incoming.isEmpty { return incoming }
         return existing
+    }
+
+    private mutating func startOpenAIResponseToolCall(
+        _ object: OrderedJSONObject
+    ) -> [AssistantEvent] {
+        guard let outputIndex = object.integer("output_index"),
+            case .object(let item)? = object["item"],
+            item.string("type") == "function_call"
+        else {
+            return []
+        }
+        if let contentIndex = openAIResponseContentIndices[outputIndex] {
+            updateOpenAIResponseToolMetadata(item, at: contentIndex, outputIndex: outputIndex)
+            return []
+        }
+        let contentIndex = partial.content.count
+        let call = openAIResponseToolCall(item, outputIndex: outputIndex)
+        partial.content.append(.toolCall(call))
+        openAIResponseContentIndices[outputIndex] = contentIndex
+        toolArgumentBuffers[contentIndex] = item.string("arguments") ?? ""
+        updateToolArguments(contentIndex)
+        return [.toolCallStart(index: contentIndex, partial: partial)]
+    }
+
+    private mutating func finishOpenAIResponseOutputItem(
+        _ object: OrderedJSONObject
+    ) -> [AssistantEvent] {
+        guard let outputIndex = object.integer("output_index") else { return [] }
+        if case .object(let item)? = object["item"],
+            item.string("type") == "function_call"
+        {
+            var events = startOpenAIResponseToolCall(object)
+            guard let contentIndex = openAIResponseContentIndices.removeValue(forKey: outputIndex) else {
+                return events
+            }
+            updateOpenAIResponseToolMetadata(item, at: contentIndex, outputIndex: outputIndex)
+            if let arguments = item.string("arguments") {
+                toolArgumentBuffers[contentIndex] = arguments
+            }
+            updateToolArguments(contentIndex)
+            guard partial.content.indices.contains(contentIndex),
+                case .toolCall(let call) = partial.content[contentIndex]
+            else {
+                toolArgumentBuffers[contentIndex] = nil
+                return events
+            }
+            events.append(.toolCallEnd(index: contentIndex, call: call, partial: partial))
+            toolArgumentBuffers[contentIndex] = nil
+            return events
+        }
+        guard let contentIndex = openAIResponseContentIndices[outputIndex] else { return [] }
+        return finishContentBlock(at: contentIndex)
+    }
+
+    private mutating func finishOpenAIResponseToolCalls() -> [AssistantEvent] {
+        var events: [AssistantEvent] = []
+        let slots = openAIResponseContentIndices.sorted(by: { $0.key < $1.key })
+        for (outputIndex, contentIndex) in slots {
+            guard partial.content.indices.contains(contentIndex),
+                case .toolCall = partial.content[contentIndex]
+            else {
+                continue
+            }
+            updateToolArguments(contentIndex)
+            guard case .toolCall(let updated) = partial.content[contentIndex] else { continue }
+            events.append(.toolCallEnd(index: contentIndex, call: updated, partial: partial))
+            toolArgumentBuffers[contentIndex] = nil
+            openAIResponseContentIndices[outputIndex] = nil
+        }
+        return events
+    }
+
+    private mutating func toolContentIndex(
+        for object: OrderedJSONObject,
+        type: String,
+        events: inout [AssistantEvent]
+    ) -> Int {
+        if type.hasPrefix("response."), let outputIndex = object.integer("output_index") {
+            if let contentIndex = openAIResponseContentIndices[outputIndex] {
+                return contentIndex
+            }
+            let contentIndex = partial.content.count
+            let call = ToolCall(
+                id: object.string("call_id") ?? "call-\(outputIndex)",
+                name: object.string("name") ?? "tool"
+            )
+            partial.content.append(.toolCall(call))
+            openAIResponseContentIndices[outputIndex] = contentIndex
+            toolArgumentBuffers[contentIndex] = ""
+            events.append(.toolCallStart(index: contentIndex, partial: partial))
+            return contentIndex
+        }
+        let index = object.integer("index") ?? latestToolIndex() ?? partial.content.count
+        if !partial.content.indices.contains(index) {
+            let call = ToolCall(
+                id: object.string("call_id") ?? "call-\(index)",
+                name: object.string("name") ?? "tool"
+            )
+            ensureIndex(index, block: .toolCall(call))
+            toolArgumentBuffers[index] = ""
+            events.append(.toolCallStart(index: index, partial: partial))
+        }
+        return index
+    }
+
+    private func openAIResponseToolCall(
+        _ item: OrderedJSONObject,
+        outputIndex: Int
+    ) -> ToolCall {
+        let callID = item.string("call_id") ?? "call-\(outputIndex)"
+        let id = item.string("id").map { "\(callID)|\($0)" } ?? callID
+        return ToolCall(
+            id: id,
+            name: item.string("name") ?? "tool",
+            namespace: item.string("namespace")
+        )
+    }
+
+    private mutating func updateOpenAIResponseToolMetadata(
+        _ item: OrderedJSONObject,
+        at contentIndex: Int,
+        outputIndex: Int
+    ) {
+        guard partial.content.indices.contains(contentIndex),
+            case .toolCall(var call) = partial.content[contentIndex]
+        else {
+            return
+        }
+        let metadata = openAIResponseToolCall(item, outputIndex: outputIndex)
+        call.id = metadata.id
+        call.name = metadata.name
+        call.namespace = metadata.namespace
+        partial.content[contentIndex] = .toolCall(call)
     }
 
     private mutating func consumeOpenAIChatToolCalls(

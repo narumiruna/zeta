@@ -197,11 +197,17 @@ public actor PluginHost {
         guard encoded.count <= configuration.maximumRecordBytes else { throw PluginError.malformedMessage }
         encoded.append(0x0A)
         try input.write(contentsOf: encoded)
-        let line = try await PluginLineRead.read(
-            from: output,
-            maximumBytes: configuration.maximumRecordBytes,
-            timeout: configuration.requestTimeout
-        )
+        let line: Data
+        do {
+            line = try await PluginLineRead.read(
+                from: output,
+                maximumBytes: configuration.maximumRecordBytes,
+                timeout: configuration.requestTimeout
+            )
+        } catch {
+            await stop()
+            throw error
+        }
         let response = try JSONDecoder().decode(PluginEnvelope.self, from: line)
         guard response.id == id, response.generation == generation, response.type == "response" else {
             throw PluginError.staleRuntime
@@ -213,6 +219,12 @@ public actor PluginHost {
     public func stop() async {
         generation &+= 1
         registrations = []
+        let process = self.process
+        let input = self.input
+        let output = self.output
+        self.process = nil
+        self.input = nil
+        self.output = nil
         try? input?.close()
         try? output?.close()
         if let process {
@@ -223,9 +235,6 @@ public actor PluginHost {
             try? await Task.sleep(for: .milliseconds(100))
             if process.isRunning { process.interrupt() }
         }
-        process = nil
-        input = nil
-        output = nil
     }
 
     private func acquireRequestSlot() async {

@@ -87,11 +87,19 @@ public struct StrictRPCRequest: Sendable, Equatable {
         ) -> JSONSchemaProperty {
             JSONSchemaProperty(name, schema, required: required)
         }
+        let imageSchema = JSONSchema.object(
+            properties: [
+                field("type", .enumeration(["image"])),
+                field("data", .string(minLength: 1)),
+                field("mimeType", .string(minLength: 1)),
+            ],
+            additionalProperties: .forbidden
+        )
         switch command {
         case .prompt:
             properties += [
                 field("message", .string()),
-                field("images", .array(items: .any), required: false),
+                field("images", .array(items: imageSchema), required: false),
                 field(
                     "streamingBehavior",
                     .enumeration(["steer", "followUp"]),
@@ -101,7 +109,7 @@ public struct StrictRPCRequest: Sendable, Equatable {
         case .steer, .followUp:
             properties += [
                 field("message", .string()),
-                field("images", .array(items: .any), required: false),
+                field("images", .array(items: imageSchema), required: false),
             ]
         case .newSession:
             properties.append(field("parentSession", .string(), required: false))

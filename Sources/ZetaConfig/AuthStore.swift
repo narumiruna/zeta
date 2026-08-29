@@ -180,9 +180,45 @@ public actor AuthStore {
             process.standardOutput = pipe
             process.standardError = FileHandle.nullDevice
             try process.run()
-            process.waitUntilExit()
-            guard process.terminationStatus == 0 else { throw CocoaError(.executableRuntimeMismatch) }
-            return String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+            _ = setpgid(process.processIdentifier, process.processIdentifier)
+            let data = try await withTaskCancellationHandler {
+                try await withThrowingTaskGroup(of: CredentialHelperResult.self) { group in
+                    group.addTask {
+                        var output = Data()
+                        for try await byte in pipe.fileHandleForReading.bytes {
+                            guard output.count < 1_048_576 else {
+                                throw CredentialHelperError.outputTooLarge
+                            }
+                            output.append(byte)
+                        }
+                        while process.isRunning {
+                            try Task.checkCancellation()
+                            try await Task.sleep(for: .milliseconds(10))
+                        }
+                        return .completed(output, process.terminationStatus)
+                    }
+                    group.addTask {
+                        try await Task.sleep(for: .seconds(30))
+                        return .timedOut
+                    }
+                    guard let first = try await group.next() else {
+                        throw CredentialHelperError.failed
+                    }
+                    group.cancelAll()
+                    switch first {
+                    case .completed(let output, let status):
+                        guard status == 0 else { throw CredentialHelperError.failed }
+                        return output
+                    case .timedOut:
+                        Self.terminateCredentialHelper(process)
+                        try? pipe.fileHandleForReading.close()
+                        throw CredentialHelperError.timedOut
+                    }
+                }
+            } onCancel: {
+                Self.terminateCredentialHelper(process)
+            }
+            return String(decoding: data, as: UTF8.self)
                 .trimmingCharacters(in: .whitespacesAndNewlines)
         }
         let sentinelDollar = "\u{0}DOLLAR\u{0}"
@@ -200,4 +236,25 @@ public actor AuthStore {
         return expanded.replacingOccurrences(of: sentinelDollar, with: "$")
             .replacingOccurrences(of: sentinelBang, with: "!")
     }
+
+    private static func terminateCredentialHelper(_ process: Process) {
+        guard process.isRunning else { return }
+        if kill(-process.processIdentifier, SIGTERM) != 0 {
+            process.terminate()
+        }
+        if process.isRunning {
+            _ = kill(-process.processIdentifier, SIGKILL)
+        }
+    }
+}
+
+private enum CredentialHelperResult: Sendable {
+    case completed(Data, Int32)
+    case timedOut
+}
+
+private enum CredentialHelperError: Error, Sendable {
+    case failed
+    case timedOut
+    case outputTooLarge
 }

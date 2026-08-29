@@ -96,6 +96,30 @@ final class ZetaToolsTests: XCTestCase {
         _ = try await tools.edit(path: "file.txt", replacements: [TextReplacement(oldText: "a\nb", newText: "x\ny")])
         XCTAssertEqual(try tools.read(path: "file.txt"), "\u{FEFF}x\r\ny\r\n")
     }
+
+    func testEditRejectsInvalidUTF8WithoutChangingBytes() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let file = directory.appendingPathComponent("invalid.txt")
+        let original = Data([0x61, 0x6C, 0x70, 0x68, 0x61, 0x0A, 0xFF, 0x0A])
+        try original.write(to: file)
+        let tools = FileTools(workingDirectory: directory)
+
+        do {
+            _ = try await tools.edit(
+                path: "invalid.txt",
+                replacements: [TextReplacement(oldText: "alpha", newText: "beta")]
+            )
+            XCTFail("Expected invalid UTF-8 to be rejected")
+        } catch FileToolError.unreadable(let path) {
+            XCTAssertEqual(path, "invalid.txt")
+        } catch {
+            XCTFail("Expected unreadable error, got \(error)")
+        }
+
+        XCTAssertEqual(try Data(contentsOf: file), original)
+    }
 }
 
 private func assertThrowsErrorAsync(_ expression: () async throws -> Void) async {

@@ -48,11 +48,15 @@ public final class Spacer: Component, @unchecked Sendable {
 }
 
 public class Container: Component, @unchecked Sendable {
-    public private(set) var children: [Component] = []
-    public init(_ children: [Component] = []) { self.children = children }
-    public func add(_ component: Component) { children.append(component) }
-    public func remove(_ component: Component) { children.removeAll { $0 === component } }
-    public func clear() { children.removeAll() }
+    private let lock = NSLock()
+    private var storedChildren: [Component]
+
+    public var children: [Component] { lock.withLock { storedChildren } }
+
+    public init(_ children: [Component] = []) { storedChildren = children }
+    public func add(_ component: Component) { lock.withLock { storedChildren.append(component) } }
+    public func remove(_ component: Component) { lock.withLock { storedChildren.removeAll { $0 === component } } }
+    public func clear() { lock.withLock { storedChildren.removeAll() } }
     public func render(width: Int) -> [String] { children.flatMap { $0.render(width: width) } }
     public func invalidate() { children.forEach { $0.invalidate() } }
 }
@@ -101,6 +105,27 @@ public final class Input: Focusable, @unchecked Sendable {
     }
 }
 
+final class TUIExecutor: @unchecked Sendable {
+    private let queue: DispatchQueue
+    private let queueKey = DispatchSpecificKey<UInt8>()
+
+    init(label: String) {
+        queue = DispatchQueue(label: label)
+        queue.setSpecific(key: queueKey, value: 1)
+    }
+
+    func sync<Result>(_ operation: () throws -> Result) rethrows -> Result {
+        if DispatchQueue.getSpecific(key: queueKey) != nil {
+            return try operation()
+        }
+        return try queue.sync(execute: operation)
+    }
+
+    func async(_ operation: @escaping @Sendable () -> Void) {
+        queue.async(execute: operation)
+    }
+}
+
 public final class TUI: @unchecked Sendable {
     private struct ActiveOverlay {
         var id: UUID
@@ -116,7 +141,11 @@ public final class TUI: @unchecked Sendable {
     private var inputListeners: [@Sendable (String) -> Bool] = []
     private var overlays: [ActiveOverlay] = []
     private var started = false
-    private let lock = NSLock()
+    private var componentCallbackDepth = 0
+    private var rendering = false
+    private var renderPending = false
+    private var forceRenderPending = false
+    private let executor = TUIExecutor(label: "works.earendil.zeta.tui")
 
     public init(terminal: Terminal, root: Container = Container()) {
         self.terminal = terminal
@@ -124,84 +153,99 @@ public final class TUI: @unchecked Sendable {
     }
 
     public func add(_ component: Component) {
-        root.add(component)
-        requestRender()
+        executor.sync {
+            root.add(component)
+            scheduleRender()
+        }
     }
 
     public func addInputListener(
         _ listener: @escaping @Sendable (String) -> Bool
     ) {
-        inputListeners.append(listener)
+        executor.sync { inputListeners.append(listener) }
     }
 
     public func showOverlay(
         _ component: Component,
         options: OverlayOptions = OverlayOptions()
     ) -> OverlayHandle {
-        let id = UUID()
-        overlays.append(
-            ActiveOverlay(
-                id: id,
-                component: component,
-                options: options,
-                hidden: false
+        executor.sync {
+            let id = UUID()
+            overlays.append(
+                ActiveOverlay(
+                    id: id,
+                    component: component,
+                    options: options,
+                    hidden: false
+                )
             )
-        )
-        if !options.nonCapturing, let focusable = component as? Focusable {
-            setFocus(focusable)
-        }
-        requestRender()
-        return OverlayHandle(
-            id: id,
-            hide: { [weak self] id in self?.hideOverlay(id) },
-            visibility: { [weak self] id, hidden in
-                self?.setOverlay(id, hidden: hidden)
+            if !options.nonCapturing, let focusable = component as? Focusable {
+                setFocusWithoutRendering(focusable)
             }
-        )
+            scheduleRender()
+            return OverlayHandle(
+                id: id,
+                hide: { [weak self] id in self?.hideOverlay(id) },
+                visibility: { [weak self] id, hidden in
+                    self?.setOverlay(id, hidden: hidden)
+                }
+            )
+        }
     }
 
     public func hasOverlay() -> Bool {
-        overlays.contains { !$0.hidden }
+        executor.sync { overlays.contains { !$0.hidden } }
     }
 
     public func hideOverlay() {
-        guard let id = overlays.last(where: { !$0.hidden })?.id else { return }
-        hideOverlay(id)
+        executor.sync {
+            guard let id = overlays.last(where: { !$0.hidden })?.id else { return }
+            hideOverlayWithoutRendering(id)
+            scheduleRender()
+        }
     }
 
     public func setFocus(_ component: (Component & Focusable)?) {
-        if let old = focus as? Focusable { old.focused = false }
-        focus = component
-        if let component { component.focused = true }
-        requestRender()
+        executor.sync {
+            setFocusWithoutRendering(component)
+            scheduleRender()
+        }
     }
 
     public func start() throws {
-        guard !started else { return }
-        started = true
-        try terminal.start(
-            onInput: { [weak self] data in
-                let value = String(decoding: data, as: UTF8.self)
-                guard let self else { return }
-                let consumed = self.inputListeners.contains { $0(value) }
-                if !consumed { self.focus?.handleInput(value) }
-                self.requestRender()
-            }, onResize: { [weak self] in self?.requestRender(force: true) })
-        terminal.write(Data("\u{1B}[?25l".utf8))
-        requestRender(force: true)
+        try executor.sync {
+            guard !started else { return }
+            started = true
+            do {
+                try terminal.start(
+                    onInput: { [weak self] data in
+                        self?.handleInput(String(decoding: data, as: UTF8.self))
+                    }, onResize: { [weak self] in self?.requestRender(force: true) })
+            } catch {
+                started = false
+                throw error
+            }
+            terminal.write(Data("\u{1B}[?25l".utf8))
+            scheduleRender(force: true)
+        }
     }
 
     public func stop() {
-        guard started else { return }
-        terminal.write(Data("\u{1B}[?2026h\u{1B}[0m\u{1B}]8;;\u{07}\u{1B}[?2026l\u{1B}[?25h".utf8))
-        terminal.stop()
-        started = false
+        executor.sync {
+            guard started else { return }
+            terminal.write(Data("\u{1B}[?2026h\u{1B}[0m\u{1B}]8;;\u{07}\u{1B}[?2026l\u{1B}[?25h".utf8))
+            terminal.stop()
+            started = false
+            renderPending = false
+            forceRenderPending = false
+        }
     }
 
     public func requestRender(force: Bool = false) {
-        lock.lock()
-        defer { lock.unlock() }
-        guard started else { return }
+        executor.sync { scheduleRender(force: force) }
+    }
+
+    private func render(force: Bool) {
         var lines = root.render(width: terminal.columns)
         for overlay in overlays where !overlay.hidden {
             lines = applyOverlay(overlay, to: lines, width: terminal.columns)
@@ -233,15 +277,60 @@ public final class TUI: @unchecked Sendable {
         previous = lines
     }
 
+    private func handleInput(_ value: String) {
+        executor.sync {
+            guard started else { return }
+            componentCallbackDepth += 1
+            let consumed = inputListeners.contains { $0(value) }
+            if !consumed { focus?.handleInput(value) }
+            componentCallbackDepth -= 1
+            scheduleRender()
+        }
+    }
+
+    private func scheduleRender(force: Bool = false) {
+        guard started else { return }
+        renderPending = true
+        forceRenderPending = forceRenderPending || force
+        drainRender()
+    }
+
+    private func drainRender() {
+        guard renderPending, componentCallbackDepth == 0, !rendering else { return }
+        let shouldForce = forceRenderPending
+        renderPending = false
+        forceRenderPending = false
+        rendering = true
+        render(force: shouldForce)
+        rendering = false
+        if renderPending {
+            executor.async { [weak self] in self?.drainRender() }
+        }
+    }
+
+    private func setFocusWithoutRendering(_ component: (Component & Focusable)?) {
+        if let old = focus as? Focusable { old.focused = false }
+        focus = component
+        if let component { component.focused = true }
+    }
+
     private func hideOverlay(_ id: UUID) {
+        executor.sync {
+            hideOverlayWithoutRendering(id)
+            scheduleRender()
+        }
+    }
+
+    private func hideOverlayWithoutRendering(_ id: UUID) {
         overlays.removeAll { $0.id == id }
-        requestRender()
     }
 
     private func setOverlay(_ id: UUID, hidden: Bool) {
-        guard let index = overlays.firstIndex(where: { $0.id == id }) else { return }
-        overlays[index].hidden = hidden
-        requestRender()
+        executor.sync {
+            guard let index = overlays.firstIndex(where: { $0.id == id }) else { return }
+            overlays[index].hidden = hidden
+            scheduleRender()
+        }
     }
 
     private func applyOverlay(

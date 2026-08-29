@@ -9,8 +9,12 @@ public final class AltScreenTUI: @unchecked Sendable {
     private var offset = 0
     private var followingEnd = true
     private var started = false
+    private var componentCallbackDepth = 0
+    private var rendering = false
+    private var renderPending = false
+    private var forceRenderPending = false
     private let transcriptOnExit: Bool
-    private let lock = NSLock()
+    private let executor = TUIExecutor(label: "works.earendil.zeta.tui-alt-screen")
 
     public init(
         terminal: Terminal,
@@ -23,40 +27,54 @@ public final class AltScreenTUI: @unchecked Sendable {
     }
 
     public func setFocus(_ component: (Component & Focusable)?) {
-        if let old = focus as? Focusable { old.focused = false }
-        focus = component
-        if let component { component.focused = true }
-        requestRender(force: true)
+        executor.sync {
+            if let old = focus as? Focusable { old.focused = false }
+            focus = component
+            if let component { component.focused = true }
+            scheduleRender(force: true)
+        }
     }
 
     public func start() throws {
-        guard !started else { return }
-        started = true
-        terminal.write(Data("\u{1B}[?1049h\u{1B}[?7l\u{1B}[?25l".utf8))
-        try terminal.start(
-            onInput: { [weak self] data in
-                self?.handleInput(String(decoding: data, as: UTF8.self))
-            },
-            onResize: { [weak self] in self?.requestRender(force: true) }
-        )
-        requestRender(force: true)
+        try executor.sync {
+            guard !started else { return }
+            started = true
+            terminal.write(Data("\u{1B}[?1049h\u{1B}[?7l\u{1B}[?25l".utf8))
+            do {
+                try terminal.start(
+                    onInput: { [weak self] data in
+                        self?.handleInput(String(decoding: data, as: UTF8.self))
+                    },
+                    onResize: { [weak self] in self?.requestRender(force: true) }
+                )
+            } catch {
+                started = false
+                throw error
+            }
+            scheduleRender(force: true)
+        }
     }
 
     public func stop() {
-        guard started else { return }
-        let transcript = root.render(width: terminal.columns)
-        terminal.write(Data("\u{1B}[?2026h\u{1B}[?7h\u{1B}[?1049l\u{1B}[?2026l".utf8))
-        terminal.stop()
-        if transcriptOnExit {
-            terminal.write(Data((transcript.joined(separator: "\n") + "\n").utf8))
+        executor.sync {
+            guard started else { return }
+            let transcript = root.render(width: terminal.columns)
+            terminal.write(Data("\u{1B}[?2026h\u{1B}[?7h\u{1B}[?1049l\u{1B}[?2026l".utf8))
+            terminal.stop()
+            if transcriptOnExit {
+                terminal.write(Data((transcript.joined(separator: "\n") + "\n").utf8))
+            }
+            started = false
+            renderPending = false
+            forceRenderPending = false
         }
-        started = false
     }
 
     public func requestRender(force: Bool = false) {
-        lock.lock()
-        defer { lock.unlock() }
-        guard started else { return }
+        executor.sync { scheduleRender(force: force) }
+    }
+
+    private func render(force: Bool) {
         let document = root.render(width: terminal.columns)
         let height = max(1, terminal.rows)
         if followingEnd { offset = max(0, document.count - height) }
@@ -81,23 +99,48 @@ public final class AltScreenTUI: @unchecked Sendable {
     }
 
     private func handleInput(_ data: String) {
-        switch data {
-        case "\u{1B}[A":
-            followingEnd = false
-            offset = max(0, offset - 1)
-        case "\u{1B}[B":
-            followingEnd = false
-            offset += 1
-        case "\u{1B}[5~":
-            followingEnd = false
-            offset = max(0, offset - terminal.rows)
-        case "\u{1B}[6~":
-            followingEnd = false
-            offset += terminal.rows
-        case "\u{1B}[F": followingEnd = true
-        default: focus?.handleInput(data)
+        executor.sync {
+            guard started else { return }
+            componentCallbackDepth += 1
+            switch data {
+            case "\u{1B}[A":
+                followingEnd = false
+                offset = max(0, offset - 1)
+            case "\u{1B}[B":
+                followingEnd = false
+                offset += 1
+            case "\u{1B}[5~":
+                followingEnd = false
+                offset = max(0, offset - terminal.rows)
+            case "\u{1B}[6~":
+                followingEnd = false
+                offset += terminal.rows
+            case "\u{1B}[F": followingEnd = true
+            default: focus?.handleInput(data)
+            }
+            componentCallbackDepth -= 1
+            scheduleRender()
         }
-        requestRender()
+    }
+
+    private func scheduleRender(force: Bool = false) {
+        guard started else { return }
+        renderPending = true
+        forceRenderPending = forceRenderPending || force
+        drainRender()
+    }
+
+    private func drainRender() {
+        guard renderPending, componentCallbackDepth == 0, !rendering else { return }
+        let shouldForce = forceRenderPending
+        renderPending = false
+        forceRenderPending = false
+        rendering = true
+        render(force: shouldForce)
+        rendering = false
+        if renderPending {
+            executor.async { [weak self] in self?.drainRender() }
+        }
     }
 
     deinit { stop() }

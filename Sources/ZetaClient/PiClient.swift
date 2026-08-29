@@ -369,16 +369,22 @@ public actor PiClient {
     }
 
     private func request(_ command: Command) async throws -> ResponseEnvelope {
+        try Task.checkCancellation()
         guard stateValue == .connected, let transport else { throw PiClientError.disconnected }
         let id = UUID().uuidString
         let envelope = try RequestEnvelope(id: id, request: command)
-        return try await withCheckedThrowingContinuation { continuation in
-            pending[id] = continuation
-            Task {
-                do { try await transport.send(try encodeClientMessage(.request(envelope), options: options)) } catch {
-                    self.reject(id: id, error: error)
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                pending[id] = continuation
+                Task {
+                    do { try await transport.send(try encodeClientMessage(.request(envelope), options: options)) } catch
+                    {
+                        self.reject(id: id, error: error)
+                    }
                 }
             }
+        } onCancel: {
+            Task { await self.reject(id: id, error: CancellationError()) }
         }
     }
 
