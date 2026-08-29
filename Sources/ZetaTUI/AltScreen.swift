@@ -6,6 +6,7 @@ public final class AltScreenTUI: @unchecked Sendable {
     private let root: Component
     private weak var focus: Component?
     private var previous: [String] = []
+    private var inputListeners: [@Sendable (String) -> Bool] = []
     private var offset = 0
     private var followingEnd = true
     private var started = false
@@ -24,6 +25,12 @@ public final class AltScreenTUI: @unchecked Sendable {
         self.terminal = terminal
         self.root = root
         self.transcriptOnExit = transcriptOnExit
+    }
+
+    public func addInputListener(
+        _ listener: @escaping @Sendable (String) -> Bool
+    ) {
+        executor.sync { inputListeners.append(listener) }
     }
 
     public func setFocus(_ component: (Component & Focusable)?) {
@@ -102,6 +109,11 @@ public final class AltScreenTUI: @unchecked Sendable {
         executor.sync {
             guard started else { return }
             componentCallbackDepth += 1
+            if inputListeners.reversed().contains(where: { $0(data) }) {
+                componentCallbackDepth -= 1
+                scheduleRender()
+                return
+            }
             switch data {
             case "\u{1B}[A":
                 followingEnd = false

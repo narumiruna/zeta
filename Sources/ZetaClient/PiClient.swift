@@ -356,6 +356,7 @@ public actor PiClient {
             if !explicit, var current = leases[sessionID] {
                 removeLease(leaseID, from: &current)
                 leases[sessionID] = current
+                detachOrphanedAttachment(sessionID)
             }
             throw error
         }

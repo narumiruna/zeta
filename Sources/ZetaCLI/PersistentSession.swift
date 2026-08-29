@@ -330,19 +330,38 @@ actor PersistentSessionController {
     }
 
     private static func sessionID(in file: URL) -> String? {
-        guard let data = try? Data(contentsOf: file), !data.isEmpty else { return nil }
-        var decoder = StrictJSONLDecoder()
-        for record in decoder.push(data) + decoder.finish() {
+        guard let handle = try? FileHandle(forReadingFrom: file) else { return nil }
+        defer { try? handle.close() }
+        let maximumRecordBytes = 16 * 1_024 * 1_024
+        var buffer = Data()
+
+        func identifier(in record: Data) -> String? {
+            var line = record
+            if line.last == 0x0D { line.removeLast() }
             guard
-                let object = try? JSONSerialization.jsonObject(with: record) as? [String: Any],
-                object["type"] as? String == "session",
-                let id = object["id"] as? String
+                let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
+                object["type"] as? String == "session"
             else {
-                continue
+                return nil
             }
-            return id
+            return object["id"] as? String
         }
-        return nil
+
+        do {
+            while let chunk = try handle.read(upToCount: 64 * 1_024), !chunk.isEmpty {
+                buffer.append(chunk)
+                while let newline = buffer.firstIndex(of: 0x0A) {
+                    let record = Data(buffer[..<newline])
+                    buffer.removeSubrange(...newline)
+                    guard record.count <= maximumRecordBytes else { return nil }
+                    if let id = identifier(in: record) { return id }
+                }
+                guard buffer.count <= maximumRecordBytes else { return nil }
+            }
+            return buffer.isEmpty ? nil : identifier(in: buffer)
+        } catch {
+            return nil
+        }
     }
 
     private static func latestSession(in root: URL) -> URL? {

@@ -155,6 +155,32 @@ final class ZetaPackagesTests: XCTestCase {
         }
     }
 
+    func testStaleManagersReloadRegistryUnderCrossProcessLock() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let firstSource = root.appendingPathComponent("first-source")
+        let secondSource = root.appendingPathComponent("second-source")
+        let installed = root.appendingPathComponent("installed")
+        try createGitPackage(at: firstSource, marker: "first")
+        try createGitPackage(at: secondSource, marker: "second")
+        let firstPackage = PackageSource.git(url: firstSource.path, reference: nil)
+        let secondPackage = PackageSource.git(url: secondSource.path, reference: nil)
+        let firstManager = try ResourcePackageManager(root: installed)
+        let staleManager = try ResourcePackageManager(root: installed)
+
+        try await firstManager.install(firstPackage)
+        try await staleManager.install(secondPackage)
+
+        let afterInstalls = try ResourcePackageManager(root: installed)
+        let installedSources = await afterInstalls.list().map(\.source)
+        XCTAssertEqual(Set(installedSources), Set([firstPackage.identifier, secondPackage.identifier]))
+
+        try await firstManager.remove(firstPackage.identifier)
+        let afterRemove = try ResourcePackageManager(root: installed)
+        let remainingSources = await afterRemove.list().map(\.source)
+        XCTAssertEqual(remainingSources, [secondPackage.identifier])
+    }
+
     func testReplacementRestoresPreviousPackageWhenIndexPersistenceFails() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }

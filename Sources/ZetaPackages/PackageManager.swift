@@ -1,4 +1,5 @@
 import CryptoKit
+import Darwin
 import Foundation
 
 public enum PackageSource: Sendable, Equatable {
@@ -206,14 +207,6 @@ public actor ResourcePackageManager {
     public func install(_ source: PackageSource, trusted: Bool = true) async throws {
         guard trusted else { throw PackageManagerError.untrusted }
         let identifier = source.identifier
-        let existingRecord = installed[identifier]
-        let directory = try destinationDirectory(for: identifier)
-        let destination = try installedPackageURL(directory: directory)
-        if existingRecord == nil,
-            FileManager.default.fileExists(atPath: destination.path)
-        {
-            throw PackageInternalError.destinationCollision
-        }
         let staging = root.appendingPathComponent(".staging-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: staging) }
         switch source {
@@ -238,78 +231,93 @@ public actor ResourcePackageManager {
             throw PackageManagerError.unsupportedExtensionPackage
         }
         try validateResourcePaths(manifest, root: staging)
-        let backup = root.appendingPathComponent(".backup-\(UUID().uuidString)")
-        var nextInstalled = installed
-        nextInstalled[identifier] = InstalledPackage(
-            source: identifier,
-            directory: directory,
-            pinned: source.pinned,
-            installedAt: ISO8601DateFormatter().string(from: Date())
-        )
-        var movedPreviousPackage = false
-        var publishedNewPackage = false
-        do {
-            if FileManager.default.fileExists(atPath: destination.path) {
-                try FileManager.default.moveItem(at: destination, to: backup)
-                movedPreviousPackage = true
+        installed = try withRegistryLock {
+            var current = try loadIndex()
+            let directory = try destinationDirectory(for: identifier, in: current)
+            let destination = try installedPackageURL(directory: directory)
+            if current[identifier] == nil,
+                FileManager.default.fileExists(atPath: destination.path)
+            {
+                throw PackageInternalError.destinationCollision
             }
-            try FileManager.default.moveItem(at: staging, to: destination)
-            publishedNewPackage = true
-            try persistIndex(nextInstalled)
-        } catch {
-            let operationError = error
+            let backup = root.appendingPathComponent(".backup-\(UUID().uuidString)")
+            current[identifier] = InstalledPackage(
+                source: identifier,
+                directory: directory,
+                pinned: source.pinned,
+                installedAt: ISO8601DateFormatter().string(from: Date())
+            )
+            var movedPreviousPackage = false
+            var publishedNewPackage = false
             do {
-                if publishedNewPackage {
-                    try FileManager.default.removeItem(at: destination)
+                if FileManager.default.fileExists(atPath: destination.path) {
+                    try FileManager.default.moveItem(at: destination, to: backup)
+                    movedPreviousPackage = true
                 }
-                if movedPreviousPackage {
-                    try FileManager.default.moveItem(at: backup, to: destination)
-                }
+                try FileManager.default.moveItem(at: staging, to: destination)
+                publishedNewPackage = true
+                try persistIndex(current)
             } catch {
-                throw PackageInternalError.rollbackFailed(
-                    "\(operationError.localizedDescription); \(error.localizedDescription)"
-                )
-            }
-            throw operationError
-        }
-        installed = nextInstalled
-        if movedPreviousPackage {
-            try? FileManager.default.removeItem(at: backup)
-        }
-    }
-
-    public func remove(_ identifier: String, trusted: Bool = true) throws {
-        guard trusted else { throw PackageManagerError.untrusted }
-        guard let value = installed[identifier] else { return }
-        try requireExclusiveOwnership(of: value.directory, by: identifier)
-        let destination = try installedPackageURL(directory: value.directory)
-        let backup = root.appendingPathComponent(".backup-\(UUID().uuidString)")
-        var nextInstalled = installed
-        nextInstalled[identifier] = nil
-        var movedPackage = false
-        do {
-            try FileManager.default.moveItem(at: destination, to: backup)
-            movedPackage = true
-            try persistIndex(nextInstalled)
-        } catch {
-            let operationError = error
-            if movedPackage {
+                let operationError = error
                 do {
-                    try FileManager.default.moveItem(at: backup, to: destination)
+                    if publishedNewPackage {
+                        try FileManager.default.removeItem(at: destination)
+                    }
+                    if movedPreviousPackage {
+                        try FileManager.default.moveItem(at: backup, to: destination)
+                    }
                 } catch {
                     throw PackageInternalError.rollbackFailed(
                         "\(operationError.localizedDescription); \(error.localizedDescription)"
                     )
                 }
+                throw operationError
             }
-            throw operationError
+            if movedPreviousPackage {
+                try? FileManager.default.removeItem(at: backup)
+            }
+            return current
         }
-        installed = nextInstalled
-        try? FileManager.default.removeItem(at: backup)
+    }
+
+    public func remove(_ identifier: String, trusted: Bool = true) throws {
+        guard trusted else { throw PackageManagerError.untrusted }
+        if let cached = installed[identifier] {
+            _ = try installedPackageURL(directory: cached.directory)
+        }
+        installed = try withRegistryLock {
+            var current = try loadIndex()
+            guard let value = current[identifier] else { return current }
+            try requireExclusiveOwnership(of: value.directory, by: identifier, in: current)
+            let destination = try installedPackageURL(directory: value.directory)
+            let backup = root.appendingPathComponent(".backup-\(UUID().uuidString)")
+            current[identifier] = nil
+            var movedPackage = false
+            do {
+                try FileManager.default.moveItem(at: destination, to: backup)
+                movedPackage = true
+                try persistIndex(current)
+            } catch {
+                let operationError = error
+                if movedPackage {
+                    do {
+                        try FileManager.default.moveItem(at: backup, to: destination)
+                    } catch {
+                        throw PackageInternalError.rollbackFailed(
+                            "\(operationError.localizedDescription); \(error.localizedDescription)"
+                        )
+                    }
+                }
+                throw operationError
+            }
+            try? FileManager.default.removeItem(at: backup)
+            return current
+        }
     }
 
     public func updateAll(trusted: Bool = true) async throws {
         guard trusted else { throw PackageManagerError.untrusted }
+        installed = try withRegistryLock { try loadIndex() }
         let sources = installed.values.filter { !$0.pinned }.map(\.source)
         for raw in sources {
             try await install(PackageSource(raw), trusted: trusted)
@@ -632,9 +640,16 @@ public actor ResourcePackageManager {
         }
     }
 
-    private func destinationDirectory(for identifier: String) throws -> String {
-        if let record = installed[identifier] {
-            try requireExclusiveOwnership(of: record.directory, by: identifier)
+    private func destinationDirectory(
+        for identifier: String,
+        in records: [String: InstalledPackage]
+    ) throws -> String {
+        if let record = records[identifier] {
+            try requireExclusiveOwnership(
+                of: record.directory,
+                by: identifier,
+                in: records
+            )
             return record.directory
         }
         let readable = identifier.unicodeScalars.map { scalar in
@@ -644,17 +659,22 @@ public actor ResourcePackageManager {
             .map { String(format: "%02x", $0) }
             .joined()
         let directory = "\(readable)-\(digest)"
-        try requireExclusiveOwnership(of: directory, by: identifier)
+        try requireExclusiveOwnership(
+            of: directory,
+            by: identifier,
+            in: records
+        )
         return directory
     }
 
     private func requireExclusiveOwnership(
         of directory: String,
-        by identifier: String
+        by identifier: String,
+        in records: [String: InstalledPackage]
     ) throws {
         let key = Self.directoryKey(directory)
         guard
-            !installed.contains(where: {
+            !records.contains(where: {
                 $0.key != identifier && Self.directoryKey($0.value.directory) == key
             })
         else {
@@ -692,6 +712,32 @@ public actor ResourcePackageManager {
     }
 
     private var indexURL: URL { root.appendingPathComponent("packages.json") }
+
+    private func loadIndex() throws -> [String: InstalledPackage] {
+        guard FileManager.default.fileExists(atPath: indexURL.path) else { return [:] }
+        let records = try JSONDecoder().decode(
+            [String: InstalledPackage].self,
+            from: Data(contentsOf: indexURL)
+        )
+        try Self.validateRegistry(records)
+        return records
+    }
+
+    private func withRegistryLock<Result>(
+        _ operation: () throws -> Result
+    ) throws -> Result {
+        let lockURL = root.appendingPathComponent(".packages.lock")
+        let descriptor = open(lockURL.path, O_CREAT | O_RDWR, 0o600)
+        guard descriptor >= 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        defer { close(descriptor) }
+        guard flock(descriptor, LOCK_EX) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        defer { flock(descriptor, LOCK_UN) }
+        return try operation()
+    }
 
     private func persistIndex(_ packages: [String: InstalledPackage]) throws {
         let encoder = JSONEncoder()

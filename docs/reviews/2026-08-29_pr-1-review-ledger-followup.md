@@ -660,3 +660,96 @@ The focused strict-concurrency suite passed 170 tests with no failures.
 The complete repository gate passed 304 XCTest cases and 56 Swift Testing cases against the clean pinned oracle.
 The complete Address Sanitizer and Thread Sanitizer suites each passed the same 360 tests without findings.
 API compatibility and generated symbol documentation checks passed with 2,021 public symbols across 30 modules.
+
+## Fourteenth-round inline feedback
+
+### `3886063939`
+
+Concern: A clean SSE EOF without a provider terminal event is treated as a successful assistant response.
+
+Outcome: Actionable and addressed by rejecting EOF while the reducer remains pending instead of inferring stop or tool-use success.
+
+Evidence: An HTTP regression ends a successful SSE body after partial text and verifies an error terminal preserving that partial.
+
+### `3886063941`
+
+Concern: Edit buffers arbitrarily large files and creates multiple full-size copies.
+
+Outcome: Actionable and addressed with a 20 MiB metadata and incremental-read limit before edit decoding or normalization.
+
+Evidence: A sparse oversized-edit regression fails before buffering and preserves the original file size.
+
+### `3886063942`
+
+Concern: Session ID resolution loads every complete transcript just to inspect its header.
+
+Outcome: Actionable and addressed by incrementally reading bounded JSONL records and returning immediately when the session header is found.
+
+Evidence: Session resolution scans past a 512 MiB sparse transcript without loading its body and selects the requested header ID.
+
+### `3886063943`
+
+Concern: A cleanup-oriented detach failure leaves an orphaned server attachment with no retry.
+
+Outcome: Actionable and addressed by scheduling orphan detachment after removing the inactive lease following a dispose failure.
+
+Evidence: A client regression injects one detach failure and verifies the automatic second detach succeeds before reacquisition.
+
+### `3886063945`
+
+Concern: An unknown explicit provider silently falls back to the first model.
+
+Outcome: Actionable and addressed by returning an unknown-model error when no model belongs to the requested provider.
+
+Evidence: A CLI regression verifies a misspelled provider cannot select an unrelated model.
+
+### `3886063950`
+
+Concern: Interactive exit, abort, and new-session operations do not cancel active direct shell commands.
+
+Outcome: Actionable and addressed by tracking the direct-shell task and cancelling and awaiting it at each lifecycle boundary.
+
+Evidence: An interactive regression launches a long-running shell process, requests exit, and verifies the process is gone before exit completes.
+
+### `3886063953`
+
+Concern: Parsed JSON object duplicate detection performs a linear key lookup for every insertion.
+
+Outcome: Actionable and addressed by tracking parser keys in a set while accumulating ordered entries.
+
+Evidence: A 50,000-key ordered-object regression decodes successfully while duplicate-key rejection remains covered.
+
+### `3886063959`
+
+Concern: Interactive startup ignores the configured fullscreen TUI mode.
+
+Outcome: Actionable and addressed by selecting `AltScreenTUI` for fullscreen settings and honoring the transcript-on-exit setting.
+
+Evidence: A CLI regression verifies fullscreen settings construct the alternate-screen renderer.
+
+### `3886063965`
+
+Concern: Malformed non-header session records should reject migration instead of being skipped.
+
+Outcome: Incorrect for the pinned coding-agent v3 contract, so malformed JSON remains intentionally skipped.
+
+Pinned source evidence: At `56700d42ed65a94a80af7376adb19a9298065164`, `packages/coding-agent/src/core/session-manager.ts` lines 503 through 509 explicitly skip malformed JSON, and lines 918 through 920 and 980 through 986 migrate and rewrite the filtered records.
+
+Pinned test evidence: `packages/coding-agent/test/session-manager/file-operations.test.ts` lines 52 through 55, 71 through 81, and 94 through 102 require malformed records and malformed tails to be skipped while valid records remain.
+
+Related protection: Zeta preserves every parseable unknown object during migration, as verified by `testV1MigrationSkipsMalformedJSONAndPreservesUndecodableObjects`.
+
+### `3886063969`
+
+Concern: Concurrent package managers can overwrite each other's stale registry snapshots.
+
+Outcome: Actionable and addressed with a cross-process registry lock and an authoritative index reload inside every install, remove, and update publication transaction.
+
+Evidence: A stale-manager regression installs two packages and removes one through independently initialized managers without losing or resurrecting entries.
+
+## Fourteenth-round verification
+
+The complete local repository gate passed 311 XCTest cases and 57 Swift Testing cases against the clean pinned oracle.
+The complete local Address Sanitizer and Thread Sanitizer suites each passed the same 368 tests without findings.
+Strict concurrency, warnings-as-errors, formatting, file-length, API compatibility, generated documentation, and interoperability checks passed.
+GitHub CI was not used as completion evidence for this round, per maintainer direction.

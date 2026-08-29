@@ -185,7 +185,8 @@ public enum ZetaCLI {
                 result = await runInteractive(
                     agent: agent,
                     initial: initial?.message,
-                    session: persistentSession
+                    session: persistentSession,
+                    settings: settings
                 )
             case .rpc:
                 result = await runRPC(
@@ -235,12 +236,17 @@ public enum ZetaCLI {
     private static func runInteractive(
         agent: Agent,
         initial: UserMessage?,
-        session: PersistentSessionController?
+        session: PersistentSessionController?,
+        settings: Settings
     ) async -> Int32 {
         let terminal = ProcessTerminal()
         let transcript = Container()
         let input = Editor()
-        let tui = TUI(terminal: terminal, root: Container([transcript, input]))
+        let tui = makeInteractiveTUI(
+            settings: settings,
+            terminal: terminal,
+            root: Container([transcript, input])
+        )
         let runner = InteractiveRunner(
             agent: agent,
             transcript: transcript,
@@ -280,6 +286,21 @@ public enum ZetaCLI {
         }
         tui.stop()
         return result
+    }
+
+    static func makeInteractiveTUI(
+        settings: Settings,
+        terminal: Terminal,
+        root: Container
+    ) -> any InteractiveTUI {
+        if settings.tuiMode == "fullscreen" {
+            return AltScreenTUI(
+                terminal: terminal,
+                root: root,
+                transcriptOnExit: settings.fullscreenExit == "transcript"
+            )
+        }
+        return TUI(terminal: terminal, root: root)
     }
 
     private static func runRPC(
@@ -343,7 +364,7 @@ public enum ZetaCLI {
         }
     }
 
-    private static func selectModel(_ args: CLIArguments, from models: [Model]) throws -> Model {
+    static func selectModel(_ args: CLIArguments, from models: [Model]) throws -> Model {
         if let requested = args.model {
             let pieces = requested.split(separator: "/", maxSplits: 1).map(String.init)
             if pieces.count == 2, let value = models.first(where: { $0.provider == pieces[0] && $0.id == pieces[1] }) {
@@ -356,7 +377,12 @@ public enum ZetaCLI {
             }
             throw ProviderError.unknownModel(requested)
         }
-        if let provider = args.provider, let value = models.first(where: { $0.provider == provider }) { return value }
+        if let provider = args.provider {
+            guard let value = models.first(where: { $0.provider == provider }) else {
+                throw ProviderError.unknownModel(provider)
+            }
+            return value
+        }
         return models[0]
     }
 
@@ -788,178 +814,5 @@ enum InteractiveSessionCommands {
     static func exit(agent: Agent) async {
         await agent.abort()
         await agent.waitForIdle()
-    }
-}
-
-private actor InteractiveRunner {
-    let agent: Agent
-    let transcript: Container
-    let tui: TUI
-    private let shell: ShellTool
-    private let session: PersistentSessionController?
-    private var exitRequested = false
-    private var failed = false
-
-    init(
-        agent: Agent,
-        transcript: Container,
-        tui: TUI,
-        session: PersistentSessionController?
-    ) {
-        self.agent = agent
-        self.transcript = transcript
-        self.tui = tui
-        self.session = session
-        shell = ShellTool(
-            workingDirectory: URL(
-                fileURLWithPath: FileManager.default.currentDirectoryPath
-            )
-        )
-    }
-
-    func submit(_ message: UserMessage) async {
-        do {
-            try await submitMessage(message)
-        } catch {
-            report(error)
-        }
-    }
-
-    func submit(_ text: String) async {
-        guard !text.isEmpty else { return }
-        do {
-            if try await command(text) { return }
-            try await submitMessage(UserMessage(text))
-        } catch {
-            report(error)
-        }
-    }
-
-    func requestExit() async {
-        guard !exitRequested else { return }
-        exitRequested = true
-        await InteractiveSessionCommands.exit(agent: agent)
-    }
-
-    func shouldExit() -> Bool { exitRequested }
-    func hadFailure() -> Bool { failed }
-
-    func report(_ error: Error) {
-        failed = true
-        transcript.add(Text(error.localizedDescription))
-        tui.requestRender()
-    }
-
-    private func submitMessage(_ message: UserMessage) async throws {
-        let state = await agent.state()
-        if state.isStreaming {
-            await agent.steer(message)
-        } else {
-            try await CLISessionBoundary.prompt(
-                message, agent: agent, session: session
-            )
-        }
-    }
-
-    func receive(_ event: AgentEvent) {
-        switch event {
-        case .messageEnd(.user(let message)):
-            transcript.add(
-                Text(
-                    "> "
-                        + message.content.compactMap {
-                            if case .text(let text, _) = $0 { text } else { nil }
-                        }.joined()
-                )
-            )
-        case .messageEnd(.assistant(let message)):
-            transcript.add(Markdown(InteractiveTranscript.assistantText(message)))
-        case .toolExecutionStart(_, let name, _):
-            transcript.add(Text("[\(name)]"))
-        default:
-            break
-        }
-        tui.requestRender()
-    }
-
-    private func command(_ text: String) async throws -> Bool {
-        if text == "/quit" || text == "/exit" {
-            await requestExit()
-            return true
-        }
-        if text == "/abort" {
-            await agent.abort()
-            return true
-        }
-        if text == "/new" {
-            try await InteractiveSessionCommands.newSession(
-                agent: agent,
-                session: session
-            )
-            transcript.clear()
-            tui.requestRender()
-            return true
-        }
-        if text.hasPrefix("/thinking ") {
-            let raw = String(text.dropFirst("/thinking ".count))
-            guard let level = ThinkingLevel(rawValue: raw) else {
-                throw CLIArgumentError.invalidValue("/thinking")
-            }
-            try await InteractiveSessionCommands.setThinkingLevel(
-                level,
-                agent: agent,
-                session: session
-            )
-            transcript.add(Text("Thinking level: \(raw)"))
-            tui.requestRender()
-            return true
-        }
-        if text == "/session" {
-            let state = await agent.state()
-            transcript.add(
-                Text(
-                    "Model: \(state.model.provider)/\(state.model.id), "
-                        + "messages: \(state.messages.count)"
-                )
-            )
-            tui.requestRender()
-            return true
-        }
-        if text == "/compact" {
-            let state = await agent.state()
-            guard let preparation = Compaction.prepare(messages: state.messages) else {
-                transcript.add(Text("Nothing to compact"))
-                tui.requestRender()
-                return true
-            }
-            _ = try await CLISessionBoundary.compact(
-                agent: agent,
-                session: session,
-                preparation: preparation,
-                summaryPrompt: Compaction.summaryPrompt(preparation: preparation)
-            )
-            transcript.add(Text("Compacted at message \(preparation.firstRetainedMessageIndex)"))
-            tui.requestRender()
-            return true
-        }
-        if text == "/help" || text == "/hotkeys" {
-            transcript.add(
-                Text(
-                    "/new /session /thinking <level> /compact /abort /quit; "
-                        + "prefix shell commands with !"
-                )
-            )
-            tui.requestRender()
-            return true
-        }
-        if text.hasPrefix("!") {
-            let result = try await shell.run(
-                command: String(text.dropFirst())
-            )
-            transcript.add(Text(result.output))
-            tui.requestRender()
-            return true
-        }
-        return false
     }
 }

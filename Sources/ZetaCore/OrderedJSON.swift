@@ -465,10 +465,11 @@ private struct JSONParser {
     private mutating func parseObject(depth: Int) throws -> JSONValue {
         index += 1
         skipWhitespace()
-        var object = OrderedJSONObject()
-        if take(0x7d) { return .object(object) }
+        var entries: [OrderedJSONObject.Entry] = []
+        var keys: Set<String> = []
+        if take(0x7d) { return .object(try OrderedJSONObject(entries)) }
         while true {
-            guard object.count < limits.maximumContainerCount else {
+            guard entries.count < limits.maximumContainerCount else {
                 throw error(
                     .limitExceeded, "JSON object count exceeds configured limit of \(limits.maximumContainerCount)")
             }
@@ -476,12 +477,20 @@ private struct JSONParser {
                 throw error(.invalidSyntax, "Expected a string key in JSON object")
             }
             let key = try parseString()
+            guard keys.insert(key).inserted else {
+                throw error(.duplicateKey, "Duplicate JSON object key \"\(key)\"")
+            }
             skipWhitespace()
             guard take(0x3a) else { throw error(.invalidSyntax, "Expected ':' after JSON object key") }
             skipWhitespace()
-            try object.append(key: key, value: parseValue(depth: depth + 1))
+            entries.append(
+                OrderedJSONObject.Entry(
+                    key: key,
+                    value: try parseValue(depth: depth + 1)
+                )
+            )
             skipWhitespace()
-            if take(0x7d) { return .object(object) }
+            if take(0x7d) { return .object(try OrderedJSONObject(entries)) }
             guard take(0x2c) else { throw error(.invalidSyntax, "Expected ',' or '}' in JSON object") }
             skipWhitespace()
         }
