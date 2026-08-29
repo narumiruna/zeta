@@ -45,6 +45,10 @@ public enum PiClientError: Error, LocalizedError, Sendable {
 }
 
 public actor PiClient {
+    private struct ConnectionOperation {
+        let token: UUID
+        let task: Task<Void, Error>
+    }
     private struct AttachmentOperation {
         let token: UUID
         let task: Task<Void, Error>
@@ -62,6 +66,7 @@ public actor PiClient {
     }
     private var generation: UInt64 = 0
     private var disposed = false
+    private var connectionOperation: ConnectionOperation?
     private var transport: (any ByteTransport)?
     private var decoder: ServerMessageDecoder?
     private var pending: [String: CheckedContinuation<ResponseEnvelope, Error>] = [:]
@@ -86,11 +91,30 @@ public actor PiClient {
 
     public func connect() async throws {
         guard !disposed else { throw PiClientError.disposed }
-        guard stateValue == .disconnected else { return }
-        stateValue = .connecting
+        if stateValue == .connected { return }
+        if stateValue == .connecting, let operation = connectionOperation {
+            try await operation.task.value
+            return
+        }
+
+        let nextDecoder = try ServerMessageDecoder(options: options)
         generation &+= 1
         let activeGeneration = generation
-        decoder = try ServerMessageDecoder(options: options)
+        decoder = nextDecoder
+        stateValue = .connecting
+        let token = UUID()
+        let task = Task { try await self.performConnection(generation: activeGeneration) }
+        connectionOperation = ConnectionOperation(token: token, task: task)
+        do {
+            try await task.value
+            clearConnectionOperation(token)
+        } catch {
+            clearConnectionOperation(token)
+            throw error
+        }
+    }
+
+    private func performConnection(generation activeGeneration: UInt64) async throws {
         do {
             let transport = try await factory(
                 ByteTransportHandlers(
@@ -100,19 +124,39 @@ public actor PiClient {
                         Task { await self?.closed(generation: activeGeneration, error: error) }
                     }
                 ))
-            guard generation == activeGeneration else {
+            guard generation == activeGeneration, stateValue == .connecting else {
                 await transport.close()
                 throw PiClientError.disconnected
             }
             self.transport = transport
-            try await transport.send(encodeClientMessage(.hello(try ClientHello()), options: options))
-            let snapshot = try await withCheckedThrowingContinuation { handshake = $0 }
+            let hello = try encodeClientMessage(.hello(try ClientHello()), options: options)
+            let snapshot = try await withCheckedThrowingContinuation { continuation in
+                handshake = continuation
+                Task { await self.sendHello(hello, using: transport, generation: activeGeneration) }
+            }
+            guard generation == activeGeneration, stateValue == .connecting else {
+                throw PiClientError.disconnected
+            }
             snapshotValue = snapshot
             stateValue = .connected
         } catch {
-            await fail(error, close: true)
+            if generation == activeGeneration { await fail(error, close: true) }
             throw error
         }
+    }
+
+    private func sendHello(_ hello: Data, using transport: any ByteTransport, generation activeGeneration: UInt64) async
+    {
+        do {
+            try await transport.send(hello)
+        } catch {
+            guard generation == activeGeneration else { return }
+            await fail(error, close: true)
+        }
+    }
+
+    private func clearConnectionOperation(_ token: UUID) {
+        if connectionOperation?.token == token { connectionOperation = nil }
     }
 
     public func reconnect() async throws {

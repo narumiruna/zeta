@@ -680,6 +680,11 @@ enum InteractiveSessionCommands {
         try await agent.reset()
         _ = try await session?.newSession()
     }
+
+    static func exit(agent: Agent) async {
+        await agent.abort()
+        await agent.waitForIdle()
+    }
 }
 
 private actor InteractiveRunner {
@@ -732,9 +737,10 @@ private actor InteractiveRunner {
         }
     }
 
-    func requestExit() {
+    func requestExit() async {
         guard !exitRequested else { return }
         exitRequested = true
+        await InteractiveSessionCommands.exit(agent: agent)
     }
 
     func shouldExit() -> Bool { exitRequested }
@@ -768,7 +774,7 @@ private actor InteractiveRunner {
 
     private func command(_ text: String) async throws -> Bool {
         if text == "/quit" || text == "/exit" {
-            requestExit()
+            await requestExit()
             return true
         }
         if text == "/abort" {

@@ -164,6 +164,54 @@ enum CLIProviderTransport: Sendable, Equatable {
     }
 }
 
+enum CLIBedrockRegionError: Error, LocalizedError, Sendable, Equatable {
+    case unsupportedEndpoint(String)
+    case environmentMismatch(variable: String, configured: String, endpoint: String)
+
+    var errorDescription: String? {
+        switch self {
+        case .unsupportedEndpoint(let endpoint):
+            "Cannot derive the AWS signing region from Bedrock endpoint: \(endpoint)"
+        case .environmentMismatch(let variable, let configured, let endpoint):
+            "\(variable) region \(configured) does not match Bedrock endpoint region \(endpoint)"
+        }
+    }
+}
+
+enum CLIBedrockSigningRegion {
+    static func resolve(
+        endpoint: URL,
+        environment: [String: String]
+    ) throws -> String {
+        let labels = endpoint.host()?.lowercased().split(separator: ".") ?? []
+        guard
+            let runtimeIndex = labels.firstIndex(where: {
+                $0 == "bedrock-runtime" || $0 == "bedrock-runtime-fips"
+            }),
+            labels.indices.contains(runtimeIndex + 1)
+        else {
+            throw CLIBedrockRegionError.unsupportedEndpoint(endpoint.absoluteString)
+        }
+        let endpointRegion = String(labels[runtimeIndex + 1])
+        guard endpointRegion.contains("-"), endpointRegion.last?.isNumber == true else {
+            throw CLIBedrockRegionError.unsupportedEndpoint(endpoint.absoluteString)
+        }
+        for variable in ["AWS_REGION", "AWS_DEFAULT_REGION"] {
+            guard let value = environment[variable] else { continue }
+            let configured = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !configured.isEmpty else { continue }
+            guard configured.lowercased() == endpointRegion else {
+                throw CLIBedrockRegionError.environmentMismatch(
+                    variable: variable,
+                    configured: configured,
+                    endpoint: endpointRegion
+                )
+            }
+        }
+        return endpointRegion
+    }
+}
+
 actor CLIModelStreamDispatcher {
     private let authStore: AuthStore
     private let explicitAPIKeys: [String: String]
@@ -224,11 +272,13 @@ actor CLIModelStreamDispatcher {
                 )
             case .bedrock:
                 let credential = CredentialResolver.aws(environment: authentication.environment)
+                let signingRegion = try CLIBedrockSigningRegion.resolve(
+                    endpoint: model.baseURL,
+                    environment: authentication.environment
+                )
                 let provider = BedrockProvider(
                     models: [model],
-                    region: authentication.environment["AWS_REGION"]
-                        ?? authentication.environment["AWS_DEFAULT_REGION"]
-                        ?? "us-east-1"
+                    region: signingRegion
                 ) {
                     guard let credential else {
                         throw ProviderError.missingCredential(model.provider)

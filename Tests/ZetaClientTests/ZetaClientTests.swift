@@ -21,6 +21,68 @@ final class ZetaClientTests: XCTestCase {
         XCTAssertEqual(disconnected, .disconnected)
     }
 
+    func testConcurrentConnectsShareOneSuccessfulAttempt() async throws {
+        let factory = ControlledConnectionFactory()
+        let client = try PiClient { handlers in try await factory.open(handlers) }
+        let completions = CompletionCounter()
+        let tasks = (0..<3).map { _ in
+            Task {
+                try await client.connect()
+                await completions.record()
+            }
+        }
+        try await waitUntil { await factory.attemptCount == 1 }
+        try await Task.sleep(for: .milliseconds(20))
+        let completionCount = await completions.count
+        XCTAssertEqual(completionCount, 0)
+
+        await factory.succeed()
+
+        for task in tasks { try await task.value }
+        let finalCompletionCount = await completions.count
+        XCTAssertEqual(finalCompletionCount, 3)
+        let state = await client.connectionState()
+        XCTAssertEqual(state, .connected)
+        await client.disconnect()
+    }
+
+    func testConcurrentConnectFailureIsSharedAndLaterRetrySucceeds() async throws {
+        let factory = ControlledConnectionFactory()
+        let client = try PiClient { handlers in try await factory.open(handlers) }
+        let tasks = (0..<3).map { _ in
+            Task { () -> Bool in
+                do {
+                    try await client.connect()
+                    return false
+                } catch ConnectTestFailure.expected {
+                    return true
+                } catch {
+                    return false
+                }
+            }
+        }
+        try await waitUntil { await factory.attemptCount == 1 }
+
+        await factory.fail()
+
+        for task in tasks {
+            let receivedExpectedFailure = await task.value
+            XCTAssertTrue(receivedExpectedFailure)
+        }
+        let failedState = await client.connectionState()
+        XCTAssertEqual(failedState, .disconnected)
+        let failedAttemptCount = await factory.attemptCount
+        XCTAssertEqual(failedAttemptCount, 1)
+
+        let retry = Task { try await client.connect() }
+        try await waitUntil { await factory.attemptCount == 2 }
+        await factory.succeed()
+        try await retry.value
+        let retriedState = await client.connectionState()
+        XCTAssertEqual(retriedState, .connected)
+        await client.disconnect()
+    }
+
     func testExclusiveAndSharedOwnership() async throws {
         let client = try PiClient { ScriptedTransport(handlers: $0) }
         try await client.connect()
@@ -107,6 +169,60 @@ final class ZetaClientTests: XCTestCase {
         XCTAssertTrue(rejected)
         try await exclusive.dispose()
     }
+}
+
+private enum ConnectTestFailure: Error { case expected }
+
+private actor CompletionCounter {
+    private(set) var count = 0
+    func record() { count += 1 }
+}
+
+private actor ControlledConnectionFactory {
+    private var continuation: CheckedContinuation<any ByteTransport, Error>?
+    private(set) var attemptCount = 0
+
+    func open(_ handlers: ByteTransportHandlers) async throws -> any ByteTransport {
+        attemptCount += 1
+        return try await withCheckedThrowingContinuation { continuation in
+            self.continuation = continuation
+            self.handlers = handlers
+        }
+    }
+
+    func succeed() {
+        guard let continuation, let handlers else { return }
+        self.continuation = nil
+        self.handlers = nil
+        continuation.resume(returning: HandshakeTransport(handlers: handlers))
+    }
+
+    func fail() {
+        guard let continuation else { return }
+        self.continuation = nil
+        handlers = nil
+        continuation.resume(throwing: ConnectTestFailure.expected)
+    }
+
+    private var handlers: ByteTransportHandlers?
+}
+
+private actor HandshakeTransport: ByteTransport {
+    private let handlers: ByteTransportHandlers
+    private let decoder = try! ClientMessageDecoder()
+
+    init(handlers: ByteTransportHandlers) { self.handlers = handlers }
+
+    func send(_ bytes: Data) throws {
+        for message in try decoder.push(bytes) {
+            guard case .hello = message else { continue }
+            let snapshot = try ServerSnapshot(serverID: "server", revision: 0, sessions: [], models: [])
+            handlers.onData(
+                try encodeServerMessage(.hello(try ServerHello(connectionID: "connection", snapshot: snapshot))))
+        }
+    }
+
+    func close() {}
 }
 
 private actor ControlledTransportBox {

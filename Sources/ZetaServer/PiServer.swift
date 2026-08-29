@@ -34,10 +34,12 @@ public enum PiServerFailure: Error, Sendable {
 
 public actor PiServer {
     private struct ClientState {
+        let token: UUID
         let connection: any ServerByteConnection
         let decoder: ClientMessageDecoder
         let sequence: ClientProtocolSequenceValidator
         var ready = false
+        var pendingRequests: [RequestEnvelope] = []
         var attached: Set<String> = []
     }
     private struct RuntimeState {
@@ -72,7 +74,9 @@ public actor PiServer {
     }
 
     public func accept(_ connection: any ServerByteConnection) throws {
+        let token = UUID()
         clients[connection.id] = ClientState(
+            token: token,
             connection: connection,
             decoder: try ClientMessageDecoder(options: frameOptions),
             sequence: ClientProtocolSequenceValidator()
@@ -80,23 +84,32 @@ public actor PiServer {
         let connectionID = connection.id
         Task {
             try? await Task.sleep(for: handshakeTimeout)
-            await handshakeTimedOut(connectionID)
+            await handshakeTimedOut(connectionID, token: token)
         }
     }
 
     public func receive(_ data: Data, connectionID: String) {
-        guard let client = clients[connectionID] else { return }
+        guard var client = clients[connectionID] else { return }
         do {
             for message in try client.decoder.push(data) {
                 try client.sequence.accept(message)
                 switch message {
-                case .hello(let hello): Task { await self.handshake(hello, connectionID: connectionID) }
+                case .hello(let hello):
+                    let token = client.token
+                    Task { await self.handshake(hello, connectionID: connectionID, token: token) }
                 case .request(let request):
-                    guard client.ready else { throw PiServerFailure.invalidRequest("Request before handshake") }
-                    Task { await self.dispatch(request, connectionID: connectionID) }
+                    if client.ready {
+                        Task { await self.dispatch(request, connectionID: connectionID) }
+                    } else {
+                        client.pendingRequests.append(request)
+                        clients[connectionID] = client
+                    }
                 }
             }
-        } catch { Task { await self.close(connectionID, finalError: self.protocolError(error)) } }
+        } catch {
+            let token = client.token
+            Task { await self.close(connectionID, finalError: self.protocolError(error), token: token) }
+        }
     }
 
     public func disconnected(_ connectionID: String) async {
@@ -116,33 +129,42 @@ public actor PiServer {
         for runtime in runtimeValues { await runtime.dispose() }
     }
 
-    private func handshakeTimedOut(_ connectionID: String) async {
-        guard let client = clients[connectionID], !client.ready else { return }
+    private func handshakeTimedOut(_ connectionID: String, token: UUID) async {
+        guard let client = clients[connectionID], client.token == token, !client.ready else { return }
         await close(
             connectionID,
             finalError: try? ProtocolErrorValue(
                 code: .invalidRequest,
                 message: "Protocol handshake timed out"
-            )
+            ),
+            token: token
         )
     }
 
-    private func handshake(_ hello: ClientHello, connectionID: String) async {
-        guard var client = clients[connectionID] else { return }
+    private func handshake(_ hello: ClientHello, connectionID: String, token: UUID) async {
+        guard let client = clients[connectionID], client.token == token else { return }
         guard isSupportedProtocolVersion(hello.version) else {
             await close(
                 connectionID,
-                finalError: try? ProtocolErrorValue(code: .version, message: "Unsupported protocol version"))
+                finalError: try? ProtocolErrorValue(code: .version, message: "Unsupported protocol version"),
+                token: token)
             return
         }
         do {
             let snapshot = try await serverSnapshot()
-            try await client.connection.send(
+            guard var current = clients[connectionID], current.token == token else { return }
+            current.ready = true
+            let pendingRequests = current.pendingRequests
+            current.pendingRequests.removeAll()
+            clients[connectionID] = current
+            try await current.connection.send(
                 encodeServerMessage(
                     .hello(try ServerHello(connectionID: connectionID, snapshot: snapshot)), options: frameOptions))
-            client.ready = true
-            clients[connectionID] = client
-        } catch { await close(connectionID, finalError: protocolError(error)) }
+            guard clients[connectionID]?.token == token else { return }
+            for request in pendingRequests {
+                Task { await self.dispatch(request, connectionID: connectionID) }
+            }
+        } catch { await close(connectionID, finalError: protocolError(error), token: token) }
     }
 
     private func dispatch(_ request: RequestEnvelope, connectionID: String) async {
@@ -323,8 +345,8 @@ public actor PiServer {
         try await connection.send(encodeServerMessage(message, options: frameOptions))
     }
 
-    private func close(_ id: String, finalError: ProtocolErrorValue?) async {
-        guard let client = clients[id] else { return }
+    private func close(_ id: String, finalError: ProtocolErrorValue?, token: UUID? = nil) async {
+        guard let client = clients[id], token == nil || client.token == token else { return }
         if let finalError, let encoded = try? encodeServerMessage(.helloError(finalError), options: frameOptions) {
             try? await client.connection.send(encoded)
         }

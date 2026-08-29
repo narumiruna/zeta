@@ -132,7 +132,7 @@ public actor ResourcePackageManager {
             var arguments = ["clone", "--quiet", "--depth", "1"]
             if let reference { arguments += ["--branch", reference] }
             arguments += [url, staging.path]
-            try run("git", arguments)
+            try await Self.run("git", arguments)
         case .npm(let name, let version):
             try await installNPM(name: name, version: version, staging: staging)
         }
@@ -154,16 +154,18 @@ public actor ResourcePackageManager {
         if FileManager.default.fileExists(atPath: destination.path) {
             try FileManager.default.moveItem(at: destination, to: backup)
         }
+        var nextInstalled = installed
+        nextInstalled[source.identifier] = InstalledPackage(
+            source: source.identifier,
+            directory: destination.lastPathComponent,
+            pinned: source.pinned,
+            installedAt: ISO8601DateFormatter().string(from: Date())
+        )
         do {
             try FileManager.default.moveItem(at: staging, to: destination)
+            try persistIndex(nextInstalled)
+            installed = nextInstalled
             try? FileManager.default.removeItem(at: backup)
-            installed[source.identifier] = InstalledPackage(
-                source: source.identifier,
-                directory: destination.lastPathComponent,
-                pinned: source.pinned,
-                installedAt: ISO8601DateFormatter().string(from: Date())
-            )
-            try persistIndex()
         } catch {
             try? FileManager.default.removeItem(at: destination)
             if FileManager.default.fileExists(atPath: backup.path) {
@@ -175,11 +177,22 @@ public actor ResourcePackageManager {
 
     public func remove(_ identifier: String, trusted: Bool = true) throws {
         guard trusted else { throw PackageManagerError.untrusted }
-        guard let value = installed.removeValue(forKey: identifier) else { return }
-        try FileManager.default.removeItem(
-            at: root.appendingPathComponent(value.directory)
-        )
-        try persistIndex()
+        guard let value = installed[identifier] else { return }
+        let destination = root.appendingPathComponent(value.directory)
+        let backup = root.appendingPathComponent(".backup-\(UUID().uuidString)")
+        var nextInstalled = installed
+        nextInstalled[identifier] = nil
+        do {
+            try FileManager.default.moveItem(at: destination, to: backup)
+            try persistIndex(nextInstalled)
+            installed = nextInstalled
+            try? FileManager.default.removeItem(at: backup)
+        } catch {
+            if FileManager.default.fileExists(atPath: backup.path) {
+                try? FileManager.default.moveItem(at: backup, to: destination)
+            }
+            throw error
+        }
     }
 
     public func updateAll(trusted: Bool = true) async throws {
@@ -221,7 +234,7 @@ public actor ResourcePackageManager {
         defer { try? FileManager.default.removeItem(at: temporary) }
         try archive.write(to: temporary, options: .atomic)
         let listing = String(
-            decoding: try run("/usr/bin/tar", ["-tzf", temporary.path]),
+            decoding: try await Self.run("/usr/bin/tar", ["-tzf", temporary.path]),
             as: UTF8.self
         )
         for raw in listing.split(separator: "\n") {
@@ -232,7 +245,7 @@ public actor ResourcePackageManager {
             }
         }
         let verbose = String(
-            decoding: try run("/usr/bin/tar", ["-tvzf", temporary.path]),
+            decoding: try await Self.run("/usr/bin/tar", ["-tvzf", temporary.path]),
             as: UTF8.self
         )
         guard
@@ -243,7 +256,7 @@ public actor ResourcePackageManager {
             throw PackageManagerError.unsafeArchive
         }
         try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
-        try run(
+        try await Self.run(
             "/usr/bin/tar",
             ["-xzf", temporary.path, "--strip-components", "1", "-C", staging.path]
         )
@@ -287,7 +300,7 @@ public actor ResourcePackageManager {
     }
 
     @discardableResult
-    private func run(_ executable: String, _ arguments: [String]) throws -> Data {
+    private nonisolated static func run(_ executable: String, _ arguments: [String]) async throws -> Data {
         let process = Process()
         process.executableURL =
             executable.hasPrefix("/")
@@ -300,15 +313,54 @@ public actor ResourcePackageManager {
         let pipe = Pipe()
         process.standardOutput = pipe
         process.standardError = pipe
-        try process.run()
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
-        guard process.terminationStatus == 0 else {
-            throw PackageManagerError.processFailed(
-                String(decoding: data, as: UTF8.self)
-            )
+
+        return try await withTaskCancellationHandler {
+            do {
+                try Task.checkCancellation()
+                try process.run()
+                _ = setpgid(process.processIdentifier, process.processIdentifier)
+                try Task.checkCancellation()
+                var data = Data()
+                for try await byte in pipe.fileHandleForReading.bytes {
+                    data.append(byte)
+                }
+                let status = try await waitForExit(process)
+                guard status == 0 else {
+                    throw PackageManagerError.processFailed(
+                        String(decoding: data, as: UTF8.self)
+                    )
+                }
+                return data
+            } catch {
+                if Task.isCancelled {
+                    terminateProcessTree(process)
+                    throw CancellationError()
+                }
+                throw error
+            }
+        } onCancel: {
+            terminateProcessTree(process)
         }
-        return data
+    }
+
+    private nonisolated static func waitForExit(_ process: Process) async throws -> Int32 {
+        while process.isRunning {
+            try Task.checkCancellation()
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        try Task.checkCancellation()
+        return process.terminationStatus
+    }
+
+    private nonisolated static func terminateProcessTree(_ process: Process) {
+        guard process.isRunning else { return }
+        let identifier = process.processIdentifier
+        if kill(-identifier, SIGTERM) != 0 {
+            process.terminate()
+        }
+        if process.isRunning, kill(-identifier, SIGKILL) != 0 {
+            _ = kill(identifier, SIGKILL)
+        }
     }
 
     private func safeName(_ value: String) -> String {
@@ -319,9 +371,9 @@ public actor ResourcePackageManager {
 
     private var indexURL: URL { root.appendingPathComponent("packages.json") }
 
-    private func persistIndex() throws {
+    private func persistIndex(_ packages: [String: InstalledPackage]) throws {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        try encoder.encode(installed).write(to: indexURL, options: .atomic)
+        try encoder.encode(packages).write(to: indexURL, options: .atomic)
     }
 }

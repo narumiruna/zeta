@@ -52,6 +52,97 @@ final class ZetaSessionsTests: XCTestCase {
         XCTAssertEqual(entries.map(\.base.id), ["00000001"])
     }
 
+    func testExistingFileAppendFailureDoesNotMutateSessionState() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let file = directory.appendingPathComponent("session.jsonl")
+        let original =
+            #"{"type":"session","version":3,"id":"existing","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp"}"#
+            + "\nnot valid json\n"
+        try Data(original.utf8).write(to: file)
+        let manager = try SessionManager.load(file: file)
+        let entry = SessionEntry.message(
+            SessionEntryBase(id: "00000001", parentId: nil, timestamp: "2026-01-01T00:00:01Z"),
+            .assistant(
+                AssistantMessage(
+                    content: [.text(text: "appended")], api: "faux", provider: "faux", model: "faux",
+                    stopReason: .stop, timestamp: 1
+                ))
+        )
+
+        try FileManager.default.removeItem(at: file)
+        try FileManager.default.createDirectory(at: file, withIntermediateDirectories: false)
+        do {
+            try await manager.append(entry)
+            XCTFail("Expected persistence failure")
+        } catch {}
+
+        let entriesAfterFailure = await manager.allEntries()
+        let leafAfterFailure = await manager.leaf()
+        let branchAfterFailure = try await manager.branch()
+        XCTAssertTrue(entriesAfterFailure.isEmpty)
+        XCTAssertNil(leafAfterFailure)
+        XCTAssertTrue(branchAfterFailure.isEmpty)
+
+        try FileManager.default.removeItem(at: file)
+        try Data(original.utf8).write(to: file)
+        try await manager.append(entry)
+        let entriesAfterRetry = await manager.allEntries()
+        let leafAfterRetry = await manager.leaf()
+        XCTAssertEqual(entriesAfterRetry.map(\.base.id), ["00000001"])
+        XCTAssertEqual(leafAfterRetry?.base.id, "00000001")
+        XCTAssertTrue(try String(contentsOf: file, encoding: .utf8).hasPrefix(original))
+    }
+
+    func testFirstAssistantMaterializationFailureDoesNotMutateSessionState() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let blockedParent = directory.appendingPathComponent("blocked")
+        try Data("not a directory".utf8).write(to: blockedParent)
+        let file = blockedParent.appendingPathComponent("session.jsonl")
+        let header = SessionHeader(id: "delayed", timestamp: "2026-01-01T00:00:00Z", cwd: directory.path)
+        let manager = try SessionManager(header: header, file: file)
+        let user = SessionEntry.message(
+            SessionEntryBase(id: "00000001", parentId: nil, timestamp: header.timestamp),
+            .user(UserMessage("hello", timestamp: 1))
+        )
+        let assistant = SessionEntry.message(
+            SessionEntryBase(id: "00000002", parentId: "00000001", timestamp: header.timestamp),
+            .assistant(
+                AssistantMessage(
+                    content: [.text(text: "reply")], api: "faux", provider: "faux", model: "faux",
+                    stopReason: .stop, timestamp: 2
+                ))
+        )
+        try await manager.append(user)
+
+        do {
+            try await manager.append(assistant)
+            XCTFail("Expected materialization failure")
+        } catch {}
+
+        let entriesAfterFailure = await manager.allEntries()
+        let leafAfterFailure = await manager.leaf()
+        let branchAfterFailure = try await manager.branch()
+        XCTAssertEqual(entriesAfterFailure.map(\.base.id), ["00000001"])
+        XCTAssertEqual(leafAfterFailure?.base.id, "00000001")
+        XCTAssertEqual(branchAfterFailure.map(\.base.id), ["00000001"])
+        XCTAssertFalse(FileManager.default.fileExists(atPath: file.path))
+
+        try FileManager.default.removeItem(at: blockedParent)
+        try FileManager.default.createDirectory(at: blockedParent, withIntermediateDirectories: false)
+        try await manager.append(assistant)
+        let entriesAfterRetry = await manager.allEntries()
+        let leafAfterRetry = await manager.leaf()
+        XCTAssertEqual(entriesAfterRetry.map(\.base.id), ["00000001", "00000002"])
+        XCTAssertEqual(leafAfterRetry?.base.id, "00000002")
+        let loaded = try SessionManager.load(file: file)
+        let loadedEntries = await loaded.allEntries()
+        XCTAssertEqual(loadedEntries.map(\.base.id), ["00000001", "00000002"])
+    }
+
     func testV1MigrationForkCloneAndNewlineRepair() async throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString)

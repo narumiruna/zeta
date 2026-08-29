@@ -101,14 +101,7 @@ public struct CLIArguments: Sendable {
                 case "approve": result.approve = true
                 case "no-approve": result.approve = false
                 case "offline": result.offline = true
-                default:
-                    if attached != nil {
-                        result.extensionFlags[flag] = attached
-                    } else if index + 1 < values.count, !values[index + 1].hasPrefix("-") {
-                        result.extensionFlags[flag] = try requireValue("--\(flag)")
-                    } else {
-                        result.extensionFlags[flag] = nil
-                    }
+                default: throw CLIArgumentError.invalidValue("--\(flag)")
                 }
             } else if options && value.hasPrefix("-") {
                 switch value {
@@ -127,7 +120,7 @@ public struct CLIArguments: Sendable {
                 case "-nbt": result.noBuiltinTools = true
                 default: throw CLIArgumentError.unknownShortFlag(value)
                 }
-            } else if value.hasPrefix("@") {
+            } else if options && value.hasPrefix("@") {
                 result.files.append(String(value.dropFirst()))
             } else {
                 result.messages.append(value)

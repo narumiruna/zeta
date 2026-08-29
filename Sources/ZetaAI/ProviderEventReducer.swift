@@ -3,12 +3,16 @@ import ZetaCore
 
 public struct ProviderEventReducer: Sendable {
     public private(set) var partial: AssistantMessage
+    private let model: Model
     private var toolArgumentBuffers: [Int: String] = [:]
     private var openAIToolContentIndices: [Int: Int] = [:]
+    private var openAIResponseContentIndices: [Int: Int] = [:]
+    private var openContentBlockIndices: Set<Int> = []
     private var googleCurrentBlockIndex: Int?
     private var googleToolCallCounter = 0
 
     public init(model: Model) {
+        self.model = model
         partial = AssistantMessage(
             api: model.api,
             provider: model.provider,
@@ -36,6 +40,7 @@ public struct ProviderEventReducer: Sendable {
             switch block.string("type") {
             case "text":
                 ensureIndex(index, block: .text(text: ""))
+                openContentBlockIndices.insert(index)
                 events.append(.textStart(index: index, partial: partial))
             case "thinking":
                 ensureIndex(
@@ -45,6 +50,7 @@ public struct ProviderEventReducer: Sendable {
                         signature: block.string("signature")
                     )
                 )
+                openContentBlockIndices.insert(index)
                 events.append(.thinkingStart(index: index, partial: partial))
             case "redacted_thinking":
                 ensureIndex(
@@ -55,6 +61,7 @@ public struct ProviderEventReducer: Sendable {
                         redacted: true
                     )
                 )
+                openContentBlockIndices.insert(index)
                 events.append(.thinkingStart(index: index, partial: partial))
             case "tool_use":
                 let call = ToolCall(
@@ -74,15 +81,25 @@ public struct ProviderEventReducer: Sendable {
             ?? object.pathString(["choices", "0", "delta", "content"])
             ?? (type.contains("output_text.delta") ? object.string("delta") : nil)
         if let textDelta, !textDelta.isEmpty {
-            events += appendText(textDelta)
+            events += appendText(
+                textDelta,
+                responseOutputIndex: type.hasPrefix("response.")
+                    ? object.integer("output_index") : nil
+            )
         }
 
         let thinkingDelta =
             object.pathString(["delta", "thinking"])
             ?? object.pathString(["choices", "0", "delta", "reasoning_content"])
+            ?? object.pathString(["choices", "0", "delta", "reasoning"])
+            ?? object.pathString(["choices", "0", "delta", "reasoning_text"])
             ?? (type.contains("reasoning") ? object.string("delta") : nil)
         if let thinkingDelta, !thinkingDelta.isEmpty {
-            events += appendThinking(thinkingDelta)
+            events += appendThinking(
+                thinkingDelta,
+                responseOutputIndex: type.hasPrefix("response.")
+                    ? object.integer("output_index") : nil
+            )
         }
 
         events += consumeOpenAIChatToolCalls(object)
@@ -134,10 +151,8 @@ public struct ProviderEventReducer: Sendable {
                 ?? 0
             if partial.content.indices.contains(index) {
                 switch partial.content[index] {
-                case .text(let text, _):
-                    events.append(.textEnd(index: index, content: text, partial: partial))
-                case .thinking(let text, _, _):
-                    events.append(.thinkingEnd(index: index, content: text, partial: partial))
+                case .text, .thinking:
+                    events += finishContentBlock(at: index)
                 case .toolCall:
                     updateToolArguments(index)
                     guard case .toolCall(let updated) = partial.content[index] else { break }
@@ -149,10 +164,21 @@ public struct ProviderEventReducer: Sendable {
             }
         }
 
+        if type == "response.output_item.done"
+            || type == "response.output_text.done"
+        {
+            if let outputIndex = object.integer("output_index"),
+                let contentIndex = openAIResponseContentIndices[outputIndex]
+            {
+                events += finishContentBlock(at: contentIndex)
+            }
+        }
+
         if let stop = object.pathString(["choices", "0", "finish_reason"])
             ?? object.string("stop_reason")
         {
             if object.pathString(["choices", "0", "finish_reason"]) != nil {
+                events += finishOpenAIContentBlocks()
                 events += finishOpenAIChatToolCalls()
             }
             partial.rawStopReason = stop
@@ -170,7 +196,17 @@ public struct ProviderEventReducer: Sendable {
                 partial.stopReason = .toolUse
             }
         }
-        if type == "message_stop" || type == "response.completed" {
+        if type == "response.completed"
+            || type == "response.incomplete"
+            || type == "response.done"
+        {
+            events += finishOpenAIContentBlocks()
+        }
+        if type == "message_stop"
+            || type == "response.completed"
+            || type == "response.incomplete"
+            || type == "response.done"
+        {
             if partial.stopReason == .pending { partial.stopReason = .stop }
         }
         if let responseID = object.string("id")
@@ -217,9 +253,11 @@ public struct ProviderEventReducer: Sendable {
                     googleCurrentBlockIndex = index
                     if thinking {
                         partial.content.append(.thinking(text: "", signature: signature))
+                        openContentBlockIndices.insert(index)
                         events.append(.thinkingStart(index: index, partial: partial))
                     } else {
                         partial.content.append(.text(text: "", signature: signature))
+                        openContentBlockIndices.insert(index)
                         events.append(.textStart(index: index, partial: partial))
                     }
                 }
@@ -296,14 +334,7 @@ public struct ProviderEventReducer: Sendable {
             return []
         }
         googleCurrentBlockIndex = nil
-        switch partial.content[index] {
-        case .text(let text, _):
-            return [.textEnd(index: index, content: text, partial: partial)]
-        case .thinking(let text, _, _):
-            return [.thinkingEnd(index: index, content: text, partial: partial)]
-        default:
-            return []
-        }
+        return finishContentBlock(at: index)
     }
 
     private func retainedSignature(
@@ -389,16 +420,32 @@ public struct ProviderEventReducer: Sendable {
         return events
     }
 
-    private mutating func appendText(_ delta: String) -> [AssistantEvent] {
+    private mutating func appendText(
+        _ delta: String,
+        responseOutputIndex: Int? = nil
+    ) -> [AssistantEvent] {
         let index: Int
         var events: [AssistantEvent] = []
-        if let existing = partial.content.firstIndex(where: {
-            if case .text = $0 { true } else { false }
-        }) {
+        if let responseOutputIndex,
+            let existing = openAIResponseContentIndices[responseOutputIndex],
+            openContentBlockIndices.contains(existing),
+            partial.content.indices.contains(existing),
+            case .text = partial.content[existing]
+        {
+            index = existing
+        } else if responseOutputIndex == nil,
+            let existing = openContentBlockIndices.sorted().first(where: {
+                if case .text = partial.content[$0] { true } else { false }
+            })
+        {
             index = existing
         } else {
             index = partial.content.count
             partial.content.append(.text(text: ""))
+            openContentBlockIndices.insert(index)
+            if let responseOutputIndex {
+                openAIResponseContentIndices[responseOutputIndex] = index
+            }
             events.append(.textStart(index: index, partial: partial))
         }
         if case .text(let current, let signature) = partial.content[index] {
@@ -411,16 +458,32 @@ public struct ProviderEventReducer: Sendable {
         return events
     }
 
-    private mutating func appendThinking(_ delta: String) -> [AssistantEvent] {
+    private mutating func appendThinking(
+        _ delta: String,
+        responseOutputIndex: Int? = nil
+    ) -> [AssistantEvent] {
         let index: Int
         var events: [AssistantEvent] = []
-        if let existing = partial.content.firstIndex(where: {
-            if case .thinking = $0 { true } else { false }
-        }) {
+        if let responseOutputIndex,
+            let existing = openAIResponseContentIndices[responseOutputIndex],
+            openContentBlockIndices.contains(existing),
+            partial.content.indices.contains(existing),
+            case .thinking = partial.content[existing]
+        {
+            index = existing
+        } else if responseOutputIndex == nil,
+            let existing = openContentBlockIndices.sorted().first(where: {
+                if case .thinking = partial.content[$0] { true } else { false }
+            })
+        {
             index = existing
         } else {
             index = partial.content.count
             partial.content.append(.thinking(text: ""))
+            openContentBlockIndices.insert(index)
+            if let responseOutputIndex {
+                openAIResponseContentIndices[responseOutputIndex] = index
+            }
             events.append(.thinkingStart(index: index, partial: partial))
         }
         if case .thinking(let current, let signature, let redacted) = partial.content[index] {
@@ -434,6 +497,29 @@ public struct ProviderEventReducer: Sendable {
             .thinkingDelta(index: index, delta: delta, partial: partial)
         )
         return events
+    }
+
+    private mutating func finishOpenAIContentBlocks() -> [AssistantEvent] {
+        openContentBlockIndices.sorted().flatMap { finishContentBlock(at: $0) }
+    }
+
+    private mutating func finishContentBlock(at index: Int) -> [AssistantEvent] {
+        guard openContentBlockIndices.remove(index) != nil,
+            partial.content.indices.contains(index)
+        else {
+            return []
+        }
+        openAIResponseContentIndices = openAIResponseContentIndices.filter {
+            $0.value != index
+        }
+        switch partial.content[index] {
+        case .text(let text, _):
+            return [.textEnd(index: index, content: text, partial: partial)]
+        case .thinking(let text, _, _):
+            return [.thinkingEnd(index: index, content: text, partial: partial)]
+        default:
+            return []
+        }
     }
 
     private mutating func ensureIndex(_ index: Int, block: ContentBlock) {
@@ -478,37 +564,100 @@ public struct ProviderEventReducer: Sendable {
 
     private mutating func updateUsage(_ object: OrderedJSONObject) {
         if case .object(let usage)? = object["usageMetadata"] {
-            let cached = usage.integer("cachedContentTokenCount") ?? 0
-            let candidates = usage.integer("candidatesTokenCount") ?? 0
-            let thoughts = usage.integer("thoughtsTokenCount") ?? 0
+            let cached = max(0, usage.integer("cachedContentTokenCount") ?? 0)
+            let candidates = max(0, usage.integer("candidatesTokenCount") ?? 0)
+            let thoughts = max(0, usage.integer("thoughtsTokenCount") ?? 0)
             partial.usage.input = max(
                 0,
                 (usage.integer("promptTokenCount") ?? 0) - cached
             )
             partial.usage.output = candidates + thoughts
             partial.usage.cacheRead = cached
+            partial.usage.cacheWrite = 0
             partial.usage.reasoning = thoughts
-            partial.usage.totalTokens =
+            partial.usage.totalTokens = max(
+                0,
                 usage.integer("totalTokenCount")
-                ?? partial.usage.input + partial.usage.output + cached
+                    ?? partial.usage.input + partial.usage.output + cached
+            )
+            updateCost()
             return
         }
-        let usageValue = object["usage"] ?? object.path(["response", "usage"])
+        let usageValue =
+            object["usage"]
+            ?? object.path(["response", "usage"])
+            ?? object.path(["message", "usage"])
+            ?? object.path(["choices", "0", "usage"])
         guard case .object(let usage)? = usageValue else { return }
-        partial.usage.input =
-            usage.integer("input_tokens")
+        let cacheRead =
+            usage.pathInteger(["input_tokens_details", "cached_tokens"])
+            ?? usage.pathInteger(["prompt_tokens_details", "cached_tokens"])
+            ?? usage.integer("cache_read_input_tokens")
+            ?? usage.integer("prompt_cache_hit_tokens")
+            ?? usage.integer("cached_tokens")
+        let cacheWrite =
+            usage.pathInteger(["input_tokens_details", "cache_write_tokens"])
+            ?? usage.pathInteger(["prompt_tokens_details", "cache_write_tokens"])
+            ?? usage.integer("cache_creation_input_tokens")
+        if let cacheRead { partial.usage.cacheRead = max(0, cacheRead) }
+        if let cacheWrite { partial.usage.cacheWrite = max(0, cacheWrite) }
+        if let cacheWrite1h = usage.pathInteger([
+            "cache_creation", "ephemeral_1h_input_tokens",
+        ]) {
+            partial.usage.cacheWrite1h = max(0, cacheWrite1h)
+        }
+        if let rawInput = usage.integer("input_tokens")
             ?? usage.integer("prompt_tokens")
-            ?? partial.usage.input
-        partial.usage.output =
-            usage.integer("output_tokens")
+        {
+            partial.usage.input =
+                model.api == "anthropic-messages"
+                ? max(0, rawInput)
+                : max(
+                    0,
+                    rawInput - partial.usage.cacheRead - partial.usage.cacheWrite
+                )
+        }
+        if let output = usage.integer("output_tokens")
             ?? usage.integer("completion_tokens")
-            ?? partial.usage.output
-        partial.usage.reasoning =
-            usage.integer("reasoning_tokens")
+        {
+            partial.usage.output = max(0, output)
+        }
+        if let reasoning = usage.integer("reasoning_tokens")
             ?? usage.pathInteger(["output_tokens_details", "reasoning_tokens"])
-        partial.usage.totalTokens =
+            ?? usage.pathInteger(["completion_tokens_details", "reasoning_tokens"])
+        {
+            partial.usage.reasoning = max(0, reasoning)
+        }
+        partial.usage.totalTokens = max(
+            0,
             usage.integer("total_tokens")
-            ?? partial.usage.input + partial.usage.output
+                ?? partial.usage.input + partial.usage.output
+                + partial.usage.cacheRead + partial.usage.cacheWrite
+        )
+        updateCost()
+    }
+
+    private mutating func updateCost() {
+        let rates = model.cost
+        let cacheWrite = max(0, partial.usage.cacheWrite)
+        let longWrite = min(cacheWrite, max(0, partial.usage.cacheWrite1h ?? 0))
+        let shortWrite = cacheWrite - longWrite
+        partial.usage.cost = Cost(
+            input: cost(tokens: partial.usage.input, rate: rates.input),
+            output: cost(tokens: partial.usage.output, rate: rates.output),
+            cacheRead: cost(tokens: partial.usage.cacheRead, rate: rates.cacheRead),
+            cacheWrite: cost(tokens: shortWrite, rate: rates.cacheWrite)
+                + cost(tokens: longWrite, rate: safeRate(rates.input) * 2)
+        )
+    }
+
+    private func cost(tokens: Int, rate: Double) -> Double {
+        let value = Double(max(0, tokens)) * safeRate(rate) / 1_000_000
+        return value.isFinite ? value : 0
+    }
+
+    private func safeRate(_ value: Double) -> Double {
+        value.isFinite && value >= 0 ? value : 0
     }
 
     private func mapStopReason(_ raw: String) -> StopReason {

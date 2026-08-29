@@ -21,24 +21,68 @@ final class ZetaServerTests: XCTestCase {
         XCTAssertEqual(error.code, .invalidRequest)
     }
 
-    func testHandshakeAndConcurrentListRequest() async throws {
+    func testImmediateRequestPublishedFromHelloSendSucceeds() async throws {
         let service = TestService()
         let server = try PiServer(serverID: "server", service: service)
         let connection = TestConnection()
         try await server.accept(connection)
-        await server.receive(try encodeClientMessage(.hello(try ClientHello())), connectionID: connection.id)
-        try await waitUntil { await connection.count >= 1 }
-        let decoder = try ServerMessageDecoder()
-        let first = try decoder.push(await connection.data[0])
-        guard case .hello = first.first else { return XCTFail("Expected hello") }
         let request = try RequestEnvelope(id: "1", request: .list)
-        await server.receive(try encodeClientMessage(.request(request)), connectionID: connection.id)
-        try await waitUntil { await connection.count >= 2 }
-        let second = try decoder.push(await connection.data[1])
-        guard case .response(.success(id: "1", result: .list)) = second.first else {
-            return XCTFail("Expected list response")
+        let requestFrame = try encodeClientMessage(.request(request))
+        await connection.setNextSendHook { _ in
+            await server.receive(requestFrame, connectionID: connection.id)
         }
+
+        await server.receive(try encodeClientMessage(.hello(try ClientHello())), connectionID: connection.id)
+
+        try await waitUntil { await connection.count >= 2 }
+        let messages = try await decodedMessages(connection)
+        guard case .hello = messages.first else { return XCTFail("Expected hello") }
+        XCTAssertTrue(
+            messages.contains {
+                guard case .response(.success(id: "1", result: .list)) = $0 else { return false }
+                return true
+            })
+        let isClosed = await connection.isClosed
+        XCTAssertFalse(isClosed)
         await server.close()
+    }
+
+    func testRequestFramedImmediatelyAfterHelloWaitsForHandshake() async throws {
+        let server = try PiServer(serverID: "server", service: TestService())
+        let connection = TestConnection()
+        try await server.accept(connection)
+        var frames = try encodeClientMessage(.hello(try ClientHello()))
+        frames.append(
+            try encodeClientMessage(.request(try RequestEnvelope(id: "immediate", request: .list))))
+
+        await server.receive(frames, connectionID: connection.id)
+
+        try await waitUntil { await connection.count >= 2 }
+        let messages = try await decodedMessages(connection)
+        XCTAssertTrue(
+            messages.contains {
+                guard case .response(.success(id: "immediate", result: .list)) = $0 else { return false }
+                return true
+            })
+        await server.close()
+    }
+
+    func testHandshakeSendFailureRollsBackReadinessAndCloses() async throws {
+        let server = try PiServer(serverID: "server", service: TestService())
+        let connection = TestConnection()
+        try await server.accept(connection)
+        await connection.setFailing(true)
+
+        await server.receive(try encodeClientMessage(.hello(try ClientHello())), connectionID: connection.id)
+
+        try await waitUntil { await connection.isClosed }
+        await connection.setFailing(false)
+        let attempts = await connection.sendAttempts
+        let request = try RequestEnvelope(id: "late", request: .list)
+        await server.receive(try encodeClientMessage(.request(request)), connectionID: connection.id)
+        try await Task.sleep(for: .milliseconds(20))
+        let finalAttempts = await connection.sendAttempts
+        XCTAssertEqual(finalAttempts, attempts)
     }
 
     func testMutationsBroadcastAuthoritativeSnapshotsToEveryAttachedClient() async throws {
@@ -187,17 +231,22 @@ private actor TestConnection: ServerByteConnection {
     private(set) var isClosed = false
     private(set) var sendAttempts = 0
     private var failing = false
+    private var nextSendHook: (@Sendable (Data) async -> Void)?
     var count: Int { data.count }
 
     init(id: String = "connection") { self.id = id }
 
-    func send(_ bytes: Data) throws {
+    func send(_ bytes: Data) async throws {
         sendAttempts += 1
         if failing { throw SendFailure() }
         data.append(bytes)
+        let hook = nextSendHook
+        nextSendHook = nil
+        await hook?(bytes)
     }
     func close() { isClosed = true }
     func setFailing(_ value: Bool) { failing = value }
+    func setNextSendHook(_ hook: @escaping @Sendable (Data) async -> Void) { nextSendHook = hook }
 }
 
 private struct TestService: PiServerService {

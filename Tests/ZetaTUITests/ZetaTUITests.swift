@@ -1,7 +1,7 @@
 import XCTest
-import ZetaTerminal
 
 @testable import ZetaTUI
+@testable import ZetaTerminal
 
 final class ZetaTUITests: XCTestCase {
     func testWidthsAndWrapping() {
@@ -99,6 +99,26 @@ final class ZetaTUITests: XCTestCase {
         XCTAssertEqual(decoder.flushEscape(), [Data([0x1B])])
     }
 
+    func testTerminalInputPipelineSerializesEscapeCancellationAndFlush() async throws {
+        let pipeline = TerminalInputPipeline()
+        let recorder = InputRecorder()
+        let record: @Sendable (Data) -> Void = { recorder.record($0) }
+
+        pipeline.submit(Data([0x1B]), escapeDelay: 0.05, onInput: record)
+        pipeline.submit(Data("[A".utf8), escapeDelay: 0.05, onInput: record)
+        pipeline.waitUntilIdle()
+        try await Task.sleep(for: .milliseconds(100))
+        pipeline.waitUntilIdle()
+        XCTAssertEqual(recorder.values, [Data("\u{1B}[A".utf8)])
+
+        pipeline.submit(Data([0x1B]), escapeDelay: 0.05, onInput: record)
+        pipeline.waitUntilIdle()
+        pipeline.reset()
+        try await Task.sleep(for: .milliseconds(100))
+        pipeline.waitUntilIdle()
+        XCTAssertEqual(recorder.values, [Data("\u{1B}[A".utf8)])
+    }
+
     func testCapabilitiesImagesAndAltScreenLifecycle() throws {
         let capabilities = TerminalCapabilities.detect(environment: [
             "TERM_PROGRAM": "Ghostty",
@@ -168,6 +188,14 @@ final class ZetaTUITests: XCTestCase {
         XCTAssertTrue(terminal.output.contains("\u{1B}]8;;\u{07}"))
         tui.stop()
     }
+}
+
+private final class InputRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storedValues: [Data] = []
+
+    var values: [Data] { lock.withLock { storedValues } }
+    func record(_ value: Data) { lock.withLock { storedValues.append(value) } }
 }
 
 private final class SubmissionRecorder: @unchecked Sendable {

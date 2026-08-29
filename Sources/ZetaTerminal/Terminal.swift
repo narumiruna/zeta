@@ -9,6 +9,78 @@ public protocol Terminal: AnyObject, Sendable {
     func write(_ data: Data)
 }
 
+final class TerminalInputPipeline: @unchecked Sendable {
+    let queue = DispatchQueue(label: "works.earendil.zeta.terminal-input")
+
+    private let queueKey = DispatchSpecificKey<UInt8>()
+    private var decoder = TerminalInputDecoder()
+    private var escapeGeneration: UInt64 = 0
+    private var escapeWorkItem: DispatchWorkItem?
+
+    init() { queue.setSpecific(key: queueKey, value: 1) }
+
+    func consume(
+        _ data: Data,
+        escapeDelay: TimeInterval,
+        onInput: @escaping @Sendable (Data) -> Void
+    ) {
+        dispatchPrecondition(condition: .onQueue(queue))
+        cancelEscape()
+        for sequence in decoder.push(data) where !TerminalInputDecoder.isKeyRelease(sequence) {
+            onInput(sequence)
+        }
+        guard decoder.hasPendingEscape else { return }
+        escapeGeneration &+= 1
+        let generation = escapeGeneration
+        let work = DispatchWorkItem { [weak self] in
+            self?.flushEscape(generation: generation, onInput: onInput)
+        }
+        escapeWorkItem = work
+        queue.asyncAfter(deadline: .now() + escapeDelay, execute: work)
+    }
+
+    func submit(
+        _ data: Data,
+        escapeDelay: TimeInterval,
+        onInput: @escaping @Sendable (Data) -> Void
+    ) {
+        queue.async { self.consume(data, escapeDelay: escapeDelay, onInput: onInput) }
+    }
+
+    func reset() {
+        sync {
+            self.cancelEscape()
+            self.decoder = TerminalInputDecoder()
+        }
+    }
+
+    func waitUntilIdle() { sync {} }
+
+    private func flushEscape(generation: UInt64, onInput: @escaping @Sendable (Data) -> Void) {
+        dispatchPrecondition(condition: .onQueue(queue))
+        guard generation == escapeGeneration else { return }
+        escapeWorkItem = nil
+        for sequence in decoder.flushEscape() where !TerminalInputDecoder.isKeyRelease(sequence) {
+            onInput(sequence)
+        }
+    }
+
+    private func cancelEscape() {
+        dispatchPrecondition(condition: .onQueue(queue))
+        escapeGeneration &+= 1
+        escapeWorkItem?.cancel()
+        escapeWorkItem = nil
+    }
+
+    private func sync(_ body: () -> Void) {
+        if DispatchQueue.getSpecific(key: queueKey) != nil {
+            body()
+        } else {
+            queue.sync(execute: body)
+        }
+    }
+}
+
 public final class ProcessTerminal: Terminal, @unchecked Sendable {
     private static let activeLock = NSLock()
     private nonisolated(unsafe) static var active: [ObjectIdentifier: ProcessTerminal] = [:]
@@ -26,8 +98,7 @@ public final class ProcessTerminal: Terminal, @unchecked Sendable {
     private var original = termios()
     private var started = false
     private var readSource: DispatchSourceRead?
-    private var decoder = TerminalInputDecoder()
-    private var escapeWorkItem: DispatchWorkItem?
+    private let inputPipeline = TerminalInputPipeline()
     private var resizeSource: DispatchSourceSignal?
     private var previousWindowSignal: sig_t?
 
@@ -46,28 +117,15 @@ public final class ProcessTerminal: Terminal, @unchecked Sendable {
         started = true
         Self.activeLock.withLock { Self.active[ObjectIdentifier(self)] = self }
         write(Data("\u{1B}[?2004h\u{1B}[>7u\u{1B}[>4;2m".utf8))
-        let source = DispatchSource.makeReadSource(fileDescriptor: descriptor, queue: .global())
+        let source = DispatchSource.makeReadSource(fileDescriptor: descriptor, queue: inputPipeline.queue)
         source.setEventHandler { [weak self] in
             guard let self else { return }
             let data = self.input.availableData
             guard !data.isEmpty else { return }
-            self.escapeWorkItem?.cancel()
-            for sequence in self.decoder.push(data) {
-                if !TerminalInputDecoder.isKeyRelease(sequence) {
-                    onInput(sequence)
-                }
-            }
-            if self.decoder.hasPendingEscape {
-                let delay =
-                    ProcessInfo.processInfo.environment["SSH_CONNECTION"] == nil
-                    ? 0.01 : 0.1
-                let work = DispatchWorkItem { [weak self] in
-                    guard let self else { return }
-                    for sequence in self.decoder.flushEscape() { onInput(sequence) }
-                }
-                self.escapeWorkItem = work
-                DispatchQueue.global().asyncAfter(deadline: .now() + delay, execute: work)
-            }
+            let delay =
+                ProcessInfo.processInfo.environment["SSH_CONNECTION"] == nil
+                ? 0.01 : 0.1
+            self.inputPipeline.consume(data, escapeDelay: delay, onInput: onInput)
         }
         source.resume()
         readSource = source
@@ -81,15 +139,13 @@ public final class ProcessTerminal: Terminal, @unchecked Sendable {
 
     public func stop() {
         guard started else { return }
-        escapeWorkItem?.cancel()
-        escapeWorkItem = nil
         readSource?.cancel()
         readSource = nil
         resizeSource?.cancel()
         resizeSource = nil
         signal(SIGWINCH, previousWindowSignal ?? SIG_DFL)
         previousWindowSignal = nil
-        decoder = TerminalInputDecoder()
+        inputPipeline.reset()
         write(Data("\u{1B}[<u\u{1B}[>4m\u{1B}[?2004l\u{1B}[?25h".utf8))
         var value = original
         tcsetattr(input.fileDescriptor, TCSAFLUSH, &value)

@@ -42,6 +42,8 @@ public struct HTTPProvider: AIProvider {
     public func stream(model: Model, context: Context, options: StreamOptions) async -> AssistantEventStream {
         let output = AssistantEventStream()
         let producer = Task {
+            var reducer = ProviderEventReducer(model: model)
+            var started = false
             do {
                 let requestEnvironment = environment().merging(options.environment) {
                     _, override in override
@@ -68,8 +70,8 @@ public struct HTTPProvider: AIProvider {
                     for try await byte in bytes { if body.count < 64 * 1_024 { body.append(byte) } }
                     throw ProviderError.http(status: http.statusCode, body: String(decoding: body, as: UTF8.self))
                 }
-                var reducer = ProviderEventReducer(model: model)
                 await output.emit(.start(reducer.partial))
+                started = true
                 var decoder = SSEDecoder()
                 for try await byte in bytes {
                     try Task.checkCancellation()
@@ -97,13 +99,34 @@ public struct HTTPProvider: AIProvider {
                 }
                 await output.emit(.done(reason: partial.stopReason, message: partial))
             } catch is CancellationError {
-                let message = AssistantMessage(
-                    api: model.api, provider: model.provider, model: model.id, stopReason: .aborted,
-                    errorMessage: "Operation aborted")
-                await output.emit(.start(AssistantMessage(api: model.api, provider: model.provider, model: model.id)))
-                await output.emit(.error(reason: .aborted, message: message))
+                if started {
+                    var message = reducer.partial
+                    message.stopReason = .aborted
+                    message.errorMessage = "Operation aborted"
+                    await output.emit(.error(reason: .aborted, message: message))
+                } else {
+                    await output.failBeforeStart(
+                        api: model.api,
+                        provider: model.provider,
+                        model: model.id,
+                        error: CancellationError(),
+                        aborted: true
+                    )
+                }
             } catch {
-                await output.failBeforeStart(api: model.api, provider: model.provider, model: model.id, error: error)
+                if started {
+                    var message = reducer.partial
+                    message.stopReason = .error
+                    message.errorMessage = String(describing: error)
+                    await output.emit(.error(reason: .error, message: message))
+                } else {
+                    await output.failBeforeStart(
+                        api: model.api,
+                        provider: model.provider,
+                        model: model.id,
+                        error: error
+                    )
+                }
             }
         }
         output.attachProducer(producer)

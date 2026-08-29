@@ -137,13 +137,28 @@ public indirect enum JSONSchema: Sendable, Equatable {
             return .number(number)
         case let .integer(minimum, maximum, javascriptSafe):
             let number = try coerceNumber(original, integer: true, enabled: coerce, path: path)
-            guard number.isInteger else { throw mismatch(path, expected: "integer") }
-            if javascriptSafe, !number.isJavaScriptSafeInteger {
-                throw ValidationIssue(
-                    code: .outOfRange, path: path, message: "Integer is outside the JavaScript-safe range")
-            }
-            guard let value = number.safeIntegerValue else {
-                throw ValidationIssue(code: .outOfRange, path: path, message: "Integer is outside the supported range")
+            let value: Int64
+            if javascriptSafe {
+                guard number.isInteger else { throw mismatch(path, expected: "integer") }
+                guard number.isJavaScriptSafeInteger,
+                    let safeValue = number.safeIntegerValue
+                else {
+                    throw ValidationIssue(
+                        code: .outOfRange, path: path,
+                        message: "Integer is outside the JavaScript-safe range")
+                }
+                value = safeValue
+            } else {
+                switch Self.preservedInteger(number.rawValue) {
+                case .value(let preservedValue):
+                    value = preservedValue
+                case .notInteger:
+                    throw mismatch(path, expected: "integer")
+                case .outOfRange:
+                    throw ValidationIssue(
+                        code: .outOfRange, path: path,
+                        message: "Integer is outside the supported range")
+                }
             }
             if let minimum, value < minimum {
                 throw ValidationIssue(code: .outOfRange, path: path, message: "Integer must be at least \(minimum)")
@@ -322,6 +337,78 @@ public indirect enum JSONSchema: Sendable, Equatable {
             }
         }
         throw mismatch(path, expected: integer ? "integer" : "number")
+    }
+
+    private enum PreservedInteger {
+        case value(Int64)
+        case notInteger
+        case outOfRange
+    }
+
+    private static func preservedInteger(_ rawValue: String) -> PreservedInteger {
+        var spelling = rawValue[...]
+        let negative = spelling.first == "-"
+        if negative { spelling.removeFirst() }
+
+        let exponent: Int
+        if let marker = spelling.firstIndex(where: { $0 == "e" || $0 == "E" }) {
+            exponent = boundedExponent(spelling[spelling.index(after: marker)...])
+            spelling = spelling[..<marker]
+        } else {
+            exponent = 0
+        }
+
+        let fractionCount: Int
+        var digits: String
+        if let point = spelling.firstIndex(of: ".") {
+            fractionCount = spelling.distance(from: spelling.index(after: point), to: spelling.endIndex)
+            digits = String(spelling[..<point]) + String(spelling[spelling.index(after: point)...])
+        } else {
+            fractionCount = 0
+            digits = String(spelling)
+        }
+
+        digits.removeFirst(digits.prefix(while: { $0 == "0" }).count)
+        if digits.isEmpty { return .value(0) }
+
+        let scale = exponent - fractionCount
+        if scale < 0 {
+            let removedCount = -scale
+            guard removedCount <= digits.count,
+                digits.suffix(removedCount).allSatisfy({ $0 == "0" })
+            else {
+                return .notInteger
+            }
+            digits.removeLast(removedCount)
+            if digits.isEmpty { return .value(0) }
+        } else if scale > 0 {
+            guard digits.count + scale <= 19 else { return .outOfRange }
+            digits.append(String(repeating: "0", count: scale))
+        }
+
+        guard digits.count <= 19 else { return .outOfRange }
+        let maximum = negative ? "9223372036854775808" : "9223372036854775807"
+        if digits.count == maximum.count, digits > maximum { return .outOfRange }
+        guard let magnitude = UInt64(digits) else { return .outOfRange }
+        if negative {
+            if magnitude == UInt64(Int64.max) + 1 { return .value(Int64.min) }
+            guard let value = Int64(exactly: magnitude) else { return .outOfRange }
+            return .value(-value)
+        }
+        guard let value = Int64(exactly: magnitude) else { return .outOfRange }
+        return .value(value)
+    }
+
+    private static func boundedExponent(_ spelling: Substring) -> Int {
+        var value = 0
+        var digits = spelling
+        let negative = digits.first == "-"
+        if digits.first == "-" || digits.first == "+" { digits.removeFirst() }
+        for digit in digits {
+            guard value < 10_000 else { return negative ? -10_000 : 10_000 }
+            value = value * 10 + Int(String(digit))!
+        }
+        return negative ? -value : value
     }
 
     private func mismatch(_ path: String, expected: String) -> ValidationIssue {

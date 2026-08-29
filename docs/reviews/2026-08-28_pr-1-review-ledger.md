@@ -444,6 +444,148 @@ Final outcome: Addressed by sharing runtime credential resolution and checking e
 
 Evidence: Auth and CLI readiness regressions cover expired OAuth, blank values, environment fallback, and valid OAuth.
 
+## Third-round inline feedback
+
+### `3885469697`
+
+Concern: Server readiness is published after sending the hello.
+
+Initial outcome: Actionable and not yet addressed.
+
+Final outcome: Addressed by marking the tokenized connection ready before hello publication, queueing same-batch requests, and closing on send failure.
+
+Evidence: Server handshake regressions verify immediate post-hello requests and failed hello sends.
+
+### `3885469702`
+
+Concern: Gemini usage metadata is not decoded.
+
+Initial outcome: Actionable and not yet addressed.
+
+Final outcome: Addressed by decoding Google prompt, candidate, thought, cached, and total token counts.
+
+Evidence: Provider regressions verify Gemini token accounting and cache separation.
+
+### `3885469706`
+
+Concern: Provider usage does not apply selected model pricing.
+
+Initial outcome: Actionable and not yet addressed.
+
+Final outcome: Addressed by retaining the selected model in the reducer and calculating input, output, cache-read, and cache-write costs from generated rates.
+
+Evidence: Provider regressions verify nonzero cost components and totals from known model rates.
+
+### `3885469712`
+
+Concern: Concurrent client connection callers do not await the active connection attempt.
+
+Initial outcome: Actionable and not yet addressed.
+
+Final outcome: Addressed by tokenized connection-operation coalescing with shared success and failure settlement.
+
+Evidence: Client regressions cover concurrent success, shared failure, and a clean retry.
+
+### `3885469719`
+
+Concern: Failed session persistence leaves unpersisted entries in memory.
+
+Initial outcome: Actionable and not yet addressed.
+
+Final outcome: Addressed by completing or rolling back durable writes before mutating entries, indexes, leaves, or materialization state.
+
+Evidence: Session regressions cover existing-file append failure and delayed first-assistant materialization failure.
+
+### `3885469722`
+
+Concern: Delayed Escape decoding races new terminal input.
+
+Initial outcome: Actionable and not yet addressed.
+
+Final outcome: Addressed by confining decoder mutation, timeout scheduling, cancellation, and reset to one serial input pipeline.
+
+Evidence: Terminal regressions exercise Escape cancellation and new input near the timeout boundary.
+
+### `3885469725`
+
+Concern: OpenAI text and thinking block lifecycles omit end events.
+
+Initial outcome: Actionable and not yet addressed.
+
+Final outcome: Addressed by tracking open content blocks and finalizing them exactly once on Chat Completions and Responses terminal events.
+
+Evidence: Provider lifecycle regressions verify balanced and nonduplicated text and thinking events.
+
+### `3885469733`
+
+Concern: Bedrock signing can use a region that differs from the selected endpoint.
+
+Initial outcome: Actionable and not yet addressed.
+
+Final outcome: Addressed by deriving the endpoint region and rejecting conflicting AWS region variables before constructing the provider.
+
+Evidence: CLI region regressions cover derived, matching, and mismatched configurations.
+
+### `3885469740`
+
+Concern: Empty credential environment variables mask later valid fallbacks.
+
+Initial outcome: Actionable and not yet addressed.
+
+Final outcome: Addressed by trimming and skipping empty values throughout stored and environment credential resolution.
+
+Evidence: AuthStore regressions verify an empty first Anthropic variable falls through to a valid API key.
+
+### `3885469741`
+
+Concern: Unknown long CLI flags are accepted and discarded.
+
+Initial outcome: Actionable and not yet addressed.
+
+Final outcome: Addressed by rejecting unsupported long flags while preserving the `--` message terminator.
+
+Evidence: CLI argument regressions cover typographical flags and post-terminator messages.
+
+### `3885469744`
+
+Concern: HTTP stream failures discard partial assistant output.
+
+Initial outcome: Actionable and not yet addressed.
+
+Final outcome: Addressed by terminating an already-started stream with the accumulated reducer partial plus error metadata.
+
+Evidence: Provider regression coverage verifies partial text survives a post-start transport failure.
+
+### `3885469747`
+
+Concern: `integer(javascriptSafe: false)` still requires JavaScript-safe values.
+
+Initial outcome: Actionable and not yet addressed.
+
+Final outcome: Addressed by exact preserved-spelling integer parsing and signed 64-bit range checks without `Double` conversion.
+
+Evidence: Validation regressions cover Int64 boundaries, exponent spellings, fractions, and overflow while retaining JavaScript-safe behavior.
+
+### `3885469750`
+
+Concern: Package subprocesses block actor isolation.
+
+Initial outcome: Actionable and not yet addressed.
+
+Final outcome: Addressed by a cancellable nonisolated async subprocess helper with process-group termination.
+
+Evidence: Package regressions verify actor responsiveness, cancellation, staging cleanup, and publication rollback.
+
+### `3885469752`
+
+Concern: Ctrl-C cannot interrupt an active initial interactive prompt.
+
+Initial outcome: Actionable and not yet addressed.
+
+Final outcome: Addressed by aborting and draining the active agent run when exit is requested.
+
+Evidence: Interactive CLI regressions verify prompt cancellation and terminal settlement.
+
 ## Check feedback
 
 ### Repository gates

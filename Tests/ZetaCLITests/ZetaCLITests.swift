@@ -21,11 +21,21 @@ final class ZetaCLITests: XCTestCase {
         XCTAssertNil(ZetaCLI.imageMIME(Data("plain".utf8)))
     }
 
-    func testArgumentConflictsAndExtensionFlags() throws {
-        let args = try CLIArguments.parse(["--custom=value", "-p", "hello"])
-        XCTAssertEqual(args.extensionFlags["custom"]!, "value")
+    func testArgumentParsingRejectsUnknownFlagsAndPreservesTerminator() throws {
+        let args = try CLIArguments.parse([
+            "--provider", "openai", "-p", "--", "--custom=value", "-c", "@prompt.md",
+        ])
+        XCTAssertEqual(args.provider, "openai")
         XCTAssertTrue(args.print)
-        XCTAssertEqual(args.messages, ["hello"])
+        XCTAssertFalse(args.continueSession)
+        XCTAssertTrue(args.files.isEmpty)
+        XCTAssertEqual(args.messages, ["--custom=value", "-c", "@prompt.md"])
+
+        for values in [["--custom=value"], ["--custom", "discarded-message"]] {
+            XCTAssertThrowsError(try CLIArguments.parse(values)) { error in
+                XCTAssertEqual(error.localizedDescription, "Invalid value for --custom")
+            }
+        }
         XCTAssertThrowsError(try CLIArguments.parse(["--fork", "a", "--session", "b"]))
         XCTAssertThrowsError(try CLIArguments.parse(["--session-id", "-invalid-"]))
         let model = try CLIArguments.parse(["--model", "openai/gpt:high", "hello"])
@@ -287,6 +297,41 @@ final class ZetaCLITests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: replacement.path))
     }
 
+    func testInteractiveExitAbortsActiveProviderRun() async throws {
+        let provider = FauxProvider(tokensPerSecond: 1)
+        let model = await provider.models[0]
+        await provider.enqueue(
+            AssistantMessage(
+                content: [.text(text: String(repeating: "x", count: 100))],
+                api: model.api,
+                provider: model.provider,
+                model: model.id,
+                stopReason: .stop
+            )
+        )
+        let agent = Agent(state: AgentState(systemPrompt: "", model: model)) {
+            model, context, options in
+            await provider.stream(model: model, context: context, options: options)
+        }
+        let prompt = Task {
+            try await agent.prompt(UserMessage("initial"))
+        }
+        while await provider.callCount() == 0 { await Task.yield() }
+
+        let start = ContinuousClock.now
+        await InteractiveSessionCommands.exit(agent: agent)
+        let elapsed = start.duration(to: .now)
+        _ = await prompt.result
+
+        XCTAssertLessThan(elapsed, .seconds(2))
+        let state = await agent.state()
+        XCTAssertFalse(state.isStreaming)
+        guard case .assistant(let assistant)? = state.messages.last else {
+            return XCTFail("Expected aborted assistant message")
+        }
+        XCTAssertEqual(assistant.stopReason, .aborted)
+    }
+
     func testThinkingCommandsPersistToSessionTranscript() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -458,6 +503,43 @@ final class ZetaCLITests: XCTestCase {
         XCTAssertEqual(CLIProviderTransport.select(for: codex, preference: .auto), .codexWebSocket)
         XCTAssertEqual(CLIProviderTransport.select(for: codex, preference: .sse), .http)
         XCTAssertEqual(CLIProviderTransport.select(for: bedrock, preference: .auto), .bedrock)
+    }
+
+    func testBedrockSigningRegionComesFromSelectedEndpoint() throws {
+        let endpoint = URL(
+            string: "https://bedrock-runtime.eu-central-1.amazonaws.com"
+        )!
+        XCTAssertEqual(
+            try CLIBedrockSigningRegion.resolve(endpoint: endpoint, environment: [:]),
+            "eu-central-1"
+        )
+        XCTAssertEqual(
+            try CLIBedrockSigningRegion.resolve(
+                endpoint: endpoint,
+                environment: [
+                    "AWS_REGION": "eu-central-1",
+                    "AWS_DEFAULT_REGION": "eu-central-1",
+                ]
+            ),
+            "eu-central-1"
+        )
+        for variable in ["AWS_REGION", "AWS_DEFAULT_REGION"] {
+            XCTAssertThrowsError(
+                try CLIBedrockSigningRegion.resolve(
+                    endpoint: endpoint,
+                    environment: [variable: "us-east-1"]
+                )
+            ) { error in
+                XCTAssertEqual(
+                    error as? CLIBedrockRegionError,
+                    .environmentMismatch(
+                        variable: variable,
+                        configured: "us-east-1",
+                        endpoint: "eu-central-1"
+                    )
+                )
+            }
+        }
     }
 
     func testVertexBearerUsesAuthorizationAndAPIKeyUsesGoogleHeader() async throws {

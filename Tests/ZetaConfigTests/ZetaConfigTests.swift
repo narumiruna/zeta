@@ -111,6 +111,17 @@ final class ZetaConfigTests: XCTestCase {
         XCTAssertEqual(fallback.apiKey, "environment-key")
         XCTAssertNil(fallback.bearerToken)
 
+        let laterFallback = try await store.resolveCredential(
+            provider: "oauth",
+            environment: [
+                "EMPTY_KEY": " \t\n",
+                "VALID_KEY": "later-environment-key",
+            ],
+            fallbackVariables: ["EMPTY_KEY", "MISSING_KEY", "VALID_KEY"],
+            nowMilliseconds: 100
+        )
+        XCTAssertEqual(laterFallback.apiKey, "later-environment-key")
+
         try await store.set(
             provider: "empty",
             credential: .apiKey(key: "", environment: ["EMPTY_KEY": ""])

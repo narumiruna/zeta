@@ -58,6 +58,60 @@ import Testing
         expectValidationThrow { try schema.validate(["unknown": true], mode: .partial) }
     }
 
+    @Test func integersBeyondJavaScriptSafeRangeUsePreservedSpelling() throws {
+        let schema = JSONSchema.integer(javascriptSafe: false)
+        for spelling in [
+            "9007199254740993",
+            "9007199254740993.0",
+            "9.007199254740993e15",
+            "9223372036854775807",
+            "-9223372036854775808",
+        ] {
+            let value = try OrderedJSON.decode(spelling)
+            let validated = try schema.validate(value)
+            guard case .number(let number) = validated else {
+                Issue.record("Expected integer for \(spelling)")
+                continue
+            }
+            #expect(number.rawValue == spelling)
+        }
+    }
+
+    @Test func preservedIntegersEnforceInt64AndSchemaBoundsExactly() throws {
+        let bounded = JSONSchema.integer(
+            minimum: 9_007_199_254_740_993,
+            maximum: 9_007_199_254_740_994,
+            javascriptSafe: false
+        )
+        #expect(
+            try bounded.validate(OrderedJSON.decode("9007199254740993"))
+                == OrderedJSON.decode("9007199254740993")
+        )
+        expectValidationThrow {
+            try bounded.validate(OrderedJSON.decode("9007199254740992"))
+        }
+        expectValidationThrow {
+            try bounded.validate(OrderedJSON.decode("9007199254740995"))
+        }
+        for spelling in [
+            "9223372036854775808",
+            "-9223372036854775809",
+            "9007199254740993.5",
+            "9.0071992547409935e15",
+        ] {
+            expectValidationThrow {
+                try JSONSchema.integer(javascriptSafe: false).validate(
+                    OrderedJSON.decode(spelling)
+                )
+            }
+        }
+        expectValidationThrow {
+            try JSONSchema.integer().validate(
+                OrderedJSON.decode("9007199254740993")
+            )
+        }
+    }
+
     @Test func oneOfRejectsAmbiguousValues() {
         expectValidationThrow { try JSONSchema.oneOf([.number(), .integer()]).validate(1) }
     }

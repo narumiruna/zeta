@@ -40,14 +40,14 @@ public enum CredentialResolver {
         environment: [String: String],
         variables: [String]
     ) -> ResolvedAuthentication? {
-        if let explicit, !explicit.isEmpty {
+        if let explicit, hasContent(explicit) {
             return ResolvedAuthentication(apiKey: explicit, source: "explicit")
         }
-        if let stored, !stored.isEmpty {
+        if let stored, hasContent(stored) {
             return ResolvedAuthentication(apiKey: stored, source: "stored")
         }
         for variable in variables {
-            if let value = environment[variable], !value.isEmpty {
+            if let value = environment[variable], hasContent(value) {
                 return ResolvedAuthentication(apiKey: value, source: variable)
             }
         }
@@ -77,13 +77,13 @@ public enum CredentialResolver {
         }
         let data = try Data(contentsOf: URL(fileURLWithPath: credentialPath))
         let object = try JSONDecoder().decode(GoogleCredentialFile.self, from: data)
-        if let token = object.accessToken, !token.isEmpty {
+        if let token = object.accessToken, hasContent(token) {
             return ResolvedAuthentication(
                 bearerToken: token,
                 source: credentialPath
             )
         }
-        if let refresh = object.refreshToken, !refresh.isEmpty {
+        if let refresh = object.refreshToken, hasContent(refresh) {
             return ResolvedAuthentication(
                 headers: [
                     "x-zeta-google-refresh-token": refresh,
@@ -95,8 +95,8 @@ public enum CredentialResolver {
         }
         if let email = object.clientEmail,
             let key = object.privateKey,
-            !email.isEmpty,
-            !key.isEmpty
+            hasContent(email),
+            hasContent(key)
         {
             return ResolvedAuthentication(
                 headers: [
@@ -161,23 +161,31 @@ public enum CredentialResolver {
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) -> AWSCredential? {
         if let bearer = environment["AWS_BEARER_TOKEN_BEDROCK"],
-            !bearer.isEmpty
+            hasContent(bearer)
         {
             return AWSCredential(bearerToken: bearer)
         }
         guard let access = environment["AWS_ACCESS_KEY_ID"],
             let secret = environment["AWS_SECRET_ACCESS_KEY"],
-            !access.isEmpty,
-            !secret.isEmpty
+            hasContent(access),
+            hasContent(secret)
         else {
             return nil
+        }
+        let sessionToken = environment["AWS_SESSION_TOKEN"].flatMap {
+            hasContent($0) ? $0 : nil
         }
         return AWSCredential(
             accessKeyID: access,
             secretAccessKey: secret,
-            sessionToken: environment["AWS_SESSION_TOKEN"]
+            sessionToken: sessionToken
         )
     }
+
+    private static func hasContent(_ value: String) -> Bool {
+        !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
     private static func formEncoded(_ values: [String: String]) -> Data {
         let allowed = CharacterSet.alphanumerics.union(
             CharacterSet(charactersIn: "-._~")

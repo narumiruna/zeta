@@ -136,14 +136,21 @@ public actor SessionManager {
     public func append(_ entry: SessionEntry) throws -> SessionEntry {
         guard byID[entry.base.id] == nil else { throw SessionError.duplicateID(entry.base.id) }
         if let parent = entry.base.parentId, byID[parent] == nil { throw SessionError.missingParent(parent) }
+
+        let materialized: Bool
+        if physicallyCreated {
+            try appendRecord(entry)
+            materialized = false
+        } else if case .message(_, .assistant) = entry {
+            materialized = try ensureFileAndAppendPending(entry)
+        } else {
+            materialized = false
+        }
+
         entries.append(entry)
         byID[entry.base.id] = entry
         leafID = entry.base.id
-        if physicallyCreated {
-            try appendRecord(entry)
-        } else if case .message(_, .assistant) = entry {
-            try ensureFileAndAppendPending()
-        }
+        if materialized { physicallyCreated = true }
         return entry
     }
 
@@ -256,27 +263,35 @@ public actor SessionManager {
         return output
     }
 
-    private func ensureFileAndAppendPending() throws {
-        guard let file, !physicallyCreated else { return }
+    private func ensureFileAndAppendPending(_ pendingEntry: SessionEntry) throws -> Bool {
+        guard let file, !physicallyCreated else { return false }
         try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try rewriteAll()
-        physicallyCreated = true
+        try rewriteAll(appending: pendingEntry)
+        return true
     }
 
-    private func rewriteAll() throws {
+    private func rewriteAll(appending pendingEntry: SessionEntry? = nil) throws {
         guard let file else { return }
         var data = try Self.line(header)
         for entry in entries { data.append(try Self.line(entry)) }
+        if let pendingEntry { data.append(try Self.line(pendingEntry)) }
         try data.write(to: file, options: .atomic)
     }
 
     private func appendRecord(_ entry: SessionEntry) throws {
         guard let file else { return }
+        let record = try Self.line(entry)
         let handle = try FileHandle(forWritingTo: file)
         defer { try? handle.close() }
-        try handle.seekToEnd()
-        try handle.write(contentsOf: Self.line(entry))
-        try handle.synchronize()
+        let originalLength = try handle.seekToEnd()
+        do {
+            try handle.write(contentsOf: record)
+            try handle.synchronize()
+        } catch {
+            try? handle.truncate(atOffset: originalLength)
+            try? handle.synchronize()
+            throw error
+        }
     }
 
     private static func line<T: Encodable>(_ value: T) throws -> Data {

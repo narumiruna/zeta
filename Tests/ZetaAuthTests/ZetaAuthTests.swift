@@ -48,6 +48,17 @@ final class ZetaAuthTests: XCTestCase {
             )?.source,
             "explicit"
         )
+        let laterEnvironmentKey = CredentialResolver.apiKey(
+            explicit: " \n",
+            stored: "\t",
+            environment: [
+                "EMPTY_KEY": "  ",
+                "VALID_KEY": "environment",
+            ],
+            variables: ["EMPTY_KEY", "VALID_KEY"]
+        )
+        XCTAssertEqual(laterEnvironmentKey?.apiKey, "environment")
+        XCTAssertEqual(laterEnvironmentKey?.source, "VALID_KEY")
         XCTAssertEqual(
             CredentialResolver.aws(environment: [
                 "AWS_ACCESS_KEY_ID": "access",
@@ -67,6 +78,14 @@ final class ZetaAuthTests: XCTestCase {
                 "AWS_SECRET_ACCESS_KEY": "ignored-secret",
             ])?.authentication,
             .bearer(token: "bedrock-token")
+        )
+        XCTAssertEqual(
+            CredentialResolver.aws(environment: [
+                "AWS_BEARER_TOKEN_BEDROCK": " \n",
+                "AWS_ACCESS_KEY_ID": "access",
+                "AWS_SECRET_ACCESS_KEY": "secret",
+            ])?.authentication,
+            .signatureV4
         )
 
         let server = OAuthCallbackServer(expectedState: "state")
