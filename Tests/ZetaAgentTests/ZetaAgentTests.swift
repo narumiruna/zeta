@@ -289,6 +289,42 @@ final class ZetaAgentTests: XCTestCase {
         XCTAssertEqual(state.messages.count, 3)
     }
 
+    func testRetryDelayUsesConfiguredMaximumAndClampsOverflow() async {
+        let provider = FauxProvider()
+        let model = await provider.models[0]
+        let agent = Agent(state: AgentState(systemPrompt: "", model: model)) {
+            model, context, options in
+            await provider.stream(model: model, context: context, options: options)
+        }
+
+        await agent.configureRetry(
+            maximumRetries: 100,
+            baseDelayMilliseconds: Int.max,
+            maximumDelayMilliseconds: 25
+        )
+
+        let first = await agent.retryDelayMilliseconds(forAttempt: 1)
+        let distant = await agent.retryDelayMilliseconds(forAttempt: Int.max)
+        let maximum = await agent.retryMaximumDelayMilliseconds
+        XCTAssertEqual(first, 25)
+        XCTAssertEqual(distant, 25)
+        XCTAssertEqual(maximum, 25)
+
+        await agent.configureRetry(
+            maximumRetries: 3,
+            baseDelayMilliseconds: 10,
+            maximumDelayMilliseconds: 25
+        )
+        let firstExponential = await agent.retryDelayMilliseconds(forAttempt: 1)
+        let secondExponential = await agent.retryDelayMilliseconds(forAttempt: 2)
+        let thirdExponential = await agent.retryDelayMilliseconds(forAttempt: 3)
+        XCTAssertEqual([firstExponential, secondExponential, thirdExponential], [10, 20, 25])
+
+        await agent.configureRetry(maximumRetries: 1, baseDelayMilliseconds: 2)
+        let legacyMaximum = await agent.retryMaximumDelayMilliseconds
+        XCTAssertEqual(legacyMaximum, Int.max)
+    }
+
     func testProviderMessageTransformUsesModelChangedAfterAgentCreation() async throws {
         let source = Model(
             id: "claude",

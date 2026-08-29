@@ -728,6 +728,128 @@ Final outcome: Addressed by exporting a version 3 header and `SessionEntry` reco
 
 Evidence: Export regressions reopen the downloaded JSONL through session format detection and `SessionManager`.
 
+## Fifth-round inline feedback
+
+### `3885635397`
+
+Concern: Plugin tool schemas are discarded.
+
+Initial outcome: Actionable and not yet addressed.
+
+Final outcome: Addressed by strict plugin JSON Schema decoding for both published definitions and runtime argument validation.
+
+Evidence: Plugin regressions verify required arguments, coercion, rejection, and transactional failure for unsupported schemas.
+
+### `3885635400`
+
+Concern: Large SQLite forks execute synchronously on the cooperative actor executor.
+
+Initial outcome: Actionable and not yet addressed.
+
+Final outcome: Addressed by assigning the repository a dedicated serial storage executor that preserves one-at-a-time SQLite access outside the cooperative pool.
+
+Evidence: SQLite fork and responsiveness regressions pass with serialized transactions.
+
+### `3885635402`
+
+Concern: Normalized package directory names can collide across identifiers.
+
+Initial outcome: Actionable and not yet addressed.
+
+Final outcome: Addressed by collision-resistant identifier hashes, legacy path reuse, and duplicate-owner validation.
+
+Evidence: Package regressions verify colliding identifiers install and remove independently and malformed duplicate registries are rejected.
+
+### `3885635405`
+
+Concern: Cancelling a stream after deltas loses accumulated output.
+
+Initial outcome: Actionable and not yet addressed.
+
+Final outcome: Addressed by retaining the latest partial in `AssistantEventStream` and using it for the single aborted terminal event.
+
+Evidence: Provider cancellation regressions verify streamed text remains in the aborted assistant.
+
+### `3885635406`
+
+Concern: Codex WebSocket failures discard partial output.
+
+Initial outcome: Actionable and not yet addressed.
+
+Final outcome: Addressed by tracking start state and terminating with the reducer partial on post-start failure.
+
+Evidence: Codex regressions cover malformed and closed streams after text deltas.
+
+### `3885635408`
+
+Concern: The configured retry-delay ceiling is ignored.
+
+Initial outcome: Actionable and not yet addressed.
+
+Final outcome: Addressed by threading the setting into retry configuration and overflow-safe exponential clamping.
+
+Evidence: Agent and CLI regressions verify the maximum delay while preserving the existing configuration API.
+
+### `3885635411`
+
+Concern: Bedrock model IDs are URL-encoded twice.
+
+Initial outcome: Actionable and not yet addressed.
+
+Final outcome: Addressed by path-segment construction that encodes the raw model ID exactly once.
+
+Evidence: Bedrock request regressions cover colon-bearing catalog IDs.
+
+### `3885635413`
+
+Concern: Failed server creates publish unreachable runtime ownership.
+
+Initial outcome: Actionable and not yet addressed.
+
+Final outcome: Addressed by validating identity and obtaining the initial snapshot before publishing runtime or attachment state, with disposal on every failure.
+
+Evidence: Server regressions cover snapshot failure, identity mismatch, connection races, and rollback.
+
+### `3885635415`
+
+Concern: Dash-prefixed grep patterns are parsed as options.
+
+Initial outcome: Actionable and not yet addressed.
+
+Final outcome: Addressed by passing patterns through ripgrep's `--regexp` option.
+
+Evidence: Search-tool regressions find `--help`-style text through external and fallback paths.
+
+### `3885635416`
+
+Concern: Incomplete SSE records can grow without bound.
+
+Initial outcome: Actionable and not yet addressed.
+
+Final outcome: Addressed by a 16 MiB pending-record limit and linear boundary scanning.
+
+Evidence: SSE regressions verify oversize rejection before a delimiter and normal fragmented decoding.
+
+### `3885635418`
+
+Concern: Image generation ignores request timeout options.
+
+Initial outcome: Actionable and not yet addressed.
+
+Final outcome: Addressed by converting the requested duration to `URLRequest.timeoutInterval`.
+
+Evidence: Image-provider request regression verifies the configured interval.
+
+### `3885635420`
+
+Concern: Client convenience methods discard structured server failures.
+
+Initial outcome: Actionable and not yet addressed.
+
+Final outcome: Addressed by central failure-envelope mapping to `PiClientError.server` across list, create, attach, detach, and session commands.
+
+Evidence: Client regressions verify error code, message, and details are preserved.
+
 ## Check feedback
 
 ### Repository gates

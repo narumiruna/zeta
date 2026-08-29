@@ -59,6 +59,27 @@ final class ZetaToolsTests: XCTestCase {
         } catch FileToolError.timedOut {}
     }
 
+    func testSearchTreatsDashPrefixedPatternAsExpression() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try Data("--zeta-dash-pattern\nother\n".utf8)
+            .write(to: directory.appendingPathComponent("file.txt"))
+
+        for useExternalCommands in [true, false] {
+            let search = SearchTools(
+                workingDirectory: directory,
+                useExternalCommands: useExternalCommands
+            )
+            let matches = try await search.grep(pattern: "--zeta-dash-pattern")
+            XCTAssertEqual(matches.count, 1)
+            XCTAssertTrue(matches[0].path.hasSuffix("file.txt"))
+            XCTAssertEqual(matches[0].line, 1)
+            XCTAssertEqual(matches[0].text, "--zeta-dash-pattern")
+        }
+    }
+
     func testSearchFallbackWorksWithoutExternalCommands() async throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString)

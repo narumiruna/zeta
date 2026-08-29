@@ -170,6 +170,61 @@ final class ZetaClientTests: XCTestCase {
         try await exclusive.dispose()
     }
 
+    func testConvenienceRequestsPreserveStructuredServerFailures() async throws {
+        let box = FailureResponseTransportBox()
+        let client = try PiClient { handlers in
+            let transport = FailureResponseTransport(handlers: handlers)
+            await box.set(transport)
+            return transport
+        }
+        try await client.connect()
+        let transport = await box.wait()
+        let expected = try ProtocolErrorValue(
+            code: .busy, message: "Synthetic busy response", details: ["retryAfter": 7])
+        await transport.setFailures([.list, .create, .attach], error: expected)
+
+        do {
+            _ = try await client.listSessions()
+            XCTFail("Expected list failure")
+        } catch PiClientError.server(let error) {
+            XCTAssertEqual(error, expected)
+        } catch {
+            XCTFail("Expected PiClientError.server, got \(error)")
+        }
+
+        do {
+            _ = try await client.createSession(try CreateCommandOptions())
+            XCTFail("Expected create failure")
+        } catch PiClientError.server(let error) {
+            XCTAssertEqual(error, expected)
+        } catch {
+            XCTFail("Expected PiClientError.server, got \(error)")
+        }
+
+        do {
+            _ = try await client.acquireSession("session", mode: .exclusive)
+            XCTFail("Expected attach failure")
+        } catch PiClientError.server(let error) {
+            XCTAssertEqual(error, expected)
+        } catch {
+            XCTFail("Expected PiClientError.server, got \(error)")
+        }
+
+        await transport.setFailures([.detach], error: expected)
+        let lease = try await client.acquireSession("session", mode: .exclusive)
+        do {
+            try await lease.detach()
+            XCTFail("Expected detach failure")
+        } catch PiClientError.server(let error) {
+            XCTAssertEqual(error, expected)
+        } catch {
+            XCTFail("Expected PiClientError.server, got \(error)")
+        }
+        _ = try await lease.abort()
+        await transport.setFailures([], error: expected)
+        try await lease.detach()
+    }
+
     func testRequestCancellationReturnsBeforeResponseAndRacesResumeOnce() async throws {
         let box = ControlledTransportBox()
         let client = try PiClient { handlers in
@@ -358,6 +413,78 @@ private actor ControlledTransport: ByteTransport {
     }
 
     func close() {}
+
+    private func makeSnapshot(id: String) throws -> SessionSnapshot {
+        try SessionSnapshot(
+            id: id, cwd: "/tmp", createdAt: 0, updatedAt: 0, phase: .idle,
+            model: ModelReference(provider: "test", id: "model"), thinkingLevel: .off, attached: true,
+            locked: false, revision: 0, transcript: [], queuedSteer: [], queuedSteerCount: 0)
+    }
+}
+
+private actor FailureResponseTransportBox {
+    private var value: FailureResponseTransport?
+    private var waiters: [CheckedContinuation<FailureResponseTransport, Never>] = []
+
+    func set(_ value: FailureResponseTransport) {
+        self.value = value
+        waiters.forEach { $0.resume(returning: value) }
+        waiters.removeAll()
+    }
+
+    func wait() async -> FailureResponseTransport {
+        if let value { return value }
+        return await withCheckedContinuation { waiters.append($0) }
+    }
+}
+
+private actor FailureResponseTransport: ByteTransport {
+    private let handlers: ByteTransportHandlers
+    private let decoder = try! ClientMessageDecoder()
+    private var failedCommands: Set<String> = []
+    private var failure = try! ProtocolErrorValue(code: .internalError, message: "Synthetic failure")
+
+    init(handlers: ByteTransportHandlers) { self.handlers = handlers }
+
+    func setFailures(_ commands: [CommandName], error: ProtocolErrorValue) {
+        failedCommands = Set(commands.map(\.rawValue))
+        failure = error
+    }
+
+    func send(_ bytes: Data) throws {
+        for message in try decoder.push(bytes) {
+            switch message {
+            case .hello:
+                let snapshot = try ServerSnapshot(serverID: "server", revision: 0, sessions: [], models: [])
+                handlers.onData(
+                    try encodeServerMessage(.hello(try ServerHello(connectionID: "connection", snapshot: snapshot))))
+            case .request(let request):
+                let response: ResponseEnvelope
+                if failedCommands.contains(request.request.name.rawValue) {
+                    response = .failure(id: request.id, error: failure)
+                } else {
+                    response = .success(id: request.id, result: try result(for: request.request))
+                }
+                handlers.onData(try encodeServerMessage(.response(response)))
+            }
+        }
+    }
+
+    func close() {}
+
+    private func result(for command: Command) throws -> CommandResult {
+        switch command {
+        case .list: .list([])
+        case .create: .create(try makeSnapshot(id: "created"))
+        case .attach(let id): .attach(try makeSnapshot(id: id))
+        case .detach(let id): .detach(sessionID: id)
+        case .prompt(let id, _): .prompt(try makeSnapshot(id: id))
+        case .steer(let id, _): .steer(try makeSnapshot(id: id))
+        case .abort(let id): .abort(try makeSnapshot(id: id))
+        case .setModel(let id, _): .setModel(try makeSnapshot(id: id))
+        case .setThinking(let id, _): .setThinking(try makeSnapshot(id: id))
+        }
+    }
 
     private func makeSnapshot(id: String) throws -> SessionSnapshot {
         try SessionSnapshot(

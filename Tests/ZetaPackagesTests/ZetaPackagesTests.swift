@@ -40,6 +40,98 @@ final class ZetaPackagesTests: XCTestCase {
         XCTAssertEqual(secondList.count, 1)
     }
 
+    func testCollidingLegacyNamesUseDistinctDirectoriesAndRemoveIndependently() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let dashedSource = root.appendingPathComponent("source-name")
+        let underscoredSource = root.appendingPathComponent("source_name")
+        let installed = root.appendingPathComponent("installed")
+        try createGitPackage(at: dashedSource, marker: "dashed")
+        try createGitPackage(at: underscoredSource, marker: "underscored")
+        let dashed = PackageSource.git(url: dashedSource.path, reference: nil)
+        let underscored = PackageSource.git(url: underscoredSource.path, reference: nil)
+        let manager = try ResourcePackageManager(root: installed)
+
+        try await manager.install(dashed)
+        try await manager.install(underscored)
+
+        let packages = await manager.list()
+        XCTAssertEqual(packages.count, 2)
+        XCTAssertEqual(Set(packages.map(\.directory)).count, 2)
+        let underscoredRecord = try XCTUnwrap(
+            packages.first { $0.source == underscored.identifier }
+        )
+        let underscoredDirectory = installed.appendingPathComponent(
+            underscoredRecord.directory
+        )
+        try await manager.remove(dashed.identifier)
+
+        let remaining = await manager.list()
+        XCTAssertEqual(remaining.map(\.source), [underscored.identifier])
+        XCTAssertEqual(
+            try Data(contentsOf: underscoredDirectory.appendingPathComponent("marker.txt")),
+            Data("underscored".utf8)
+        )
+    }
+
+    func testExistingRegistryDirectoryIsReusedDuringMigrationCompatibleUpdate() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = root.appendingPathComponent("source")
+        let installed = root.appendingPathComponent("installed")
+        let legacyDirectory = installed.appendingPathComponent("legacy-directory")
+        try createGitPackage(at: source, marker: "new")
+        try FileManager.default.createDirectory(at: legacyDirectory, withIntermediateDirectories: true)
+        try writePackage(at: legacyDirectory, marker: "old")
+        let packageSource = PackageSource.git(url: source.path, reference: nil)
+        let record = InstalledPackage(
+            source: packageSource.identifier,
+            directory: legacyDirectory.lastPathComponent,
+            pinned: false,
+            installedAt: "2026-01-01T00:00:00Z"
+        )
+        try JSONEncoder().encode([packageSource.identifier: record]).write(
+            to: installed.appendingPathComponent("packages.json")
+        )
+        let manager = try ResourcePackageManager(root: installed)
+
+        try await manager.install(packageSource)
+
+        let updated = await manager.list()
+        XCTAssertEqual(updated.first?.directory, "legacy-directory")
+        XCTAssertEqual(
+            try Data(contentsOf: legacyDirectory.appendingPathComponent("marker.txt")),
+            Data("new".utf8)
+        )
+    }
+
+    func testDuplicateRegistryDirectoryIsRejected() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let first = InstalledPackage(
+            source: "npm:first",
+            directory: "shared",
+            pinned: false,
+            installedAt: "2026-01-01T00:00:00Z"
+        )
+        let second = InstalledPackage(
+            source: "npm:second",
+            directory: "SHARED",
+            pinned: false,
+            installedAt: "2026-01-01T00:00:00Z"
+        )
+        try JSONEncoder().encode([first.source: first, second.source: second]).write(
+            to: root.appendingPathComponent("packages.json")
+        )
+
+        XCTAssertThrowsError(try ResourcePackageManager(root: root)) { error in
+            guard case PackageInternalError.duplicateRegistryDirectory = error else {
+                return XCTFail("Expected duplicate registry directory, got \(error)")
+            }
+        }
+    }
+
     func testReplacementRestoresPreviousPackageWhenIndexPersistenceFails() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }

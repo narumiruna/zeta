@@ -5,8 +5,14 @@ import ZetaCore
 import ZetaPluginAPI
 
 actor CLIPluginRuntime {
+    private struct ToolBinding: Sendable {
+        let registration: PluginRegistration
+        let host: PluginHost
+        let schema: PluginToolSchema?
+    }
+
     private var hosts: [PluginHost] = []
-    private var toolBindings: [(PluginRegistration, PluginHost)] = []
+    private var toolBindings: [ToolBinding] = []
 
     func load(
         agentDirectory: URL,
@@ -40,10 +46,21 @@ actor CLIPluginRuntime {
                             unsupported.map { $0.kind.rawValue }
                         )
                     }
-                    hosts.append(host)
-                    for registration in registrations {
-                        toolBindings.append((registration, host))
+                    let bindings: [ToolBinding]
+                    do {
+                        bindings = try registrations.map { registration in
+                            ToolBinding(
+                                registration: registration,
+                                host: host,
+                                schema: try registration.schema.map(PluginToolSchema.init(data:))
+                            )
+                        }
+                    } catch {
+                        await host.stop()
+                        throw error
                     }
+                    hosts.append(host)
+                    toolBindings.append(contentsOf: bindings)
                 } catch {
                     diagnostics.append("Swift plugin \(manifestURL.path): \(error.localizedDescription)")
                 }
@@ -53,18 +70,19 @@ actor CLIPluginRuntime {
     }
 
     func tools() -> [AgentTool] {
-        toolBindings.map { registration, host in
+        toolBindings.map { binding in
             AgentTool(
                 definition: ToolDefinition(
-                    name: registration.name,
-                    description: "Swift plugin tool \(registration.name)",
-                    parameters: [:]
+                    name: binding.registration.name,
+                    description: "Swift plugin tool \(binding.registration.name)",
+                    parameters: binding.schema?.definition ?? [:]
                 ),
-                label: registration.name
+                label: binding.registration.name,
+                parameterSchema: binding.schema?.validator
             ) { _, arguments, _ in
                 let payload = OrderedJSON.encode(arguments)
-                let response = try await host.request(
-                    method: registration.callback,
+                let response = try await binding.host.request(
+                    method: binding.registration.callback,
                     payload: payload
                 )
                 if let value = try? OrderedJSON.decode(response),

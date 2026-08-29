@@ -48,6 +48,13 @@ public struct OpenRouterImageProvider: ImageProvider {
                 url: model.baseURL.appendingPathComponent("chat/completions")
             )
             request.httpMethod = "POST"
+            if let timeout = options.timeout {
+                let components = timeout.components
+                request.timeoutInterval = max(
+                    0.001,
+                    Double(components.seconds) + Double(components.attoseconds) / 1e18
+                )
+            }
             request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
             let content: [JSONValue] = input.compactMap { block in

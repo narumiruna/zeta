@@ -182,14 +182,23 @@ public actor PiServer {
         case .list: return .list(try await service.listSessions())
         case .create(let options):
             let runtime = try await service.createSession(options)
-            guard runtimes[runtime.id] == nil else {
+            do {
+                let snapshot = try await runtime.snapshot(attached: true)
+                guard snapshot.id == runtime.id else {
+                    throw PiServerFailure.invalidRequest("Runtime session id mismatch")
+                }
+                guard clients[connectionID]?.ready == true else {
+                    throw PiServerFailure.invalidRequest("Connection closed while creating session")
+                }
+                guard runtimes[runtime.id] == nil else { throw PiServerFailure.busy }
+                runtimes[runtime.id] = RuntimeState(runtime: runtime, connections: [connectionID])
+                clients[connectionID]?.attached.insert(runtime.id)
+                await broadcastServerSnapshot()
+                return .create(snapshot)
+            } catch {
                 await runtime.dispose()
-                throw PiServerFailure.busy
+                throw error
             }
-            runtimes[runtime.id] = RuntimeState(runtime: runtime, connections: [connectionID])
-            clients[connectionID]?.attached.insert(runtime.id)
-            await broadcastServerSnapshot()
-            return .create(try await runtime.snapshot(attached: true))
         case .attach(let id):
             let runtime = try await openRuntime(id)
             runtimes[id]?.connections.insert(connectionID)

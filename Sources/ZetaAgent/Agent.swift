@@ -137,6 +137,7 @@ public actor Agent {
     public var followUpMode: QueueDeliveryMode
     public var maximumRetries = 0
     public var retryBaseDelayMilliseconds = 2_000
+    public var retryMaximumDelayMilliseconds = Int.max
     private var retryCancelled = false
     public var beforeToolCall:
         (@Sendable (ToolCall, JSONValue) async throws -> (blocked: Bool, reason: String?, terminate: Bool)?)?
@@ -233,8 +234,31 @@ public actor Agent {
         followUps.removeAll()
     }
     public func configureRetry(maximumRetries: Int, baseDelayMilliseconds: Int) {
+        configureRetry(
+            maximumRetries: maximumRetries,
+            baseDelayMilliseconds: baseDelayMilliseconds,
+            maximumDelayMilliseconds: Int.max
+        )
+    }
+
+    public func configureRetry(
+        maximumRetries: Int,
+        baseDelayMilliseconds: Int,
+        maximumDelayMilliseconds: Int
+    ) {
         self.maximumRetries = max(0, maximumRetries)
         retryBaseDelayMilliseconds = max(0, baseDelayMilliseconds)
+        retryMaximumDelayMilliseconds = max(0, maximumDelayMilliseconds)
+    }
+
+    func retryDelayMilliseconds(forAttempt attempt: Int) -> Int {
+        let exponent = min(max(1, attempt) - 1, Int.bitWidth - 2)
+        let multiplier = 1 << exponent
+        let product = retryBaseDelayMilliseconds.multipliedReportingOverflow(
+            by: multiplier
+        )
+        let exponentialDelay = product.overflow ? Int.max : product.partialValue
+        return min(exponentialDelay, retryMaximumDelayMilliseconds)
     }
     public func abortRetry() { retryCancelled = true }
     public func abort() {
@@ -426,8 +450,7 @@ public actor Agent {
             {
                 retryAttempt += 1
                 retrying = true
-                let multiplier = 1 << min(retryAttempt - 1, 20)
-                let delay = retryBaseDelayMilliseconds * multiplier
+                let delay = retryDelayMilliseconds(forAttempt: retryAttempt)
                 try? await Task.sleep(for: .milliseconds(delay))
                 continueTurns = !Task.isCancelled && !retryCancelled
                 continue

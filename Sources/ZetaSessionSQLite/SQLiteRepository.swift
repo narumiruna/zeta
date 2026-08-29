@@ -86,10 +86,15 @@ public struct WriterLease: Sendable, Equatable {
 }
 
 public actor SQLiteSessionRepository {
+    private let storageExecutor = SQLiteStorageExecutor()
     nonisolated(unsafe) private var database: OpaquePointer?
     public let url: URL
     public let leaseTTL: Int64
     private var searchInitialized = false
+
+    nonisolated public var unownedExecutor: UnownedSerialExecutor {
+        storageExecutor.asUnownedSerialExecutor()
+    }
 
     public init(url: URL, leaseTTL: Int64 = 30_000) throws {
         self.url = url
@@ -109,7 +114,7 @@ public actor SQLiteSessionRepository {
             try Self.execute(handle, "PRAGMA journal_mode=WAL;")
             try Self.execute(handle, "PRAGMA synchronous=FULL;")
             try Self.execute(handle, "PRAGMA busy_timeout=5000;")
-            try Self.execute(handle, Self.schema)
+            try Self.execute(handle, SQLiteRepositorySchema.schema)
             try Self.verifyCapabilities(handle)
         } catch {
             sqlite3_close(handle)
@@ -566,13 +571,13 @@ public actor SQLiteSessionRepository {
         try transaction {
             let needsRebuild = try !Self.searchIndexExists(database)
             do {
-                try Self.execute(database, Self.searchSchema)
+                try Self.execute(database, SQLiteRepositorySchema.searchSchema)
             } catch SQLiteRepositoryError.execute(let message)
                 where message.localizedCaseInsensitiveContains("tokenizer")
             {
-                try Self.execute(database, Self.fallbackSearchSchema)
+                try Self.execute(database, SQLiteRepositorySchema.fallbackSearchSchema)
             }
-            if needsRebuild { try Self.execute(database, Self.searchRebuild) }
+            if needsRebuild { try Self.execute(database, SQLiteRepositorySchema.searchRebuild) }
         }
         searchInitialized = true
     }
@@ -593,6 +598,10 @@ public actor SQLiteSessionRepository {
 
     public func integrityCheck() throws -> String {
         try query("PRAGMA integrity_check", []) { Self.text($0, 0)! }.first ?? ""
+    }
+
+    func isOnDedicatedStorageExecutor() -> Bool {
+        storageExecutor.isCurrent
     }
 
     private func mainLeaf(sessionID: String) throws -> String? {
@@ -945,52 +954,6 @@ public actor SQLiteSessionRepository {
         return sqlite3_step(statement) == SQLITE_ROW
     }
 
-    private static let schema = """
-        CREATE TABLE IF NOT EXISTS migrations(id TEXT PRIMARY KEY,applied_at TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY,created_at INTEGER NOT NULL,cwd TEXT NOT NULL,parent_session_id TEXT NULL,metadata TEXT NULL) WITHOUT ROWID;
-        CREATE INDEX IF NOT EXISTS idx_sessions_created_at ON sessions(created_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_sessions_cwd_created_at ON sessions(cwd,created_at DESC);
-        CREATE TABLE IF NOT EXISTS entries(session_id TEXT NOT NULL,seq INTEGER NOT NULL,id TEXT NOT NULL,parent_id TEXT NULL,type TEXT NOT NULL,timestamp INTEGER NOT NULL,payload TEXT NOT NULL,PRIMARY KEY(session_id,id),UNIQUE(session_id,seq));
-        CREATE INDEX IF NOT EXISTS idx_entries_session_parent ON entries(session_id,parent_id);
-        CREATE INDEX IF NOT EXISTS idx_entries_session_type_seq ON entries(session_id,type,seq);
-        CREATE TABLE IF NOT EXISTS session_sequences(session_id TEXT PRIMARY KEY,next_seq INTEGER NOT NULL) WITHOUT ROWID;
-        CREATE TABLE IF NOT EXISTS session_stats(session_id TEXT PRIMARY KEY,message_count INTEGER NOT NULL,cached_tokens REAL NOT NULL,uncached_tokens REAL NOT NULL,total_tokens REAL NOT NULL,cost_total REAL NOT NULL) WITHOUT ROWID;
-        CREATE TABLE IF NOT EXISTS branch_entries(session_id TEXT NOT NULL,branch_id TEXT NOT NULL,entry_id TEXT NOT NULL,entry_seq INTEGER NOT NULL,entry_type TEXT NULL,custom_type TEXT NULL,PRIMARY KEY(session_id,branch_id,entry_id)) WITHOUT ROWID;
-        CREATE INDEX IF NOT EXISTS idx_branch_entries_session_branch_seq ON branch_entries(session_id,branch_id,entry_seq);
-        CREATE INDEX IF NOT EXISTS idx_branch_entries_session_entry ON branch_entries(session_id,entry_id,branch_id,entry_seq);
-        CREATE INDEX IF NOT EXISTS idx_branch_entries_session_branch_type_seq ON branch_entries(session_id,branch_id,entry_type,entry_seq);
-        CREATE INDEX IF NOT EXISTS idx_branch_entries_session_branch_custom_seq ON branch_entries(session_id,branch_id,custom_type,entry_seq);
-        CREATE TABLE IF NOT EXISTS lanes(session_id TEXT NOT NULL,lane TEXT NOT NULL,leaf_id TEXT NULL,open_operation_id TEXT NULL,PRIMARY KEY(session_id,lane)) WITHOUT ROWID;
-        CREATE TABLE IF NOT EXISTS records(session_id TEXT NOT NULL,seq INTEGER NOT NULL,id TEXT NOT NULL,lane TEXT NOT NULL,run_id TEXT NULL,type TEXT NOT NULL,op_kind TEXT NULL,timestamp INTEGER NOT NULL,payload TEXT NOT NULL,PRIMARY KEY(session_id,id),UNIQUE(session_id,seq)) WITHOUT ROWID;
-        CREATE INDEX IF NOT EXISTS idx_records_session_lane_seq ON records(session_id,lane,seq);
-        CREATE INDEX IF NOT EXISTS idx_records_session_type_seq ON records(session_id,type,seq);
-        CREATE INDEX IF NOT EXISTS idx_records_session_type_op_kind_seq ON records(session_id,type,op_kind,seq);
-        CREATE INDEX IF NOT EXISTS idx_records_session_lane_type_seq ON records(session_id,lane,type,seq);
-        CREATE INDEX IF NOT EXISTS idx_records_session_lane_type_op_kind_seq ON records(session_id,lane,type,op_kind,seq);
-        CREATE INDEX IF NOT EXISTS idx_records_session_run_id_seq ON records(session_id,run_id,seq);
-        CREATE TABLE IF NOT EXISTS lane_moves(session_id TEXT NOT NULL,seq INTEGER NOT NULL,lane TEXT NOT NULL,leaf_id TEXT NULL,PRIMARY KEY(session_id,seq)) WITHOUT ROWID;
-        CREATE TABLE IF NOT EXISTS facts(session_id TEXT NOT NULL,seq INTEGER NOT NULL,kind TEXT NOT NULL,key TEXT NULL,value TEXT NULL,PRIMARY KEY(session_id,seq)) WITHOUT ROWID;
-        CREATE INDEX IF NOT EXISTS idx_facts_session_kind_key_seq ON facts(session_id,kind,key,seq);
-        CREATE TABLE IF NOT EXISTS branch_tips(session_id TEXT NOT NULL,branch_id TEXT NOT NULL,tip_id TEXT NOT NULL,PRIMARY KEY(session_id,tip_id),UNIQUE(session_id,branch_id)) WITHOUT ROWID;
-        CREATE TABLE IF NOT EXISTS writer_leases(session_id TEXT PRIMARY KEY,owner_id TEXT NOT NULL,fence INTEGER NOT NULL,expires_at_ms INTEGER NOT NULL) WITHOUT ROWID;
-        INSERT OR IGNORE INTO migrations(id,applied_at) VALUES('001_initial.sql',strftime('%Y-%m-%dT%H:%M:%fZ','now'));
-        """
-
-    private static let searchSchema = """
-        CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts USING fts5(payload,content='entries',content_rowid='rowid',tokenize='trigram remove_diacritics 1');
-        CREATE TRIGGER IF NOT EXISTS entries_fts_ai AFTER INSERT ON entries BEGIN INSERT INTO entries_fts(rowid,payload) VALUES(new.rowid,new.payload); END;
-        CREATE TRIGGER IF NOT EXISTS entries_fts_ad AFTER DELETE ON entries BEGIN INSERT INTO entries_fts(entries_fts,rowid,payload) VALUES('delete',old.rowid,old.payload); END;
-        CREATE TRIGGER IF NOT EXISTS entries_fts_au AFTER UPDATE OF payload ON entries BEGIN INSERT INTO entries_fts(entries_fts,rowid,payload) VALUES('delete',old.rowid,old.payload); INSERT INTO entries_fts(rowid,payload) VALUES(new.rowid,new.payload); END;
-        """
-
-    private static let fallbackSearchSchema = """
-        CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts USING fts5(payload,content='entries',content_rowid='rowid',tokenize='unicode61 remove_diacritics 2');
-        CREATE TRIGGER IF NOT EXISTS entries_fts_ai AFTER INSERT ON entries BEGIN INSERT INTO entries_fts(rowid,payload) VALUES(new.rowid,new.payload); END;
-        CREATE TRIGGER IF NOT EXISTS entries_fts_ad AFTER DELETE ON entries BEGIN INSERT INTO entries_fts(entries_fts,rowid,payload) VALUES('delete',old.rowid,old.payload); END;
-        CREATE TRIGGER IF NOT EXISTS entries_fts_au AFTER UPDATE OF payload ON entries BEGIN INSERT INTO entries_fts(entries_fts,rowid,payload) VALUES('delete',old.rowid,old.payload); INSERT INTO entries_fts(rowid,payload) VALUES(new.rowid,new.payload); END;
-        """
-
-    private static let searchRebuild = "INSERT INTO entries_fts(entries_fts) VALUES('rebuild');"
 }
 
 private let sqliteTransient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)

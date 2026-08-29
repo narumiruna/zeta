@@ -5,6 +5,34 @@ import ZetaCore
 @testable import ZetaSessionSQLite
 
 final class ZetaSessionSQLiteTests: XCTestCase {
+    func testDatabaseOperationsUseDedicatedSerialStorageExecutor() async throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("\(UUID().uuidString).sqlite")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let repository = try SQLiteSessionRepository(url: url)
+
+        let isDedicated = await repository.isOnDedicatedStorageExecutor()
+        XCTAssertTrue(isDedicated)
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            for index in 0..<20 {
+                group.addTask {
+                    try await repository.createSession(
+                        SQLiteSessionMetadata(
+                            id: "session-\(index)",
+                            createdAt: Int64(index),
+                            cwd: "/tmp"
+                        )
+                    )
+                }
+            }
+            try await group.waitForAll()
+        }
+        let sessions = try await repository.listSessions()
+        XCTAssertEqual(sessions.count, 20)
+        let integrity = try await repository.integrityCheck()
+        XCTAssertEqual(integrity, "ok")
+    }
+
     func testSchemaLeaseEntriesAndSearch() async throws {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("\(UUID().uuidString).sqlite")
         defer { try? FileManager.default.removeItem(at: url) }

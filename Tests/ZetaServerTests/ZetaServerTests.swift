@@ -186,6 +186,93 @@ final class ZetaServerTests: XCTestCase {
         await server.close()
     }
 
+    func testCreateSnapshotFailureDisposesWithoutPublishingOrRetainingRuntime() async throws {
+        let tracker = RuntimeTracker()
+        let service = FailingCreateService(tracker: tracker)
+        let server = try PiServer(serverID: "server", service: service)
+        let connection = TestConnection()
+        try await server.accept(connection)
+        await server.receive(try encodeClientMessage(.hello(try ClientHello())), connectionID: connection.id)
+        try await waitUntil { await connection.count == 1 }
+
+        let create = try RequestEnvelope(id: "create", request: .create(try CreateCommandOptions()))
+        await server.receive(try encodeClientMessage(.request(create)), connectionID: connection.id)
+        try await waitUntil { await connection.count >= 2 }
+
+        var messages = try await decodedMessages(connection)
+        XCTAssertFalse(
+            messages.contains {
+                guard case .event(.serverSnapshot) = $0 else { return false }
+                return true
+            })
+        XCTAssertTrue(
+            messages.contains {
+                guard case .response(.failure(id: "create", error: _)) = $0 else { return false }
+                return true
+            })
+        let disposeCount = await tracker.disposeCount
+        XCTAssertEqual(disposeCount, 1)
+
+        let attach = try RequestEnvelope(id: "attach", request: .attach(sessionID: "created"))
+        await server.receive(try encodeClientMessage(.request(attach)), connectionID: connection.id)
+        try await waitUntil { await connection.count >= 3 }
+        messages = try await decodedMessages(connection)
+        XCTAssertTrue(
+            messages.contains {
+                guard case .response(.success(id: "attach", result: .attach)) = $0 else { return false }
+                return true
+            })
+        let openCount = await service.openCount
+        XCTAssertEqual(openCount, 1)
+        await server.close()
+    }
+
+    func testConcurrentCreateDoesNotPublishRuntimeBeforeItsInitialSnapshot() async throws {
+        let gate = SnapshotGate()
+        let firstTracker = RuntimeTracker()
+        let secondTracker = RuntimeTracker()
+        let service = RacingCreateService(gate: gate, firstTracker: firstTracker, secondTracker: secondTracker)
+        let server = try PiServer(serverID: "server", service: service)
+        let connection = TestConnection()
+        try await server.accept(connection)
+        await server.receive(try encodeClientMessage(.hello(try ClientHello())), connectionID: connection.id)
+        try await waitUntil { await connection.count == 1 }
+
+        let first = try RequestEnvelope(id: "create-first", request: .create(try CreateCommandOptions()))
+        await server.receive(try encodeClientMessage(.request(first)), connectionID: connection.id)
+        try await waitUntil { await firstTracker.snapshotCount == 1 }
+        let countWhileFirstSnapshotPending = await connection.count
+        XCTAssertEqual(countWhileFirstSnapshotPending, 1)
+
+        let second = try RequestEnvelope(id: "create-second", request: .create(try CreateCommandOptions()))
+        await server.receive(try encodeClientMessage(.request(second)), connectionID: connection.id)
+        try await waitUntil { await connection.count >= 3 }
+        var messages = try await decodedMessages(connection)
+        XCTAssertTrue(
+            messages.contains {
+                guard case .response(.success(id: "create-second", result: .create)) = $0 else { return false }
+                return true
+            })
+        let secondSnapshotCount = await secondTracker.snapshotCount
+        XCTAssertEqual(secondSnapshotCount, 1)
+
+        await gate.release()
+        try await waitUntil { await connection.count >= 4 }
+        messages = try await decodedMessages(connection)
+        XCTAssertTrue(
+            messages.contains {
+                guard case .response(.failure(id: "create-first", error: _)) = $0 else { return false }
+                return true
+            })
+        let firstDisposeCount = await firstTracker.disposeCount
+        let secondDisposeCount = await secondTracker.disposeCount
+        XCTAssertEqual(firstDisposeCount, 1)
+        XCTAssertEqual(secondDisposeCount, 0)
+        await server.close()
+        let finalSecondDisposeCount = await secondTracker.disposeCount
+        XCTAssertEqual(finalSecondDisposeCount, 1)
+    }
+
     func testConcurrentAttachmentsShareOneRuntimeAndPreserveBothConnections() async throws {
         let tracker = RuntimeTracker()
         let service = CountingService(tracker: tracker)
@@ -258,6 +345,47 @@ private struct TestService: PiServerService {
     func openSession(_ id: String) async throws -> any PiSessionRuntime { TestRuntime(id: id) }
 }
 
+private actor FailingCreateService: PiServerService {
+    private(set) var openCount = 0
+    let tracker: RuntimeTracker
+
+    init(tracker: RuntimeTracker) { self.tracker = tracker }
+
+    func listSessions() async throws -> [SessionMetadata] { [] }
+    func listModels() async throws -> [ModelMetadata] { [] }
+    func createSession(_ options: CreateCommandOptions) async throws -> any PiSessionRuntime {
+        TestRuntime(id: "created", tracker: tracker, snapshotFailure: true)
+    }
+    func openSession(_ id: String) async throws -> any PiSessionRuntime {
+        openCount += 1
+        return TestRuntime(id: id)
+    }
+}
+
+private actor RacingCreateService: PiServerService {
+    private var createCount = 0
+    let gate: SnapshotGate
+    let firstTracker: RuntimeTracker
+    let secondTracker: RuntimeTracker
+
+    init(gate: SnapshotGate, firstTracker: RuntimeTracker, secondTracker: RuntimeTracker) {
+        self.gate = gate
+        self.firstTracker = firstTracker
+        self.secondTracker = secondTracker
+    }
+
+    func listSessions() async throws -> [SessionMetadata] { [] }
+    func listModels() async throws -> [ModelMetadata] { [] }
+    func createSession(_ options: CreateCommandOptions) async throws -> any PiSessionRuntime {
+        createCount += 1
+        if createCount == 1 {
+            return TestRuntime(id: "created", tracker: firstTracker, snapshotGate: gate)
+        }
+        return TestRuntime(id: "created", tracker: secondTracker)
+    }
+    func openSession(_ id: String) async throws -> any PiSessionRuntime { TestRuntime(id: id) }
+}
+
 private actor CountingService: PiServerService {
     private(set) var openCount = 0
     let tracker: RuntimeTracker
@@ -276,21 +404,55 @@ private actor CountingService: PiServerService {
     }
 }
 
+private actor SnapshotGate {
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var released = false
+
+    func wait() async {
+        if released { return }
+        await withCheckedContinuation { continuation = $0 }
+    }
+
+    func release() {
+        released = true
+        continuation?.resume()
+        continuation = nil
+    }
+}
+
 private actor RuntimeTracker {
     private(set) var disposeCount = 0
+    private(set) var snapshotCount = 0
     func recordDispose() { disposeCount += 1 }
+    func recordSnapshot() { snapshotCount += 1 }
 }
+
+private enum SnapshotFailure: Error { case expected }
 
 private actor TestRuntime: PiSessionRuntime {
     nonisolated let id: String
     private let tracker: RuntimeTracker?
+    private let snapshotFailure: Bool
+    private let snapshotGate: SnapshotGate?
     private var revision: Int64 = 0
 
-    init(id: String, tracker: RuntimeTracker? = nil) {
+    init(
+        id: String,
+        tracker: RuntimeTracker? = nil,
+        snapshotFailure: Bool = false,
+        snapshotGate: SnapshotGate? = nil
+    ) {
         self.id = id
         self.tracker = tracker
+        self.snapshotFailure = snapshotFailure
+        self.snapshotGate = snapshotGate
     }
-    func snapshot(attached: Bool) throws -> SessionSnapshot { try makeSnapshot(attached: attached) }
+    func snapshot(attached: Bool) async throws -> SessionSnapshot {
+        await tracker?.recordSnapshot()
+        await snapshotGate?.wait()
+        if snapshotFailure { throw SnapshotFailure.expected }
+        return try makeSnapshot(attached: attached)
+    }
     func prompt(_ text: String) throws -> SessionSnapshot { try mutate() }
     func steer(_ text: String) throws -> SessionSnapshot { try mutate() }
     func abort() throws -> SessionSnapshot { try mutate() }

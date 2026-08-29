@@ -366,7 +366,8 @@ public enum ZetaCLI {
         )
         await agent.configureRetry(
             maximumRetries: settings.retry.enabled ? settings.retry.maxRetries : 0,
-            baseDelayMilliseconds: settings.retry.baseDelayMs
+            baseDelayMilliseconds: settings.retry.baseDelayMs,
+            maximumDelayMilliseconds: settings.retry.maxRetryDelayMs
         )
     }
 

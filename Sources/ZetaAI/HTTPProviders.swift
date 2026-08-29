@@ -75,7 +75,7 @@ public struct HTTPProvider: AIProvider {
                 var decoder = SSEDecoder()
                 for try await byte in bytes {
                     try Task.checkCancellation()
-                    for record in decoder.push(byte) {
+                    for record in try decoder.pushValidated(byte) {
                         try await consume(
                             record: record,
                             reducer: &reducer,
@@ -83,7 +83,7 @@ public struct HTTPProvider: AIProvider {
                         )
                     }
                 }
-                for record in decoder.finish() {
+                for record in try decoder.finishValidated() {
                     try await consume(
                         record: record,
                         reducer: &reducer,
@@ -288,45 +288,74 @@ public struct SSERecord: Sendable, Equatable {
 }
 
 public struct SSEDecoder: Sendable {
+    private static let defaultMaximumRecordBytes = 16 * 1_024 * 1_024
     private var buffer = Data()
-    public init() {}
-    public mutating func push(_ byte: UInt8) -> [SSERecord] {
-        buffer.append(byte)
-        return drain()
+    private let maximumRecordBytes: Int
+
+    public init() {
+        maximumRecordBytes = Self.defaultMaximumRecordBytes
     }
+
+    package init(maximumRecordBytes: Int) {
+        precondition(maximumRecordBytes > 0)
+        self.maximumRecordBytes = maximumRecordBytes
+    }
+
+    public mutating func push(_ byte: UInt8) -> [SSERecord] {
+        (try? pushValidated(byte)) ?? []
+    }
+
     public mutating func finish() -> [SSERecord] {
+        (try? finishValidated()) ?? []
+    }
+
+    package mutating func pushValidated(_ byte: UInt8) throws -> [SSERecord] {
+        buffer.append(byte)
+        let records = try drain()
+        guard buffer.count <= maximumRecordBytes else {
+            buffer.removeAll()
+            throw SSEDecoderError.recordTooLarge
+        }
+        return records
+    }
+
+    package mutating func finishValidated() throws -> [SSERecord] {
         defer { buffer.removeAll() }
         guard !buffer.isEmpty else { return [] }
+        guard buffer.count <= maximumRecordBytes else {
+            throw SSEDecoderError.recordTooLarge
+        }
         return parse(String(decoding: buffer, as: UTF8.self))
     }
-    private mutating func drain() -> [SSERecord] {
+
+    private mutating func drain() throws -> [SSERecord] {
         var output: [SSERecord] = []
         while let range = recordBoundary() {
             let data = buffer[..<range.lowerBound]
+            guard data.count <= maximumRecordBytes else {
+                buffer.removeAll()
+                throw SSEDecoderError.recordTooLarge
+            }
             buffer.removeSubrange(..<range.upperBound)
             output += parse(String(decoding: data, as: UTF8.self))
         }
         return output
     }
     private func recordBoundary() -> Range<Data.Index>? {
-        let bytes = Array(buffer)
-        for offset in bytes.indices {
-            let length: Int
-            if offset + 3 < bytes.count,
-                bytes[offset...offset + 3] == [0x0D, 0x0A, 0x0D, 0x0A]
-            {
-                length = 4
-            } else if offset + 1 < bytes.count,
-                (bytes[offset] == 0x0A && bytes[offset + 1] == 0x0A)
-                    || (bytes[offset] == 0x0D && bytes[offset + 1] == 0x0D)
-            {
-                length = 2
-            } else {
-                continue
+        if buffer.count >= 4 {
+            let lower = buffer.index(buffer.endIndex, offsetBy: -4)
+            if buffer[lower...].elementsEqual([0x0D, 0x0A, 0x0D, 0x0A]) {
+                return lower..<buffer.endIndex
             }
-            let lower = buffer.index(buffer.startIndex, offsetBy: offset)
-            let upper = buffer.index(lower, offsetBy: length)
-            return lower..<upper
+        }
+        if buffer.count >= 2 {
+            let lower = buffer.index(buffer.endIndex, offsetBy: -2)
+            let suffix = buffer[lower...]
+            if suffix.elementsEqual([0x0A, 0x0A])
+                || suffix.elementsEqual([0x0D, 0x0D])
+            {
+                return lower..<buffer.endIndex
+            }
         }
         return nil
     }
@@ -346,6 +375,10 @@ public struct SSEDecoder: Sendable {
         }
         return data.isEmpty ? [] : [SSERecord(event: event, data: data.joined(separator: "\n"))]
     }
+}
+
+package enum SSEDecoderError: Error, Sendable, Equatable {
+    case recordTooLarge
 }
 
 private extension OrderedJSONObject {

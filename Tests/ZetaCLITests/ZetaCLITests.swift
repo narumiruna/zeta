@@ -608,13 +608,16 @@ final class ZetaCLITests: XCTestCase {
         var settings = Settings()
         settings.steeringMode = .all
         settings.followUpMode = .all
+        settings.retry.maxRetryDelayMs = 1_234
 
         await ZetaCLI.configure(agent: agent, from: settings)
 
         let steeringMode = await agent.steeringMode
         let followUpMode = await agent.followUpMode
+        let retryMaximumDelay = await agent.retryMaximumDelayMilliseconds
         XCTAssertEqual(steeringMode, .all)
         XCTAssertEqual(followUpMode, .all)
+        XCTAssertEqual(retryMaximumDelay, 1_234)
     }
 
     func testRPCAutoCompactionRunsAfterThresholdCrossing() async throws {
@@ -709,6 +712,95 @@ final class ZetaCLITests: XCTestCase {
         XCTAssertEqual(diagnostics.count, 1)
         XCTAssertTrue(diagnostics[0].contains("Unsupported registration kinds: command"))
         XCTAssertTrue(diagnostics[0].contains("only tool registrations"))
+        await runtime.stop()
+    }
+
+    func testPluginRuntimePublishesAndValidatesRegistrationSchema() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let plugin = root.appendingPathComponent("agent/plugins/schema")
+        try FileManager.default.createDirectory(at: plugin, withIntermediateDirectories: true)
+        let script = plugin.appendingPathComponent("plugin.py")
+        let source = #"""
+            #!/usr/bin/env python3
+            import base64,json,sys
+            schema={"type":"object","properties":{"message":{"type":"string","minLength":1},"count":{"type":"integer","minimum":1}},"required":["message"],"additionalProperties":False}
+            registrations=[{"kind":"tool","name":"echo","callback":"tool.echo","schema":base64.b64encode(json.dumps(schema,separators=(',',':')).encode()).decode()}]
+            for line in sys.stdin:
+                request=json.loads(line)
+                payload=base64.b64encode(json.dumps(registrations,separators=(',',':')).encode()).decode()
+                response={"id":request.get("id"),"type":"response","generation":request["generation"],"payload":payload}
+                print(json.dumps(response,separators=(',',':')),flush=True)
+            """#
+        try Data(source.utf8).write(to: script)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: script.path)
+        let manifest = #"""
+            {"name":"schema","version":"1","protocolVersion":1,"executable":"plugin.py","capabilities":["tools"]}
+            """#
+        try Data(manifest.utf8).write(to: plugin.appendingPathComponent("zeta-plugin.json"))
+        let runtime = CLIPluginRuntime()
+        let diagnostics = await runtime.load(
+            agentDirectory: root.appendingPathComponent("agent"),
+            workingDirectory: root.appendingPathComponent("project"),
+            projectTrusted: false
+        )
+
+        XCTAssertTrue(diagnostics.isEmpty)
+        let tools = await runtime.tools()
+        let tool = try XCTUnwrap(tools.first)
+        guard case .object(let published) = tool.definition.parameters else {
+            return XCTFail("Expected published object schema")
+        }
+        XCTAssertEqual(published["required"], ["message"])
+        XCTAssertEqual(published["additionalProperties"], false)
+        let validator = try XCTUnwrap(tool.parameterSchema)
+        XCTAssertTrue(validator.accepts(["message": "hello"]))
+        XCTAssertTrue(validator.accepts(["message": "hello", "count": 2]))
+        XCTAssertFalse(validator.accepts(["count": 2]))
+        XCTAssertFalse(validator.accepts(["message": ""]))
+        XCTAssertFalse(validator.accepts(["message": "hello", "extra": true]))
+        await runtime.stop()
+    }
+
+    func testPluginRuntimeRejectsUnrepresentableSchemasTransactionally() async throws {
+        XCTAssertThrowsError(try PluginToolSchema(data: Data("{".utf8))) { error in
+            XCTAssertTrue(error.localizedDescription.contains("not valid JSON"))
+        }
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let plugin = root.appendingPathComponent("agent/plugins/invalid-schema")
+        try FileManager.default.createDirectory(at: plugin, withIntermediateDirectories: true)
+        let script = plugin.appendingPathComponent("plugin.py")
+        let source = #"""
+            #!/usr/bin/env python3
+            import base64,json,sys
+            schemas=[{"type":"object","properties":{}},{"type":"object","properties":{"value":{"type":"string","format":"email"}}}]
+            registrations=[{"kind":"tool","name":name,"callback":"tool."+name,"schema":base64.b64encode(json.dumps(schema,separators=(',',':')).encode()).decode()} for name,schema in zip(["valid","invalid"],schemas)]
+            for line in sys.stdin:
+                request=json.loads(line)
+                payload=base64.b64encode(json.dumps(registrations,separators=(',',':')).encode()).decode()
+                response={"id":request.get("id"),"type":"response","generation":request["generation"],"payload":payload}
+                print(json.dumps(response,separators=(',',':')),flush=True)
+            """#
+        try Data(source.utf8).write(to: script)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: script.path)
+        let manifest = #"""
+            {"name":"invalid-schema","version":"1","protocolVersion":1,"executable":"plugin.py","capabilities":["tools"]}
+            """#
+        try Data(manifest.utf8).write(to: plugin.appendingPathComponent("zeta-plugin.json"))
+        let runtime = CLIPluginRuntime()
+
+        let diagnostics = await runtime.load(
+            agentDirectory: root.appendingPathComponent("agent"),
+            workingDirectory: root.appendingPathComponent("project"),
+            projectTrusted: false
+        )
+
+        let tools = await runtime.tools()
+        XCTAssertTrue(tools.isEmpty)
+        XCTAssertEqual(diagnostics.count, 1)
+        XCTAssertTrue(diagnostics[0].contains("Invalid plugin tool schema"))
+        XCTAssertTrue(diagnostics[0].contains("format"))
         await runtime.stop()
     }
 

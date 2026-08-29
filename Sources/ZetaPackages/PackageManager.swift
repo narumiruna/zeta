@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 public enum PackageSource: Sendable, Equatable {
@@ -99,12 +100,18 @@ public enum PackageManagerError: Error, LocalizedError, Sendable {
 
 enum PackageInternalError: Error, LocalizedError, Sendable {
     case unsafeRegistryDirectory(String)
+    case duplicateRegistryDirectory(String)
+    case destinationCollision
     case rollbackFailed(String)
 
     var errorDescription: String? {
         switch self {
         case .unsafeRegistryDirectory(let value):
             "Package registry contains an unsafe directory: \(value)"
+        case .duplicateRegistryDirectory(let value):
+            "Multiple package records own the same directory: \(value)"
+        case .destinationCollision:
+            "Package install destination is already owned or occupied"
         case .rollbackFailed(let value):
             "Package rollback failed: \(value)"
         }
@@ -127,10 +134,12 @@ public actor ResourcePackageManager {
         )
         let indexURL = standardizedRoot.appendingPathComponent("packages.json")
         if FileManager.default.fileExists(atPath: indexURL.path) {
-            installed = try JSONDecoder().decode(
+            let records = try JSONDecoder().decode(
                 [String: InstalledPackage].self,
                 from: Data(contentsOf: indexURL)
             )
+            try Self.validateRegistry(records)
+            installed = records
         }
     }
 
@@ -140,6 +149,15 @@ public actor ResourcePackageManager {
 
     public func install(_ source: PackageSource, trusted: Bool = true) async throws {
         guard trusted else { throw PackageManagerError.untrusted }
+        let identifier = source.identifier
+        let existingRecord = installed[identifier]
+        let directory = try destinationDirectory(for: identifier)
+        let destination = try installedPackageURL(directory: directory)
+        if existingRecord == nil,
+            FileManager.default.fileExists(atPath: destination.path)
+        {
+            throw PackageInternalError.destinationCollision
+        }
         let staging = root.appendingPathComponent(".staging-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: staging) }
         switch source {
@@ -164,12 +182,11 @@ public actor ResourcePackageManager {
             throw PackageManagerError.unsupportedExtensionPackage
         }
         try validateResourcePaths(manifest, root: staging)
-        let destination = root.appendingPathComponent(safeName(source.identifier))
         let backup = root.appendingPathComponent(".backup-\(UUID().uuidString)")
         var nextInstalled = installed
-        nextInstalled[source.identifier] = InstalledPackage(
-            source: source.identifier,
-            directory: destination.lastPathComponent,
+        nextInstalled[identifier] = InstalledPackage(
+            source: identifier,
+            directory: directory,
             pinned: source.pinned,
             installedAt: ISO8601DateFormatter().string(from: Date())
         )
@@ -208,6 +225,7 @@ public actor ResourcePackageManager {
     public func remove(_ identifier: String, trusted: Bool = true) throws {
         guard trusted else { throw PackageManagerError.untrusted }
         guard let value = installed[identifier] else { return }
+        try requireExclusiveOwnership(of: value.directory, by: identifier)
         let destination = try installedPackageURL(directory: value.directory)
         let backup = root.appendingPathComponent(".backup-\(UUID().uuidString)")
         var nextInstalled = installed
@@ -402,10 +420,50 @@ public actor ResourcePackageManager {
         }
     }
 
-    private func safeName(_ value: String) -> String {
-        value.unicodeScalars.map { scalar in
+    private func destinationDirectory(for identifier: String) throws -> String {
+        if let record = installed[identifier] {
+            try requireExclusiveOwnership(of: record.directory, by: identifier)
+            return record.directory
+        }
+        let readable = identifier.unicodeScalars.map { scalar in
             CharacterSet.alphanumerics.contains(scalar) ? String(scalar) : "-"
-        }.joined()
+        }.joined().prefix(80)
+        let digest = SHA256.hash(data: Data(identifier.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
+        let directory = "\(readable)-\(digest)"
+        try requireExclusiveOwnership(of: directory, by: identifier)
+        return directory
+    }
+
+    private func requireExclusiveOwnership(
+        of directory: String,
+        by identifier: String
+    ) throws {
+        let key = Self.directoryKey(directory)
+        guard
+            !installed.contains(where: {
+                $0.key != identifier && Self.directoryKey($0.value.directory) == key
+            })
+        else {
+            throw PackageInternalError.destinationCollision
+        }
+    }
+
+    private static func validateRegistry(
+        _ records: [String: InstalledPackage]
+    ) throws {
+        var directories: Set<String> = []
+        for record in records.values {
+            let directory = record.directory
+            guard directories.insert(directoryKey(directory)).inserted else {
+                throw PackageInternalError.duplicateRegistryDirectory(directory)
+            }
+        }
+    }
+
+    private static func directoryKey(_ directory: String) -> String {
+        directory.precomposedStringWithCanonicalMapping.lowercased()
     }
 
     private func installedPackageURL(directory: String) throws -> URL {
@@ -415,7 +473,7 @@ public actor ResourcePackageManager {
             throw PackageInternalError.unsafeRegistryDirectory(directory)
         }
         let destination = root.appendingPathComponent(directory).standardizedFileURL
-        guard destination.deletingLastPathComponent() == root else {
+        guard destination.deletingLastPathComponent().path == root.path else {
             throw PackageInternalError.unsafeRegistryDirectory(directory)
         }
         return destination

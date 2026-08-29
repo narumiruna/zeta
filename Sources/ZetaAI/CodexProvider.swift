@@ -61,36 +61,45 @@ public struct CodexWebSocketProvider: AIProvider {
                     url: url,
                     headers: headers.dictionary
                 ) { connection in
-                    try await withTaskCancellationHandler {
-                        try await connection.send(requestData)
-                        var reducer = ProviderEventReducer(model: model)
-                        await output.emit(.start(reducer.partial))
-                        var terminal = false
-                        while !terminal {
-                            try Task.checkCancellation()
-                            let frame = try await connection.receive()
-                            let value = try OrderedJSON.decode(frame)
-                            for event in try reducer.consume(value) {
-                                await output.emit(event)
+                    var reducer = ProviderEventReducer(model: model)
+                    do {
+                        try await withTaskCancellationHandler {
+                            try await connection.send(requestData)
+                            await output.emit(.start(reducer.partial))
+                            var terminal = false
+                            while !terminal {
+                                try Task.checkCancellation()
+                                let frame = try await connection.receive()
+                                let value = try OrderedJSON.decode(frame)
+                                for event in try reducer.consume(value) {
+                                    await output.emit(event)
+                                }
+                                if case .object(let object) = value,
+                                    case .string(let type)? = object["type"],
+                                    type == "response.completed"
+                                {
+                                    var message = reducer.partial
+                                    if message.stopReason == .pending { message.stopReason = .stop }
+                                    await output.emit(.done(reason: message.stopReason, message: message))
+                                    terminal = true
+                                }
+                                if case .object(let object) = value,
+                                    case .string(let type)? = object["type"],
+                                    type.contains("error")
+                                {
+                                    throw ProviderError.invalidResponse(OrderedJSON.string(value))
+                                }
                             }
-                            if case .object(let object) = value,
-                                case .string(let type)? = object["type"],
-                                type == "response.completed"
-                            {
-                                var message = reducer.partial
-                                if message.stopReason == .pending { message.stopReason = .stop }
-                                await output.emit(.done(reason: message.stopReason, message: message))
-                                terminal = true
-                            }
-                            if case .object(let object) = value,
-                                case .string(let type)? = object["type"],
-                                type.contains("error")
-                            {
-                                throw ProviderError.invalidResponse(OrderedJSON.string(value))
-                            }
+                        } onCancel: {
+                            Task { await connection.close() }
                         }
-                    } onCancel: {
-                        Task { await connection.close() }
+                    } catch {
+                        await output.fail(
+                            error,
+                            preserving: reducer.partial,
+                            aborted: error is CancellationError
+                        )
+                        throw error
                     }
                 }
             } catch is CancellationError {

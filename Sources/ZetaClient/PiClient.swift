@@ -178,14 +178,14 @@ public actor PiClient {
     }
 
     public func listSessions() async throws -> [SessionMetadata] {
-        guard case .success(_, .list(let sessions)) = try await request(.list) else {
+        guard case .list(let sessions) = try await requestResult(.list) else {
             throw PiClientError.protocolFailure("Unexpected list result")
         }
         return sessions
     }
 
     public func createSession(_ options: CreateCommandOptions) async throws -> SessionLease {
-        guard case .success(_, .create(let snapshot)) = try await request(.create(options)) else {
+        guard case .create(let snapshot) = try await requestResult(.create(options)) else {
             throw PiClientError.protocolFailure("Unexpected create result")
         }
         sessionSnapshots[snapshot.id] = snapshot
@@ -215,13 +215,11 @@ public actor PiClient {
 
     fileprivate func command(sessionID: String, command: Command) async throws -> SessionSnapshot {
         guard leaseIsActive(sessionID) else { throw PiClientError.detached }
-        let response = try await request(command)
+        let result = try await requestResult(command)
         let snapshot: SessionSnapshot
-        switch response {
-        case .success(_, .prompt(let value)), .success(_, .steer(let value)), .success(_, .abort(let value)),
-            .success(_, .setModel(let value)), .success(_, .setThinking(let value)):
+        switch result {
+        case .prompt(let value), .steer(let value), .abort(let value), .setModel(let value), .setThinking(let value):
             snapshot = value
-        case .failure(_, let error): throw PiClientError.server(error)
         default: throw PiClientError.protocolFailure("Unexpected session result")
         }
         sessionSnapshots[sessionID] = snapshot
@@ -327,7 +325,7 @@ public actor PiClient {
             return
         }
         do {
-            guard case .success(_, .attach(let snapshot)) = try await request(.attach(sessionID: sessionID)) else {
+            guard case .attach(let snapshot) = try await requestResult(.attach(sessionID: sessionID)) else {
                 throw PiClientError.protocolFailure("Unexpected attach result")
             }
             guard var book = leases[sessionID], book.attachment?.token == token else {
@@ -345,7 +343,7 @@ public actor PiClient {
 
     private func performDetachment(sessionID: String, token: UUID) async throws {
         do {
-            guard case .success(_, .detach) = try await request(.detach(sessionID: sessionID)) else {
+            guard case .detach = try await requestResult(.detach(sessionID: sessionID)) else {
                 throw PiClientError.protocolFailure("Unexpected detach result")
             }
             guard var book = leases[sessionID], book.detachment?.token == token else { return }
@@ -366,6 +364,18 @@ public actor PiClient {
     private func leaseIsActive(_ id: String) -> Bool {
         guard let book = leases[id] else { return false }
         return book.exclusive != nil || !book.shared.isEmpty
+    }
+
+    private func requestResult(_ command: Command) async throws -> CommandResult {
+        switch try await request(command) {
+        case .failure(_, let error): throw PiClientError.server(error)
+        case .success(_, let result):
+            guard result.name == command.name else {
+                throw PiClientError.protocolFailure(
+                    "Response command \(result.name.rawValue) does not match \(command.name.rawValue)")
+            }
+            return result
+        }
     }
 
     private func request(_ command: Command) async throws -> ResponseEnvelope {

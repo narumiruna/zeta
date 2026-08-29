@@ -296,6 +296,138 @@ final class ProviderRegressionTests: XCTestCase {
         XCTAssertNotNil(message.errorMessage)
     }
 
+    func testCancellationAfterDeltaPreservesLatestPartialAndSingleTerminal() async throws {
+        let stream = AssistantEventStream()
+        let producer = Task {
+            var partial = AssistantMessage(
+                api: "test-api",
+                provider: "test-provider",
+                model: "test-model"
+            )
+            await stream.emit(.start(partial))
+            partial.content.append(.text(text: ""))
+            await stream.emit(.textStart(index: 0, partial: partial))
+            partial.content[0] = .text(text: "kept")
+            await stream.emit(.textDelta(index: 0, delta: "kept", partial: partial))
+            do {
+                try await Task.sleep(for: .seconds(300))
+            } catch {
+                await stream.failBeforeStart(
+                    api: "test-api",
+                    provider: "test-provider",
+                    model: "test-model",
+                    error: error,
+                    aborted: true
+                )
+            }
+        }
+        stream.attachProducer(producer)
+
+        var iterator = stream.makeAsyncIterator()
+        var events: [AssistantEvent] = []
+        for _ in 0..<3 {
+            if let event = try await iterator.next() { events.append(event) }
+        }
+        await stream.cancel(
+            api: "test-api",
+            provider: "test-provider",
+            model: "test-model"
+        )
+        while let event = try await iterator.next() { events.append(event) }
+        await producer.value
+
+        let result = await stream.result()
+        XCTAssertEqual(result.content, [.text(text: "kept")])
+        XCTAssertEqual(result.stopReason, .aborted)
+        XCTAssertEqual(
+            events.filter {
+                if case .done = $0 { return true }
+                if case .error = $0 { return true }
+                return false
+            }.count,
+            1
+        )
+        guard case .error(.aborted, let terminal) = events.last else {
+            return XCTFail("Expected one aborted terminal event")
+        }
+        XCTAssertEqual(terminal, result)
+    }
+
+    func testCodexFailureAfterStartPreservesReducerPartial() async throws {
+        let connection = FailingCodexConnection(frames: [
+            Data(
+                #"{"type":"response.output_text.delta","output_index":0,"delta":"kept"}"#
+                    .utf8
+            ),
+            Data("not-json".utf8),
+        ])
+        let pool = CodexWebSocketPool { _, _ in connection }
+        let model = pricedModel(api: "openai-codex-responses")
+        let provider = CodexWebSocketProvider(
+            id: model.provider,
+            models: [model],
+            pool: pool
+        )
+
+        let stream = await provider.stream(
+            model: model,
+            context: Context(messages: [.user(UserMessage("hello"))]),
+            options: StreamOptions(apiKey: "synthetic-key", sessionID: "session")
+        )
+        var events: [AssistantEvent] = []
+        for try await event in stream { events.append(event) }
+
+        guard case .error(.error, let message) = events.last else {
+            return XCTFail("Expected terminal Codex streaming error")
+        }
+        XCTAssertEqual(message.content, [.text(text: "kept")])
+        XCTAssertEqual(message.stopReason, .error)
+        XCTAssertNotNil(message.errorMessage)
+        let result = await stream.result()
+        XCTAssertEqual(result, message)
+        XCTAssertEqual(events.filter { if case .error = $0 { true } else { false } }.count, 1)
+    }
+
+    func testSSEDecoderRejectsOversizedPendingRecord() throws {
+        var decoder = SSEDecoder(maximumRecordBytes: 8)
+        for byte in "data: 12".utf8 {
+            XCTAssertTrue(try decoder.pushValidated(byte).isEmpty)
+        }
+        XCTAssertThrowsError(try decoder.pushValidated(UInt8(ascii: "3"))) { error in
+            XCTAssertEqual(error as? SSEDecoderError, .recordTooLarge)
+        }
+    }
+
+    func testImageProviderAppliesStreamTimeoutToRequest() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [TimeoutCapturingImageURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        TimeoutCapturingImageURLProtocol.reset()
+        let model = ImageModel(
+            id: "image-model",
+            name: "Image",
+            api: "openrouter-images",
+            provider: "openrouter",
+            baseURL: URL(string: "https://example.com/v1")!,
+            input: ["text"],
+            output: ["image"]
+        )
+        let provider = OpenRouterImageProvider(models: [model], session: session)
+
+        let result = await provider.generate(
+            model: model,
+            input: [.text(text: "draw")],
+            options: StreamOptions(apiKey: "synthetic-key", timeout: .milliseconds(250))
+        )
+
+        XCTAssertEqual(result.stopReason, .stop)
+        XCTAssertEqual(
+            try XCTUnwrap(TimeoutCapturingImageURLProtocol.capturedTimeout()),
+            0.25,
+            accuracy: 1e-9
+        )
+    }
+
     private func pricedModel(api: String) -> Model {
         Model(
             id: "priced",
@@ -346,6 +478,55 @@ private func isTextEnd(_ event: AssistantEvent) -> Bool {
 
 private func isThinkingEnd(_ event: AssistantEvent) -> Bool {
     if case .thinkingEnd = event { true } else { false }
+}
+
+private actor FailingCodexConnection: WebSocketConnection {
+    nonisolated let identifier = UUID()
+    private var frames: [Data]
+
+    init(frames: [Data]) { self.frames = frames }
+
+    func send(_ data: Data) {}
+
+    func receive() throws -> Data {
+        guard !frames.isEmpty else {
+            throw ProviderError.invalidResponse("No scripted WebSocket frame")
+        }
+        return frames.removeFirst()
+    }
+
+    func close() {}
+}
+
+private final class TimeoutCapturingImageURLProtocol: URLProtocol, @unchecked Sendable {
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var timeout: TimeInterval?
+
+    static func reset() {
+        lock.withLock { timeout = nil }
+    }
+
+    static func capturedTimeout() -> TimeInterval? {
+        lock.withLock { timeout }
+    }
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        Self.lock.withLock { Self.timeout = request.timeoutInterval }
+        let response = HTTPURLResponse(
+            url: request.url!,
+            statusCode: 200,
+            httpVersion: "HTTP/1.1",
+            headerFields: ["Content-Type": "application/json"]
+        )!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: Data(#"{"choices":[]}"#.utf8))
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
 }
 
 private final class FailingStreamingURLProtocol: URLProtocol, @unchecked Sendable {

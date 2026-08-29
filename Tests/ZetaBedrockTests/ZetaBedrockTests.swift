@@ -75,6 +75,81 @@ final class ZetaBedrockTests: XCTestCase {
         XCTAssertEqual(signed.httpBody, body)
     }
 
+    func testModelIDIsEncodedOnceAsOneBedrockPathSegment() throws {
+        let url = try BedrockProvider.endpointURL(
+            baseURL: URL(string: "https://bedrock.example.com/runtime")!,
+            modelID: "arn:aws:bedrock:us-east-1:123:model/profile"
+        )
+
+        XCTAssertEqual(
+            url.absoluteString,
+            "https://bedrock.example.com/runtime/model/arn%3Aaws%3Abedrock%3Aus-east-1%3A123%3Amodel%2Fprofile/converse-stream"
+        )
+        XCTAssertFalse(url.absoluteString.contains("%253A"))
+    }
+
+    func testFailureAfterStartPreservesBedrockPartial() async throws {
+        var body = Data()
+        body.append(
+            eventMessage(
+                headers: [":message-type": "event", ":event-type": "chunk"],
+                payload: Data(
+                    #"{"contentBlockDelta":{"contentBlockIndex":0,"delta":{"text":"kept"}}}"#
+                        .utf8
+                )
+            )
+        )
+        body.append(
+            eventMessage(
+                headers: [":message-type": "exception"],
+                payload: Data("stream failed".utf8)
+            )
+        )
+        BedrockStreamingURLProtocol.setBody(body)
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [BedrockStreamingURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        let credential = try XCTUnwrap(
+            CredentialResolver.aws(environment: [
+                "AWS_BEARER_TOKEN_BEDROCK": "synthetic-token"
+            ])
+        )
+        let model = Model(
+            id: "provider.model:0",
+            name: "Model",
+            api: "bedrock-converse-stream",
+            provider: "amazon-bedrock",
+            baseURL: URL(string: "https://bedrock.example.com")!,
+            contextWindow: 100,
+            maximumTokens: 10
+        )
+        let provider = BedrockProvider(
+            models: [model],
+            region: "us-east-1",
+            session: session
+        ) {
+            credential
+        }
+
+        let stream = await provider.stream(
+            model: model,
+            context: Context(),
+            options: StreamOptions()
+        )
+        var events: [AssistantEvent] = []
+        for try await event in stream { events.append(event) }
+
+        guard case .error(.error, let message) = events.last else {
+            return XCTFail("Expected terminal Bedrock streaming error")
+        }
+        XCTAssertEqual(message.content, [.text(text: "kept")])
+        XCTAssertEqual(message.stopReason, .error)
+        XCTAssertNotNil(message.errorMessage)
+        let result = await stream.result()
+        XCTAssertEqual(result, message)
+        XCTAssertEqual(events.filter { if case .error = $0 { true } else { false } }.count, 1)
+    }
+
     func testToolUseStreamParsesFragmentedInputAndStopReason() async throws {
         let credential = try XCTUnwrap(
             CredentialResolver.aws(environment: [
@@ -141,6 +216,32 @@ final class ZetaBedrockTests: XCTestCase {
         XCTAssertTrue(events.contains { if case .toolCallDelta(0, _, _) = $0 { true } else { false } })
         XCTAssertTrue(events.contains { if case .toolCallEnd(0, _, _) = $0 { true } else { false } })
     }
+}
+
+private final class BedrockStreamingURLProtocol: URLProtocol, @unchecked Sendable {
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var body = Data()
+
+    static func setBody(_ value: Data) {
+        lock.withLock { body = value }
+    }
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        let response = HTTPURLResponse(
+            url: request.url!,
+            statusCode: 200,
+            httpVersion: "HTTP/1.1",
+            headerFields: ["Content-Type": "application/vnd.amazon.eventstream"]
+        )!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: Self.lock.withLock { Self.body })
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
 }
 
 private func bedrockMessage(_ payload: String) -> AWSEventStreamMessage {

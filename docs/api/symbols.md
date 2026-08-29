@@ -322,6 +322,7 @@ Regenerate it with `uv run python scripts/generate-api-docs.py`.
 | `clearQueues()` | Instance Method |
 | `compact(summaryPrompt:retainedTail:)` | Instance Method |
 | `configureRetry(maximumRetries:baseDelayMilliseconds:)` | Instance Method |
+| `configureRetry(maximumRetries:baseDelayMilliseconds:maximumDelayMilliseconds:)` | Instance Method |
 | `continue()` | Instance Method |
 | `followUp(_:)` | Instance Method |
 | `prompt(_:)` | Instance Method |
@@ -363,6 +364,7 @@ Regenerate it with `uv run python scripts/generate-api-docs.py`.
 | `prepareArguments` | Instance Property |
 | `prepareNextTurn` | Instance Property |
 | `retryBaseDelayMilliseconds` | Instance Property |
+| `retryMaximumDelayMilliseconds` | Instance Property |
 | `shouldStopAfterTurn` | Instance Property |
 | `steeringMode` | Instance Property |
 | `streamingMessage` | Instance Property |
@@ -1670,6 +1672,7 @@ Regenerate it with `uv run python scripts/generate-api-docs.py`.
 | `totalTokens` | Instance Property |
 | `type` | Instance Property |
 | `uncachedTokens` | Instance Property |
+| `unownedExecutor` | Instance Property |
 | `url` | Instance Property |
 | `SQLiteEntry` | Structure |
 | `SQLiteRecord` | Structure |

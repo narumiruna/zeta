@@ -24,6 +24,7 @@ public actor AssistantEventStream: AsyncSequence {
     private let continuation: AsyncThrowingStream<AssistantEvent, Error>.Continuation
     private nonisolated let producerTermination: ProducerTermination
     private var terminal: AssistantMessage?
+    private var latestPartial: AssistantMessage?
     private var terminalWaiters: [CheckedContinuation<AssistantMessage, Never>] = []
     private var started = false
     private var finished = false
@@ -55,9 +56,10 @@ public actor AssistantEventStream: AsyncSequence {
     public func emit(_ event: AssistantEvent) {
         guard !finished else { return }
         switch event {
-        case .start:
+        case .start(let message):
             guard !started else { return }
             started = true
+            latestPartial = message
         case .done(let reason, let message):
             guard started, [.stop, .length, .toolUse, .deferred].contains(reason), message.stopReason == reason else {
                 finishProtocolError("Invalid done event")
@@ -76,16 +78,31 @@ public actor AssistantEventStream: AsyncSequence {
             return
         default:
             guard started else { return }
+            latestPartial = event.partial
         }
         continuation.yield(event)
     }
 
     public func failBeforeStart(api: String, provider: String, model: String, error: Error, aborted: Bool = false) {
+        fail(
+            error,
+            preserving: AssistantMessage(api: api, provider: provider, model: model),
+            aborted: aborted
+        )
+    }
+
+    package func fail(_ error: Error, preserving partial: AssistantMessage, aborted: Bool = false) {
         guard !finished else { return }
         let reason: StopReason = aborted ? .aborted : .error
-        let message = AssistantMessage(
-            api: api, provider: provider, model: model, stopReason: reason, errorMessage: String(describing: error))
-        emit(.start(AssistantMessage(api: api, provider: provider, model: model)))
+        if !started {
+            var initial = partial
+            initial.stopReason = .pending
+            initial.errorMessage = nil
+            emit(.start(initial))
+        }
+        var message = partial
+        message.stopReason = reason
+        message.errorMessage = aborted ? "Operation aborted" : String(describing: error)
         emit(.error(reason: reason, message: message))
     }
 
@@ -95,18 +112,19 @@ public actor AssistantEventStream: AsyncSequence {
     }
 
     public func cancel(api: String, provider: String, model: String) {
+        guard !finished else { return }
         producerTermination.cancel()
-        failBeforeStart(
-            api: api,
-            provider: provider,
-            model: model,
-            error: CancellationError(),
+        fail(
+            CancellationError(),
+            preserving: latestPartial
+                ?? AssistantMessage(api: api, provider: provider, model: model),
             aborted: true
         )
     }
 
     private func settle(_ message: AssistantMessage, event: AssistantEvent) {
         terminal = message
+        latestPartial = message
         finished = true
         continuation.yield(event)
         continuation.finish()
@@ -150,6 +168,26 @@ private final class ProducerTermination: @unchecked Sendable {
         terminated = true
         producer = nil
         lock.unlock()
+    }
+}
+
+private extension AssistantEvent {
+    var partial: AssistantMessage {
+        switch self {
+        case .start(let partial),
+            .textStart(_, let partial),
+            .textDelta(_, _, let partial),
+            .textEnd(_, _, let partial),
+            .thinkingStart(_, let partial),
+            .thinkingDelta(_, _, let partial),
+            .thinkingEnd(_, _, let partial),
+            .toolCallStart(_, let partial),
+            .toolCallDelta(_, _, let partial),
+            .toolCallEnd(_, _, let partial),
+            .done(_, let partial),
+            .error(_, let partial):
+            partial
+        }
     }
 }
 

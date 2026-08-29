@@ -32,7 +32,7 @@ public struct SearchTools: Sendable {
             "--glob", "!.git/**",
         ]
         if let filePattern { arguments += ["--glob", filePattern] }
-        arguments += [pattern, path]
+        arguments += ["--regexp", pattern, path]
         let result = try await command("rg", arguments: arguments)
         if result.status == 127 {
             return try fallbackGrep(

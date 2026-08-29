@@ -30,7 +30,7 @@ public struct AWSEventStreamDecoder: Sendable {
             }
             guard buffer.count >= total else { break }
             let message = Data(buffer.prefix(total))
-            buffer.removeFirst(total)
+            buffer = Data(buffer.dropFirst(total))
             guard CRC32.checksum(message.prefix(8)) == message.uint32(at: 8),
                 CRC32.checksum(message.prefix(total - 4)) == message.uint32(at: total - 4)
             else {
@@ -130,6 +130,27 @@ public struct BedrockProvider: AIProvider {
         }
     }
 
+    static func endpointURL(baseURL: URL, modelID: String) throws -> URL {
+        guard var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false),
+            let encodedID = modelID.addingPercentEncoding(
+                withAllowedCharacters: CharacterSet(
+                    charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
+                )
+            )
+        else {
+            throw ProviderError.invalidResponse("Invalid Bedrock endpoint URL")
+        }
+        let basePath =
+            components.percentEncodedPath.hasSuffix("/")
+            ? components.percentEncodedPath
+            : components.percentEncodedPath + "/"
+        components.percentEncodedPath = basePath + "model/\(encodedID)/converse-stream"
+        guard let url = components.url else {
+            throw ProviderError.invalidResponse("Invalid Bedrock endpoint URL")
+        }
+        return url
+    }
+
     public func stream(
         model: Model,
         context: Context,
@@ -137,6 +158,12 @@ public struct BedrockProvider: AIProvider {
     ) async -> AssistantEventStream {
         let result = AssistantEventStream()
         let producer = Task {
+            var partial = AssistantMessage(
+                api: model.api,
+                provider: model.provider,
+                model: model.id
+            )
+            var started = false
             do {
                 let body = OrderedJSON.encode(
                     try ProviderPayloadBuilder.build(
@@ -145,12 +172,10 @@ public struct BedrockProvider: AIProvider {
                         options: options
                     )
                 )
-                let encodedID = model.id.addingPercentEncoding(
-                    withAllowedCharacters: .urlPathAllowed
-                )!
                 var request = URLRequest(
-                    url: model.baseURL.appendingPathComponent(
-                        "model/\(encodedID)/converse-stream"
+                    url: try Self.endpointURL(
+                        baseURL: model.baseURL,
+                        modelID: model.id
                     )
                 )
                 request.httpMethod = "POST"
@@ -171,12 +196,8 @@ public struct BedrockProvider: AIProvider {
                         body: "Bedrock request failed"
                     )
                 }
-                var partial = AssistantMessage(
-                    api: model.api,
-                    provider: model.provider,
-                    model: model.id
-                )
                 await result.emit(.start(partial))
+                started = true
                 var decoder = AWSEventStreamDecoder()
                 var toolInputBuffers: [Int: String] = [:]
                 var chunk = Data()
@@ -207,20 +228,32 @@ public struct BedrockProvider: AIProvider {
                 }
                 await result.emit(.done(reason: partial.stopReason, message: partial))
             } catch is CancellationError {
-                await result.failBeforeStart(
-                    api: model.api,
-                    provider: model.provider,
-                    model: model.id,
-                    error: CancellationError(),
-                    aborted: true
-                )
+                if started {
+                    await result.fail(
+                        CancellationError(),
+                        preserving: partial,
+                        aborted: true
+                    )
+                } else {
+                    await result.failBeforeStart(
+                        api: model.api,
+                        provider: model.provider,
+                        model: model.id,
+                        error: CancellationError(),
+                        aborted: true
+                    )
+                }
             } catch {
-                await result.failBeforeStart(
-                    api: model.api,
-                    provider: model.provider,
-                    model: model.id,
-                    error: error
-                )
+                if started {
+                    await result.fail(error, preserving: partial)
+                } else {
+                    await result.failBeforeStart(
+                        api: model.api,
+                        provider: model.provider,
+                        model: model.id,
+                        error: error
+                    )
+                }
             }
         }
         result.attachProducer(producer)
