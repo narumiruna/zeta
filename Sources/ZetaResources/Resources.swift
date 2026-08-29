@@ -233,13 +233,7 @@ public struct ResourceLoader: Sendable {
     }
 
     private func loadContext() -> [String] {
-        var output: [String] = []
-        var loadedBytes = 0
-        let global = agentDirectory.appendingPathComponent("AGENTS.md")
-        if let text = contextText(global, remainingBytes: maximumContextBytes - loadedBytes) {
-            output.append(text)
-            loadedBytes += text.utf8.count
-        }
+        var candidates = [agentDirectory.appendingPathComponent("AGENTS.md")]
         var directories: [URL] = []
         var current = workingDirectory
         while current.path != "/" {
@@ -250,18 +244,24 @@ public struct ResourceLoader: Sendable {
             let override = directory.appendingPathComponent("AGENTS.override.md")
             let agents = directory.appendingPathComponent("AGENTS.md")
             let claude = directory.appendingPathComponent("CLAUDE.md")
-            let selected =
+            candidates.append(
                 isRegularFile(override)
-                ? override : isRegularFile(agents) ? agents : claude
+                    ? override : isRegularFile(agents) ? agents : claude
+            )
+        }
+
+        var selected: [(index: Int, text: String)] = []
+        var loadedBytes = 0
+        for index in candidates.indices.reversed() {
             if let text = contextText(
-                selected,
+                candidates[index],
                 remainingBytes: maximumContextBytes - loadedBytes
             ) {
-                output.append(text)
+                selected.append((index, text))
                 loadedBytes += text.utf8.count
             }
         }
-        return output
+        return selected.sorted { $0.index < $1.index }.map(\.text)
     }
 
     private func contextText(_ url: URL, remainingBytes: Int) -> String? {

@@ -336,7 +336,13 @@ public struct HTTPProvider: AIProvider {
         reducer: inout ProviderEventReducer,
         output: AssistantEventStream
     ) async throws {
-        guard !record.data.isEmpty, record.data != "[DONE]" else { return }
+        guard !record.data.isEmpty else { return }
+        if record.data == "[DONE]" {
+            for event in reducer.finishAtDoneSentinel() {
+                await output.emit(event)
+            }
+            return
+        }
         let value = try OrderedJSON.decode(record.data)
         for event in try reducer.consume(value, eventName: record.event) {
             await output.emit(event)

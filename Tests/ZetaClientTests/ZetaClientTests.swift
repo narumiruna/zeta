@@ -420,6 +420,38 @@ final class ZetaClientTests: XCTestCase {
         XCTAssertEqual(disconnectedValue, .disconnected)
     }
 
+    func testCancellationTrackingBudgetRetiresConnectionWithoutEvictingIDs() async throws {
+        let box = ControlledTransportBox()
+        let client = try PiClient { handlers in
+            let transport = ControlledTransport(handlers: handlers)
+            await box.set(transport)
+            return transport
+        }
+        try await client.connect()
+        let transport = await box.wait()
+        let trackedRequests = (0..<1_024).map { _ in
+            Task { await listOutcome(from: client) }
+        }
+        try await waitUntil { await transport.listCount == trackedRequests.count }
+        for request in trackedRequests { request.cancel() }
+        for request in trackedRequests {
+            let outcome = await request.value
+            XCTAssertEqual(outcome, .cancelled)
+        }
+        let stateAtBudget = await client.connectionState()
+        XCTAssertEqual(stateAtBudget, .connected)
+
+        let overflow = Task { await listOutcome(from: client) }
+        try await waitUntil { await transport.listCount == trackedRequests.count + 1 }
+        overflow.cancel()
+
+        try await waitUntil { await client.connectionState() == .disconnected }
+        let overflowOutcome = await overflow.value
+        XCTAssertEqual(overflowOutcome, .cancelled)
+        let closeCount = await transport.closeCount
+        XCTAssertEqual(closeCount, 1)
+    }
+
     func testUnknownResponseIDFailsConnectionAndPendingRequest() async throws {
         let box = ControlledTransportBox()
         let client = try PiClient { handlers in
@@ -800,7 +832,7 @@ private final class ScriptedTransport: ByteTransport, @unchecked Sendable {
 }
 
 private func waitUntil(_ condition: @escaping () async -> Bool) async throws {
-    for _ in 0..<100 {
+    for _ in 0..<1_000 {
         if await condition() { return }
         try await Task.sleep(for: .milliseconds(5))
     }

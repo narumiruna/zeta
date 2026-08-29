@@ -43,7 +43,7 @@ public struct Settings: Codable, Sendable, Equatable {
     public var imageAutoResize = true
     public var blockImages = false
     public var tuiMode = "regular"
-    public var fullscreenExit = "transcript"
+    public var fullscreenExitOutput = "transcript"
     public var fullscreenScrollbar = "auto"
     public var fullscreenCopyOnSelect = true
     public var outputPadding = 1
@@ -53,6 +53,12 @@ public struct Settings: Codable, Sendable, Equatable {
     public var enableInstallTelemetry = true
 
     public init() {}
+
+    @available(*, deprecated, renamed: "fullscreenExitOutput")
+    public var fullscreenExit: String {
+        get { fullscreenExitOutput }
+        set { fullscreenExitOutput = newValue }
+    }
 }
 
 public struct ZetaPaths: Sendable {
@@ -210,6 +216,11 @@ public actor SettingsStore {
             result["transport"] == nil
         {
             result["transport"] = websockets ? "websocket" : "sse"
+        }
+        if let legacyFullscreenExit = result.removeValue(forKey: "fullscreenExit"),
+            result["fullscreenExitOutput"] == nil
+        {
+            result["fullscreenExitOutput"] = legacyFullscreenExit
         }
         if var retry = result["retry"] as? [String: Any],
             let legacyDelay = retry.removeValue(forKey: "maxDelayMs"),

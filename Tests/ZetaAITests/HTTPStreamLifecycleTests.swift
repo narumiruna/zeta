@@ -33,6 +33,45 @@ final class HTTPStreamLifecycleTests: XCTestCase {
         XCTAssertTrue(result.errorMessage?.contains("byte limit") == true)
     }
 
+    func testDoneSentinelTerminatesOpenAICompatibleStream() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [DoneSentinelStreamingURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        let model = Model(
+            id: "model",
+            name: "Model",
+            api: "openai-completions",
+            provider: "test-provider",
+            baseURL: URL(string: "https://example.com")!,
+            contextWindow: 1_000,
+            maximumTokens: 100
+        )
+        let provider = HTTPProvider(
+            configuration: ProviderConfiguration(
+                id: model.provider,
+                api: model.api,
+                baseURL: model.baseURL,
+                models: [model],
+                apiKeyEnvironmentVariables: []
+            ),
+            session: session
+        )
+
+        let stream = await provider.stream(
+            model: model,
+            context: Context(),
+            options: StreamOptions(apiKey: "synthetic-key")
+        )
+        var events: [AssistantEvent] = []
+        for try await event in stream { events.append(event) }
+
+        guard case .done(.stop, let message) = events.last else {
+            return XCTFail("Expected the done sentinel to terminate the stream")
+        }
+        XCTAssertEqual(message.content, [.text(text: "kept")])
+        XCTAssertEqual(message.stopReason, .stop)
+    }
+
     func testCleanSSEEOFWithoutTerminalEventFailsAndPreservesPartial() async throws {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [IncompleteStreamingURLProtocol.self]
@@ -85,6 +124,31 @@ private final class OversizedImageURLProtocol: URLProtocol, @unchecked Sendable 
         )!
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
         client?.urlProtocol(self, didLoad: Data(repeating: 0x61, count: 1_025))
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
+}
+
+private final class DoneSentinelStreamingURLProtocol: URLProtocol, @unchecked Sendable {
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        let response = HTTPURLResponse(
+            url: request.url!,
+            statusCode: 200,
+            httpVersion: "HTTP/1.1",
+            headerFields: ["Content-Type": "text/event-stream"]
+        )!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(
+            self,
+            didLoad: Data(
+                ("data: {\"id\":\"response-1\",\"choices\":[{\"delta\":{\"content\":\"kept\"}}]}\n\n"
+                    + "data: [DONE]\n\n").utf8
+            )
+        )
         client?.urlProtocolDidFinishLoading(self)
     }
 
