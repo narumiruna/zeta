@@ -1,4 +1,5 @@
 import Foundation
+import ZetaCore
 
 public enum ModelCatalogError: Error, LocalizedError, Sendable {
     case missingResource
@@ -30,8 +31,13 @@ public struct BuiltinModelCatalog: Sendable {
                 else {
                     throw ModelCatalogError.invalidModel("\(provider)/\(generated.id)")
                 }
+                let isTemplatedBaseURL = generated.baseURL.contains("{location}")
+                let resolvedBaseURL =
+                    isTemplatedBaseURL
+                    ? generated.baseURL.replacingOccurrences(of: "{location}", with: "location")
+                    : generated.baseURL
                 let baseURL =
-                    URL(string: generated.baseURL).flatMap { url in
+                    URL(string: resolvedBaseURL).flatMap { url in
                         url.scheme == nil ? nil : url
                     } ?? URL(string: "https://configuration-required.invalid")!
                 return Model(
@@ -44,7 +50,11 @@ public struct BuiltinModelCatalog: Sendable {
                     input: Set(generated.input),
                     cost: generated.cost,
                     contextWindow: generated.contextWindow,
-                    maximumTokens: generated.maximumTokens
+                    maximumTokens: generated.maximumTokens,
+                    headers: generated.headers,
+                    compat: generated.compat,
+                    thinkingLevelMap: generated.thinkingLevelMap,
+                    baseURLTemplate: isTemplatedBaseURL ? generated.baseURL : nil
                 )
             }.sorted { $0.id < $1.id }
         }
@@ -87,6 +97,9 @@ private struct GeneratedModel: Decodable {
     let cost: ModelCost
     let contextWindow: Int
     let maximumTokens: Int
+    let headers: [String: String]?
+    let compat: JSONValue?
+    let thinkingLevelMap: JSONValue?
 
     private enum CodingKeys: String, CodingKey {
         case id
@@ -99,6 +112,9 @@ private struct GeneratedModel: Decodable {
         case cost
         case contextWindow
         case maximumTokens = "maxTokens"
+        case headers
+        case compat
+        case thinkingLevelMap
     }
 }
 

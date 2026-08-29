@@ -32,8 +32,16 @@ actor CLIPluginRuntime {
                         baseDirectory: manifestURL.deletingLastPathComponent(),
                         trusted: trusted
                     )
+                    let registrations = await host.currentRegistrations()
+                    let unsupported = registrations.filter { $0.kind != .tool }
+                    guard unsupported.isEmpty else {
+                        await host.stop()
+                        throw CLIPluginRuntimeError.unsupportedRegistrations(
+                            unsupported.map { $0.kind.rawValue }
+                        )
+                    }
                     hosts.append(host)
-                    for registration in await host.currentRegistrations() where registration.kind == .tool {
+                    for registration in registrations {
                         toolBindings.append((registration, host))
                     }
                 } catch {
@@ -100,5 +108,18 @@ actor CLIPluginRuntime {
             if FileManager.default.fileExists(atPath: candidate.path) { output.append(candidate) }
         }
         return output.sorted { $0.path < $1.path }
+    }
+}
+
+private enum CLIPluginRuntimeError: LocalizedError {
+    case unsupportedRegistrations([String])
+
+    var errorDescription: String? {
+        switch self {
+        case .unsupportedRegistrations(let kinds):
+            let names = Array(Set(kinds)).sorted().joined(separator: ", ")
+            return
+                "Unsupported registration kinds: \(names). The Zeta CLI currently wires only tool registrations; remove the unsupported registrations or run them through a host that implements those capabilities."
+        }
     }
 }

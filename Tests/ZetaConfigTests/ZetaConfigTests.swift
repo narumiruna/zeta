@@ -45,6 +45,24 @@ final class ZetaConfigTests: XCTestCase {
         XCTAssertEqual(stored?[parent.path], true)
     }
 
+    func testOAuthExtrasRoundTripThroughDisk() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("auth.json")
+        let credential = StoredCredential.oauth(
+            access: "access",
+            refresh: "refresh",
+            expires: 123,
+            extras: ["accountId": "account", "region": "test"]
+        )
+        let store = try AuthStore(url: url)
+        try await store.set(provider: "provider", credential: credential)
+
+        let reopened = try AuthStore(url: url)
+        let stored = await reopened.read(provider: "provider")
+        XCTAssertEqual(stored, credential)
+    }
+
     func testCredentialKindsDoNotExposeSecretsInList() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let store = try AuthStore(url: directory.appendingPathComponent("auth.json"))

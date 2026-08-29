@@ -289,6 +289,65 @@ final class ZetaAgentTests: XCTestCase {
         XCTAssertEqual(state.messages.count, 3)
     }
 
+    func testProviderMessageTransformUsesModelChangedAfterAgentCreation() async throws {
+        let source = Model(
+            id: "claude",
+            name: "Claude",
+            api: "anthropic-messages",
+            provider: "anthropic",
+            baseURL: URL(string: "https://example.com")!,
+            contextWindow: 100,
+            maximumTokens: 10
+        )
+        let target = Model(
+            id: "gpt",
+            name: "GPT",
+            api: "openai-responses",
+            provider: "openai",
+            baseURL: URL(string: "https://example.com")!,
+            contextWindow: 100,
+            maximumTokens: 10
+        )
+        let history = AssistantMessage(
+            content: [.thinking(text: "private", signature: "opaque")],
+            api: source.api,
+            provider: source.provider,
+            model: source.id,
+            stopReason: .stop
+        )
+        let contexts = ContextRecorder()
+        let agent = Agent(
+            state: AgentState(
+                systemPrompt: "",
+                model: source,
+                messages: [.assistant(history)]
+            )
+        ) { model, context, _ in
+            await contexts.append(context)
+            let stream = AssistantEventStream()
+            let response = AssistantMessage(
+                content: [.text(text: "done")],
+                api: model.api,
+                provider: model.provider,
+                model: model.id,
+                stopReason: .stop
+            )
+            await stream.emit(.start(response))
+            await stream.emit(.done(reason: .stop, message: response))
+            return stream
+        }
+        await agent.setModel(target)
+        try await agent.prompt(UserMessage("continue"))
+        let requests = await contexts.values()
+        guard case .assistant(let transformed)? = requests.first?.messages.first else {
+            return XCTFail("Expected transformed assistant history")
+        }
+        XCTAssertEqual(
+            transformed.content,
+            [.text(text: "<thinking>private</thinking>")]
+        )
+    }
+
     func testConcurrentPromptRejected() async throws {
         let provider = FauxProvider()
         let model = await provider.models[0]
@@ -324,6 +383,12 @@ private actor SequenceRecorder {
     private var stored: [String] = []
     func append(_ value: String) { stored.append(value) }
     func values() -> [String] { stored }
+}
+
+private actor ContextRecorder {
+    private var stored: [Context] = []
+    func append(_ value: Context) { stored.append(value) }
+    func values() -> [Context] { stored }
 }
 
 private actor IntegerCounter {

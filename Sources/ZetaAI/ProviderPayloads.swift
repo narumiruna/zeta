@@ -30,17 +30,26 @@ public enum ProviderPayloadBuilder {
     ) -> JSONValue {
         var messages: [JSONValue] = []
         if let system = context.systemPrompt {
-            messages.append(["role": "system", "content": .string(system)])
+            let role =
+                model.compatibilityBool("supportsDeveloperRole") == true
+                ? "developer" : "system"
+            messages.append(["role": .string(role), "content": .string(system)])
         }
         messages += context.messages.map(openAIMessage)
         var object: OrderedJSONObject = [
             "model": .string(model.id),
             "messages": .array(messages),
             "stream": true,
-            "stream_options": ["include_usage": true],
         ]
-        addCommonOptions(&object, options: options)
-        addOpenAITools(&object, context: context)
+        if model.compatibilityBool("supportsUsageInStreaming") != false {
+            object["stream_options"] = ["include_usage": true]
+        }
+        if model.compatibilityBool("supportsStore") == true {
+            object["store"] = false
+        }
+        addCommonOptions(&object, model: model, options: options)
+        addOpenAIThinking(&object, model: model, options: options)
+        addOpenAITools(&object, model: model, context: context)
         return .object(object)
     }
 
@@ -51,7 +60,10 @@ public enum ProviderPayloadBuilder {
     ) -> JSONValue {
         var input: [JSONValue] = context.messages.flatMap(responseItems)
         if let system = context.systemPrompt {
-            input.insert(["role": "developer", "content": .string(system)], at: 0)
+            let role =
+                model.compatibilityBool("supportsDeveloperRole") != false
+                ? "developer" : "system"
+            input.insert(["role": .string(role), "content": .string(system)], at: 0)
         }
         var object: OrderedJSONObject = [
             "model": .string(model.id),
@@ -67,7 +79,13 @@ public enum ProviderPayloadBuilder {
         if let sessionID = options.sessionID {
             object["prompt_cache_key"] = .string(sessionID)
         }
-        addOpenAITools(&object, context: context)
+        addOpenAIResponsesTools(&object, model: model, context: context)
+        if let requested = options.thinking,
+            let effort = model.requestThinkingValue(requested),
+            requested != .off || model.thinkingLevelMapValue(.off) != nil
+        {
+            object["reasoning"] = ["effort": .string(effort)]
+        }
         return .object(object)
     }
 
@@ -85,23 +103,41 @@ public enum ProviderPayloadBuilder {
         if let system = context.systemPrompt {
             object["system"] = .array([["type": "text", "text": .string(system)]])
         }
-        if let temperature = options.temperature {
+        if let temperature = options.temperature,
+            model.compatibilityBool("supportsTemperature") != false
+        {
             object["temperature"] = .number(try! JSONNumber(temperature))
         }
         if let thinking = options.thinking, thinking != .off {
-            object["thinking"] = [
-                "type": "enabled",
-                "budget_tokens": .number(JSONNumber(thinkingBudget(thinking))),
-            ]
+            let resolved = model.resolvedThinkingLevel(thinking)
+            if model.compatibilityBool("forceAdaptiveThinking") == true {
+                object["thinking"] = ["type": "adaptive"]
+                if let effort = model.requestThinkingValue(resolved) {
+                    object["output_config"] = ["effort": .string(effort)]
+                }
+            } else {
+                object["thinking"] = [
+                    "type": "enabled",
+                    "budget_tokens": .number(JSONNumber(max(1_024, thinkingBudget(resolved)))),
+                ]
+            }
+        } else if options.thinking == .off, model.reasoning,
+            model.thinkingLevelMapValue(.off) != .null
+        {
+            object["thinking"] = ["type": "disabled"]
         }
         if let tools = context.tools, !tools.isEmpty {
             object["tools"] = .array(
                 tools.map { tool in
-                    [
+                    var value: OrderedJSONObject = [
                         "name": .string(tool.name),
                         "description": .string(tool.description),
                         "input_schema": tool.parameters,
                     ]
+                    if model.compatibilityBool("supportsStrictTools") == true {
+                        value["strict"] = true
+                    }
+                    return .object(value)
                 })
         }
         return .object(object)
@@ -128,9 +164,11 @@ public enum ProviderPayloadBuilder {
         if let temperature = options.temperature {
             generation["temperature"] = .number(try! JSONNumber(temperature))
         }
-        if let thinking = options.thinking, thinking != .off {
+        if let thinking = options.thinking, model.reasoning {
+            let resolved = model.resolvedThinkingLevel(thinking)
             generation["thinkingConfig"] = [
-                "thinkingBudget": .number(JSONNumber(thinkingBudget(thinking)))
+                "includeThoughts": .bool(thinking != .off),
+                "thinkingBudget": .number(JSONNumber(thinkingBudget(resolved))),
             ]
         }
         if !generation.isEmpty {
@@ -158,14 +196,56 @@ public enum ProviderPayloadBuilder {
         context: Context,
         options: StreamOptions
     ) -> JSONValue {
+        var inference: OrderedJSONObject = [
+            "maxTokens": .number(JSONNumber(options.maximumTokens ?? model.maximumTokens))
+        ]
+        if let temperature = options.temperature {
+            inference["temperature"] = .number(try! JSONNumber(temperature))
+        }
         var object: OrderedJSONObject = [
-            "messages": .array(context.messages.map(anthropicMessage)),
-            "inferenceConfig": [
-                "maxTokens": .number(JSONNumber(options.maximumTokens ?? model.maximumTokens))
-            ],
+            "messages": .array(bedrockMessages(context.messages)),
+            "inferenceConfig": .object(inference),
         ]
         if let system = context.systemPrompt {
             object["system"] = .array([["text": .string(system)]])
+        }
+        if let tools = context.tools, !tools.isEmpty {
+            object["toolConfig"] = [
+                "tools": .array(
+                    tools.map { tool in
+                        var specification: OrderedJSONObject = [
+                            "name": .string(tool.name),
+                            "description": .string(tool.description),
+                            "inputSchema": ["json": tool.parameters],
+                        ]
+                        if model.compatibilityBool("supportsStrictMode") == true {
+                            specification["strict"] = true
+                        }
+                        return ["toolSpec": .object(specification)]
+                    }
+                )
+            ]
+        }
+        if let requested = options.thinking, requested != .off,
+            model.reasoning,
+            model.id.lowercased().contains("claude")
+        {
+            let resolved = model.resolvedThinkingLevel(requested)
+            if bedrockUsesAdaptiveThinking(model) {
+                object["additionalModelRequestFields"] = [
+                    "thinking": ["type": "adaptive"],
+                    "output_config": [
+                        "effort": .string(model.requestThinkingValue(resolved) ?? resolved.rawValue)
+                    ],
+                ]
+            } else {
+                object["additionalModelRequestFields"] = [
+                    "thinking": [
+                        "type": "enabled",
+                        "budget_tokens": .number(JSONNumber(bedrockThinkingBudget(resolved))),
+                    ]
+                ]
+            }
         }
         return .object(object)
     }
@@ -251,15 +331,25 @@ public enum ProviderPayloadBuilder {
             }
             return output
         case .toolResult(let result):
+            let output: JSONValue
+            let content = result.content.map(responseInputContent)
+            if content.contains(where: {
+                if case .object(let value) = $0 { return value["type"] == "input_image" }
+                return false
+            }) {
+                output = .array(content)
+            } else {
+                output = .string(text(from: result.content))
+            }
             return [
                 [
                     "type": "function_call_output",
                     "call_id": .string(result.toolCallId),
-                    "output": .string(text(from: result.content)),
+                    "output": output,
                 ]
             ]
         case .user(let user):
-            return [["role": "user", "content": .array(user.content.map(openAIContent))]]
+            return [["role": "user", "content": .array(user.content.map(responseInputContent))]]
         case .custom(let value):
             return [
                 [
@@ -301,6 +391,113 @@ public enum ProviderPayloadBuilder {
         }
     }
 
+    private static func bedrockMessages(_ messages: [Message]) -> [JSONValue] {
+        var output: [JSONValue] = []
+        var index = 0
+        while index < messages.count {
+            switch messages[index] {
+            case .user(let message):
+                output.append([
+                    "role": "user",
+                    "content": .array(message.content.compactMap(bedrockContent)),
+                ])
+            case .assistant(let message):
+                output.append([
+                    "role": "assistant",
+                    "content": .array(message.content.compactMap(bedrockContent)),
+                ])
+            case .toolResult:
+                var results: [JSONValue] = []
+                while index < messages.count,
+                    case .toolResult(let result) = messages[index]
+                {
+                    results.append([
+                        "toolResult": [
+                            "toolUseId": .string(result.toolCallId),
+                            "content": .array(result.content.compactMap(bedrockToolResultContent)),
+                            "status": .string(result.isError ? "error" : "success"),
+                        ]
+                    ])
+                    index += 1
+                }
+                output.append(["role": "user", "content": .array(results)])
+                continue
+            case .custom(let message):
+                output.append([
+                    "role": "user",
+                    "content": .array([["text": .string(OrderedJSON.string(message.content))]]),
+                ])
+            }
+            index += 1
+        }
+        return output
+    }
+
+    private static func bedrockContent(_ block: ContentBlock) -> JSONValue? {
+        switch block {
+        case .text(let text, _):
+            return text.isEmpty ? nil : ["text": .string(text)]
+        case .image(let data, let mime):
+            return [
+                "image": [
+                    "format": .string(bedrockImageFormat(mime)),
+                    "source": ["bytes": .string(data)],
+                ]
+            ]
+        case .thinking(let text, let signature, let redacted):
+            if redacted {
+                guard let signature, !signature.isEmpty else { return nil }
+                return ["reasoningContent": ["redactedContent": .string(signature)]]
+            }
+            guard !text.isEmpty else { return nil }
+            if let signature, !signature.isEmpty {
+                return [
+                    "reasoningContent": [
+                        "reasoningText": [
+                            "text": .string(text),
+                            "signature": .string(signature),
+                        ]
+                    ]
+                ]
+            }
+            return ["text": .string(text)]
+        case .toolCall(let call):
+            return [
+                "toolUse": [
+                    "toolUseId": .string(call.id),
+                    "name": .string(call.name),
+                    "input": call.arguments,
+                ]
+            ]
+        }
+    }
+
+    private static func bedrockToolResultContent(_ block: ContentBlock) -> JSONValue? {
+        switch block {
+        case .text(let text, _):
+            return ["text": .string(text.isEmpty ? "<empty>" : text)]
+        case .image(let data, let mime):
+            return [
+                "image": [
+                    "format": .string(bedrockImageFormat(mime)),
+                    "source": ["bytes": .string(data)],
+                ]
+            ]
+        case .thinking, .toolCall:
+            return nil
+        }
+    }
+
+    private static func bedrockImageFormat(_ mime: String) -> String {
+        switch mime.lowercased() {
+        case "image/jpeg", "image/jpg": "jpeg"
+        case "image/png": "png"
+        case "image/gif": "gif"
+        case "image/webp": "webp"
+        default: mime.replacingOccurrences(of: "image/", with: "")
+        }
+    }
+
     private static func googleMessage(_ message: Message) -> JSONValue {
         switch message {
         case .user(let value):
@@ -339,6 +536,23 @@ public enum ProviderPayloadBuilder {
             ["type": "image_url", "image_url": ["url": .string("data:\(mime);base64,\(data)")]]
         case .thinking(let text, _, _):
             ["type": "text", "text": .string("<thinking>\(text)</thinking>")]
+        case .toolCall:
+            .null
+        }
+    }
+
+    private static func responseInputContent(_ block: ContentBlock) -> JSONValue {
+        switch block {
+        case .text(let text, _):
+            ["type": "input_text", "text": .string(text)]
+        case .image(let data, let mime):
+            [
+                "type": "input_image",
+                "detail": "auto",
+                "image_url": .string("data:\(mime);base64,\(data)"),
+            ]
+        case .thinking(let text, _, _):
+            ["type": "input_text", "text": .string("<thinking>\(text)</thinking>")]
         case .toolCall:
             .null
         }
@@ -390,32 +604,112 @@ public enum ProviderPayloadBuilder {
 
     private static func addCommonOptions(
         _ object: inout OrderedJSONObject,
+        model: Model,
         options: StreamOptions
     ) {
         if let temperature = options.temperature {
             object["temperature"] = .number(try! JSONNumber(temperature))
         }
         if let maximum = options.maximumTokens {
-            object["max_completion_tokens"] = .number(JSONNumber(maximum))
+            let field = model.compatibilityString("maxTokensField") ?? "max_completion_tokens"
+            object[field] = .number(JSONNumber(maximum))
+        }
+    }
+
+    private static func addOpenAIThinking(
+        _ object: inout OrderedJSONObject,
+        model: Model,
+        options: StreamOptions
+    ) {
+        guard model.reasoning, let requested = options.thinking else { return }
+        let enabled = requested != .off
+        let effort = enabled ? model.requestThinkingValue(requested) : model.requestThinkingValue(.off)
+        switch model.compatibilityString("thinkingFormat") ?? "openai" {
+        case "openrouter":
+            if let effort { object["reasoning"] = ["effort": .string(effort)] }
+        case "deepseek", "zai":
+            object["thinking"] = ["type": .string(enabled ? "enabled" : "disabled")]
+            if enabled, model.compatibilityBool("supportsReasoningEffort") == true,
+                let effort
+            {
+                object["reasoning_effort"] = .string(effort)
+            }
+        case "qwen":
+            object["enable_thinking"] = .bool(enabled)
+            if enabled, model.compatibilityBool("supportsReasoningEffort") == true,
+                let effort
+            {
+                object["reasoning_effort"] = .string(effort)
+            }
+        case "qwen-chat-template":
+            object["chat_template_kwargs"] = [
+                "enable_thinking": .bool(enabled),
+                "preserve_thinking": true,
+            ]
+        case "together":
+            object["reasoning"] = ["enabled": .bool(enabled)]
+            if enabled, model.compatibilityBool("supportsReasoningEffort") == true,
+                let effort
+            {
+                object["reasoning_effort"] = .string(effort)
+            }
+        case "string-thinking":
+            if let effort { object["thinking"] = .string(effort) }
+        case "ant-ling":
+            if enabled, let effort {
+                object["reasoning"] = ["effort": .string(effort)]
+            }
+        default:
+            if model.compatibilityBool("supportsReasoningEffort") == true,
+                let effort
+            {
+                object["reasoning_effort"] = .string(effort)
+            }
         }
     }
 
     private static func addOpenAITools(
         _ object: inout OrderedJSONObject,
+        model: Model,
         context: Context
     ) {
         guard let tools = context.tools, !tools.isEmpty else { return }
         object["tools"] = .array(
             tools.map { tool in
-                [
+                var function: OrderedJSONObject = [
+                    "name": .string(tool.name),
+                    "description": .string(tool.description),
+                    "parameters": tool.parameters,
+                ]
+                if model.compatibilityBool("supportsStrictMode") == true {
+                    function["strict"] = true
+                }
+                return [
                     "type": "function",
-                    "function": [
-                        "name": .string(tool.name),
-                        "description": .string(tool.description),
-                        "parameters": tool.parameters,
-                    ],
+                    "function": .object(function),
                 ]
             })
+    }
+
+    private static func addOpenAIResponsesTools(
+        _ object: inout OrderedJSONObject,
+        model: Model,
+        context: Context
+    ) {
+        guard let tools = context.tools, !tools.isEmpty else { return }
+        let supportsStrictMode = model.compatibilityBool("supportsStrictMode") ?? true
+        object["tools"] = .array(
+            tools.map { tool in
+                var value: OrderedJSONObject = [
+                    "type": "function",
+                    "name": .string(tool.name),
+                    "description": .string(tool.description),
+                    "parameters": tool.parameters,
+                ]
+                if supportsStrictMode { value["strict"] = true }
+                return .object(value)
+            }
+        )
     }
 
     private static func text(from blocks: [ContentBlock]) -> String {
@@ -426,6 +720,26 @@ public enum ProviderPayloadBuilder {
             default: nil
             }
         }.joined(separator: "\n")
+    }
+
+    private static func bedrockUsesAdaptiveThinking(_ model: Model) -> Bool {
+        let value = "\(model.id) \(model.name)".lowercased()
+            .replacingOccurrences(of: "_", with: "-")
+            .replacingOccurrences(of: ".", with: "-")
+        return [
+            "opus-4-6", "opus-4-7", "opus-4-8", "opus-5",
+            "sonnet-4-6", "sonnet-5", "fable-5",
+        ].contains { value.contains($0) }
+    }
+
+    private static func bedrockThinkingBudget(_ level: ThinkingLevel) -> Int {
+        switch level {
+        case .off: 0
+        case .minimal: 1_024
+        case .low: 2_048
+        case .medium: 8_192
+        case .high, .xhigh, .max: 16_384
+        }
     }
 
     private static func thinkingBudget(_ level: ThinkingLevel) -> Int {

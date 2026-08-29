@@ -1,5 +1,7 @@
 import Foundation
 import XCTest
+import ZetaAI
+import ZetaAuth
 
 @testable import ZetaBedrock
 
@@ -28,6 +30,121 @@ final class ZetaBedrockTests: XCTestCase {
         _ = try truncated.push(Data(eventMessage(headers: [:], payload: Data()).dropLast()))
         XCTAssertThrowsError(try truncated.finish())
     }
+
+    func testBearerAndSigV4RequestsUseDistinctAuthorization() throws {
+        var request = URLRequest(url: URL(string: "https://bedrock.example.com/model/test")!)
+        request.httpMethod = "POST"
+        let body = Data("{}".utf8)
+        let date = Date(timeIntervalSince1970: 0)
+
+        let bearerCredential = try XCTUnwrap(
+            CredentialResolver.aws(environment: [
+                "AWS_BEARER_TOKEN_BEDROCK": "bedrock-token"
+            ])
+        )
+        let bearer = try BedrockProvider.authorizedRequest(
+            request,
+            body: body,
+            region: "us-east-1",
+            credential: bearerCredential,
+            date: date
+        )
+        XCTAssertEqual(
+            bearer.value(forHTTPHeaderField: "Authorization"),
+            "Bearer bedrock-token"
+        )
+        XCTAssertNil(bearer.value(forHTTPHeaderField: "x-amz-date"))
+        XCTAssertNil(bearer.value(forHTTPHeaderField: "x-amz-security-token"))
+        XCTAssertEqual(bearer.httpBody, body)
+
+        let signed = try BedrockProvider.authorizedRequest(
+            request,
+            body: body,
+            region: "us-east-1",
+            credential: AWSCredential(
+                accessKeyID: "access",
+                secretAccessKey: "secret"
+            ),
+            date: date
+        )
+        XCTAssertTrue(
+            signed.value(forHTTPHeaderField: "Authorization")?
+                .hasPrefix("AWS4-HMAC-SHA256 Credential=access/") == true
+        )
+        XCTAssertNotNil(signed.value(forHTTPHeaderField: "x-amz-date"))
+        XCTAssertEqual(signed.httpBody, body)
+    }
+
+    func testToolUseStreamParsesFragmentedInputAndStopReason() async throws {
+        let credential = try XCTUnwrap(
+            CredentialResolver.aws(environment: [
+                "AWS_BEARER_TOKEN_BEDROCK": "unused"
+            ])
+        )
+        let provider = BedrockProvider(models: [], region: "us-east-1") {
+            credential
+        }
+        var partial = AssistantMessage(
+            api: "bedrock-converse-stream",
+            provider: "amazon-bedrock",
+            model: "test-model"
+        )
+        var toolInputBuffers: [Int: String] = [:]
+        let stream = AssistantEventStream()
+        await stream.emit(.start(partial))
+        let eventsTask = Task { () throws -> [AssistantEvent] in
+            var events: [AssistantEvent] = []
+            for try await event in stream { events.append(event) }
+            return events
+        }
+
+        try await provider.consume(
+            [
+                bedrockMessage(
+                    #"{"contentBlockStart":{"contentBlockIndex":0,"start":{"toolUse":{"toolUseId":"call-1","name":"weather"}}}}"#
+                ),
+                bedrockMessage(
+                    #"{"contentBlockDelta":{"contentBlockIndex":0,"delta":{"toolUse":{"input":"{\"city\":\"San"}}}}"#
+                ),
+                bedrockMessage(
+                    #"{"contentBlockDelta":{"contentBlockIndex":0,"delta":{"toolUse":{"input":" Francisco\"}"}}}}"#
+                ),
+                bedrockMessage(#"{"contentBlockStop":{"contentBlockIndex":0}}"#),
+                bedrockMessage(#"{"messageStop":{"stopReason":"tool_use"}}"#),
+                bedrockMessage(
+                    #"{"metadata":{"usage":{"inputTokens":7,"outputTokens":3}}}"#
+                ),
+            ],
+            partial: &partial,
+            toolInputBuffers: &toolInputBuffers,
+            stream: stream
+        )
+        await stream.emit(.done(reason: partial.stopReason, message: partial))
+        let events = try await eventsTask.value
+
+        XCTAssertEqual(
+            partial.content,
+            [
+                .toolCall(
+                    ToolCall(
+                        id: "call-1",
+                        name: "weather",
+                        arguments: ["city": "San Francisco"]
+                    )
+                )
+            ]
+        )
+        XCTAssertEqual(partial.stopReason, .toolUse)
+        XCTAssertEqual(partial.rawStopReason, "tool_use")
+        XCTAssertEqual(partial.usage.totalTokens, 10)
+        XCTAssertTrue(events.contains { if case .toolCallStart(0, _) = $0 { true } else { false } })
+        XCTAssertTrue(events.contains { if case .toolCallDelta(0, _, _) = $0 { true } else { false } })
+        XCTAssertTrue(events.contains { if case .toolCallEnd(0, _, _) = $0 { true } else { false } })
+    }
+}
+
+private func bedrockMessage(_ payload: String) -> AWSEventStreamMessage {
+    AWSEventStreamMessage(headers: [":message-type": "event"], payload: Data(payload.utf8))
 }
 
 private func eventMessage(headers: [String: String], payload: Data) -> Data {

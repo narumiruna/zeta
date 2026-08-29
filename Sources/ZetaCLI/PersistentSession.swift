@@ -85,7 +85,24 @@ actor PersistentSessionController {
 
     func currentEntries() async -> [SessionEntry] { await manager.allEntries() }
     func currentMessages() async throws -> [Message] { try await manager.context().messages }
+    func currentFile() async -> URL? { await manager.file }
     func persistenceErrors() -> [String] { errors }
+
+    @discardableResult
+    func newSession() async throws -> URL? {
+        let currentFile = await manager.file
+        let root =
+            currentFile?.deletingLastPathComponent()
+            ?? FileManager.default.temporaryDirectory
+        let replacement = try Self.create(
+            root: root,
+            cwd: await manager.header.cwd
+        )
+        try await replacement.materialize()
+        manager = replacement
+        errors = []
+        return await replacement.file
+    }
 
     func recordCompaction(
         summary: String,

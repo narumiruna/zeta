@@ -91,7 +91,7 @@ Regenerate it with `uv run python scripts/generate-api-docs.py`.
 | `init(id:models:pool:environment:)` | Initializer |
 | `init(id:models:tokensPerSecond:)` | Initializer |
 | `init(id:name:api:provider:baseURL:input:output:cost:)` | Initializer |
-| `init(id:name:api:provider:baseURL:reasoning:input:cost:contextWindow:maximumTokens:)` | Initializer |
+| `init(id:name:api:provider:baseURL:reasoning:input:cost:contextWindow:maximumTokens:headers:compat:thinkingLevelMap:baseURLTemplate:)` | Initializer |
 | `init(id:name:arguments:thoughtSignature:namespace:)` | Initializer |
 | `init(idleTimeout:factory:)` | Initializer |
 | `init(input:output:cacheRead:cacheWrite:)` | Initializer |
@@ -114,6 +114,9 @@ Regenerate it with `uv run python scripts/generate-api-docs.py`.
 | `cancel(api:provider:model:)` | Instance Method |
 | `close()` | Instance Method |
 | `closeAll()` | Instance Method |
+| `compatibility(_:)` | Instance Method |
+| `compatibilityBool(_:)` | Instance Method |
+| `compatibilityString(_:)` | Instance Method |
 | `consume(_:eventName:)` | Instance Method |
 | `count()` | Instance Method |
 | `delete(provider:)` | Instance Method |
@@ -134,11 +137,14 @@ Regenerate it with `uv run python scripts/generate-api-docs.py`.
 | `receive()` | Instance Method |
 | `refresh(allowNetwork:)` | Instance Method |
 | `remove(_:)` | Instance Method |
+| `requestThinkingValue(_:)` | Instance Method |
+| `resolvedThinkingLevel(_:)` | Instance Method |
 | `restore()` | Instance Method |
 | `result()` | Instance Method |
 | `send(_:)` | Instance Method |
 | `set(_:)` | Instance Method |
 | `stream(model:context:options:)` | Instance Method |
+| `thinkingLevelMapValue(_:)` | Instance Method |
 | `withConnection(key:url:headers:operation:)` | Instance Method |
 | `write(provider:entry:)` | Instance Method |
 | `aborted` | Instance Property |
@@ -149,11 +155,13 @@ Regenerate it with `uv run python scripts/generate-api-docs.py`.
 | `apiKeyEnvironmentVariables` | Instance Property |
 | `arguments` | Instance Property |
 | `baseURL` | Instance Property |
+| `baseURLTemplate` | Instance Property |
 | `cacheRead` | Instance Property |
 | `cacheRetention` | Instance Property |
 | `cacheWrite` | Instance Property |
 | `cacheWrite1h` | Instance Property |
 | `checkedAt` | Instance Property |
+| `compat` | Instance Property |
 | `configuration` | Instance Property |
 | `content` | Instance Property |
 | `contextWindow` | Instance Property |
@@ -207,6 +215,7 @@ Regenerate it with `uv run python scripts/generate-api-docs.py`.
 | `systemPrompt` | Instance Property |
 | `temperature` | Instance Property |
 | `thinking` | Instance Property |
+| `thinkingLevelMap` | Instance Property |
 | `thoughtSignature` | Instance Property |
 | `timeout` | Instance Property |
 | `timestamp` | Instance Property |

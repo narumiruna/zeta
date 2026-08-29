@@ -11,6 +11,46 @@ final class ZetaAITests: XCTestCase {
         XCTAssertNotNil(catalog.model(provider: "openai", id: "gpt-4o-mini"))
     }
 
+    func testBundledCatalogRetainsGeneratedRequestMetadata() throws {
+        let catalog = try BuiltinModelCatalog.bundled()
+        let vertex = try XCTUnwrap(
+            catalog.model(provider: "google-vertex", id: "gemini-2.5-flash")
+        )
+        XCTAssertEqual(
+            vertex.baseURLTemplate,
+            "https://{location}-aiplatform.googleapis.com"
+        )
+        let anthropic = try XCTUnwrap(
+            catalog.model(provider: "anthropic", id: "claude-fable-5")
+        )
+        XCTAssertEqual(anthropic.compatibilityBool("forceAdaptiveThinking"), true)
+        XCTAssertEqual(anthropic.thinkingLevelMapValue(.off), .null)
+        XCTAssertEqual(anthropic.requestThinkingValue(.xhigh), "xhigh")
+        let copilot = try XCTUnwrap(
+            catalog.model(provider: "github-copilot", id: "claude-fable-5")
+        )
+        XCTAssertEqual(copilot.headers?["Copilot-Integration-Id"], "vscode-chat")
+        let bedrock = try XCTUnwrap(
+            catalog.model(
+                provider: "amazon-bedrock",
+                id: "anthropic.claude-opus-4-6-v1"
+            )
+        )
+        let payload = try ProviderPayloadBuilder.build(
+            model: bedrock,
+            context: Context(),
+            options: StreamOptions(thinking: .high)
+        )
+        XCTAssertEqual(
+            jsonPath(payload, "additionalModelRequestFields", "thinking", "type"),
+            "adaptive"
+        )
+        XCTAssertEqual(
+            jsonPath(payload, "additionalModelRequestFields", "output_config", "effort"),
+            "high"
+        )
+    }
+
     func testDynamicCatalogPersistenceRefreshAndCaseInsensitiveHeaders() async throws {
         let model = Model(
             id: "dynamic",
@@ -116,6 +156,152 @@ final class ZetaAITests: XCTestCase {
         }
     }
 
+    func testResponsesAndBedrockPayloadsUseProviderSpecificContentAndTools() throws {
+        let context = Context(
+            messages: [
+                .user(
+                    UserMessage(
+                        content: [
+                            .text(text: "look"),
+                            .image(data: "aGVsbG8=", mimeType: "image/png"),
+                        ],
+                        timestamp: 1
+                    )
+                ),
+                .assistant(
+                    AssistantMessage(
+                        content: [
+                            .toolCall(
+                                ToolCall(
+                                    id: "call-1",
+                                    name: "read",
+                                    arguments: ["path": "README.md"]
+                                )
+                            )
+                        ],
+                        api: "bedrock-converse-stream",
+                        provider: "amazon-bedrock",
+                        model: "claude",
+                        stopReason: .toolUse
+                    )
+                ),
+                .toolResult(
+                    ToolResultMessage(
+                        toolCallId: "call-1",
+                        toolName: "read",
+                        content: [.text(text: "done")],
+                        isError: false
+                    )
+                ),
+            ],
+            tools: [
+                ToolDefinition(
+                    name: "read",
+                    description: "Read a file",
+                    parameters: ["type": "object"]
+                )
+            ]
+        )
+        let responses = Model(
+            id: "gpt",
+            name: "GPT",
+            api: "openai-responses",
+            provider: "openai",
+            baseURL: URL(string: "https://example.com/v1")!,
+            contextWindow: 100,
+            maximumTokens: 10
+        )
+        let responsesPayload = try ProviderPayloadBuilder.build(
+            model: responses,
+            context: context,
+            options: StreamOptions()
+        )
+        XCTAssertEqual(
+            jsonPath(responsesPayload, "input", "0", "content", "0", "type"),
+            "input_text"
+        )
+        XCTAssertEqual(
+            jsonPath(responsesPayload, "input", "0", "content", "1", "type"),
+            "input_image"
+        )
+        XCTAssertEqual(jsonPath(responsesPayload, "tools", "0", "name"), "read")
+        XCTAssertNil(jsonPath(responsesPayload, "tools", "0", "function"))
+
+        let bedrock = Model(
+            id: "anthropic.claude-test",
+            name: "Claude",
+            api: "bedrock-converse-stream",
+            provider: "amazon-bedrock",
+            baseURL: URL(string: "https://example.com")!,
+            contextWindow: 100,
+            maximumTokens: 10,
+            compat: ["supportsStrictMode": true]
+        )
+        let bedrockPayload = try ProviderPayloadBuilder.build(
+            model: bedrock,
+            context: context,
+            options: StreamOptions()
+        )
+        XCTAssertEqual(
+            jsonPath(bedrockPayload, "messages", "1", "content", "0", "toolUse", "toolUseId"),
+            "call-1"
+        )
+        XCTAssertEqual(
+            jsonPath(bedrockPayload, "messages", "2", "content", "0", "toolResult", "status"),
+            "success"
+        )
+        XCTAssertEqual(
+            jsonPath(bedrockPayload, "toolConfig", "tools", "0", "toolSpec", "name"),
+            "read"
+        )
+        XCTAssertEqual(
+            jsonPath(bedrockPayload, "toolConfig", "tools", "0", "toolSpec", "strict"),
+            true
+        )
+    }
+
+    func testOpenAICompatAndThinkingMetadataAffectPayload() throws {
+        let model = Model(
+            id: "reasoning",
+            name: "Reasoning",
+            api: "openai-completions",
+            provider: "compatible",
+            baseURL: URL(string: "https://example.com/v1")!,
+            reasoning: true,
+            contextWindow: 100,
+            maximumTokens: 10,
+            compat: [
+                "supportsUsageInStreaming": false,
+                "supportsDeveloperRole": true,
+                "supportsStrictMode": true,
+                "maxTokensField": "max_tokens",
+                "thinkingFormat": "openrouter",
+            ],
+            thinkingLevelMap: ["high": "provider-high"]
+        )
+        let payload = try ProviderPayloadBuilder.build(
+            model: model,
+            context: Context(
+                systemPrompt: "system",
+                messages: [.user(UserMessage("hello"))],
+                tools: [
+                    ToolDefinition(
+                        name: "read",
+                        description: "Read",
+                        parameters: ["type": "object"]
+                    )
+                ]
+            ),
+            options: StreamOptions(maximumTokens: 7, thinking: .high)
+        )
+        XCTAssertNil(jsonPath(payload, "stream_options"))
+        XCTAssertEqual(jsonPath(payload, "max_tokens"), 7)
+        XCTAssertNil(jsonPath(payload, "max_completion_tokens"))
+        XCTAssertEqual(jsonPath(payload, "reasoning", "effort"), "provider-high")
+        XCTAssertEqual(jsonPath(payload, "messages", "0", "role"), "developer")
+        XCTAssertEqual(jsonPath(payload, "tools", "0", "function", "strict"), true)
+    }
+
     func testProviderEventReducerHandlesTextThinkingToolsAndUsage() throws {
         let model = Model(
             id: "model",
@@ -174,6 +360,107 @@ final class ZetaAITests: XCTestCase {
         ])
         XCTAssertEqual(reducer.partial.stopReason, .toolUse)
         XCTAssertEqual(reducer.partial.usage.totalTokens, 5)
+    }
+
+    func testProviderEventReducerPreservesParallelOpenAIToolCalls() throws {
+        let model = Model(
+            id: "model",
+            name: "Model",
+            api: "openai-completions",
+            provider: "openai",
+            baseURL: URL(string: "https://example.com")!,
+            contextWindow: 100,
+            maximumTokens: 10
+        )
+        var reducer = ProviderEventReducer(model: model)
+        let starts = try reducer.consume([
+            "choices": .array([
+                [
+                    "delta": [
+                        "tool_calls": .array([
+                            [
+                                "index": 0,
+                                "id": "call-a",
+                                "function": ["name": "read", "arguments": "{\"path\":\"A"],
+                            ],
+                            [
+                                "index": 1,
+                                "id": "call-b",
+                                "function": ["name": "write", "arguments": "{\"path\":\"B"],
+                            ],
+                        ])
+                    ]
+                ]
+            ])
+        ])
+        XCTAssertEqual(starts.filter { if case .toolCallStart = $0 { true } else { false } }.count, 2)
+        _ = try reducer.consume([
+            "choices": .array([
+                [
+                    "delta": [
+                        "tool_calls": .array([
+                            ["index": 1, "function": ["arguments": "\"}"]],
+                            ["index": 0, "function": ["arguments": "\"}"]],
+                        ])
+                    ]
+                ]
+            ])
+        ])
+        let ends = try reducer.consume([
+            "choices": .array([["delta": [:], "finish_reason": "tool_calls"]])
+        ])
+        XCTAssertEqual(ends.filter { if case .toolCallEnd = $0 { true } else { false } }.count, 2)
+        guard case .toolCall(let first) = reducer.partial.content[0],
+            case .toolCall(let second) = reducer.partial.content[1]
+        else {
+            return XCTFail("Expected parallel tool calls")
+        }
+        XCTAssertEqual(first.id, "call-a")
+        XCTAssertEqual(first.name, "read")
+        XCTAssertEqual(first.arguments, ["path": "A"])
+        XCTAssertEqual(second.id, "call-b")
+        XCTAssertEqual(second.name, "write")
+        XCTAssertEqual(second.arguments, ["path": "B"])
+    }
+
+    func testProviderEventReducerPreservesAnthropicThinkingMetadata() throws {
+        let model = Model(
+            id: "claude",
+            name: "Claude",
+            api: "anthropic-messages",
+            provider: "anthropic",
+            baseURL: URL(string: "https://example.com")!,
+            contextWindow: 100,
+            maximumTokens: 10
+        )
+        var reducer = ProviderEventReducer(model: model)
+        _ = try reducer.consume([
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": ["type": "thinking", "thinking": "why"],
+        ])
+        _ = try reducer.consume([
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": ["type": "signature_delta", "signature": "opaque"],
+        ])
+        _ = try reducer.consume([
+            "type": "content_block_start",
+            "index": 1,
+            "content_block": ["type": "redacted_thinking", "data": "encrypted"],
+        ])
+        XCTAssertEqual(
+            reducer.partial.content[0],
+            .thinking(text: "why", signature: "opaque")
+        )
+        XCTAssertEqual(
+            reducer.partial.content[1],
+            .thinking(
+                text: "[Reasoning redacted]",
+                signature: "encrypted",
+                redacted: true
+            )
+        )
     }
 
     func testCrossProviderTransformsRepairToolsAndRetryClassification() {
@@ -362,11 +649,58 @@ final class ZetaAITests: XCTestCase {
         XCTAssertEqual(pendingCount, 0)
     }
 
+    func testVertexRequestResolvesTemplateAndGeneratedHeaders() async throws {
+        let catalog = try BuiltinModelCatalog.bundled()
+        var model = try XCTUnwrap(
+            catalog.model(provider: "google-vertex", id: "gemini-2.5-flash")
+        )
+        model.headers = ["X-Generated": "catalog"]
+        let provider = HTTPProvider(
+            configuration: ProviderConfiguration(
+                id: model.provider,
+                api: model.api,
+                baseURL: model.baseURL,
+                models: [model],
+                apiKeyEnvironmentVariables: []
+            ),
+            environment: { [:] }
+        )
+        let request = try await provider.buildRequest(
+            model: model,
+            context: Context(),
+            apiKey: "key",
+            options: StreamOptions(),
+            environment: [
+                "GOOGLE_CLOUD_PROJECT": "sample-project",
+                "GOOGLE_CLOUD_LOCATION": "us-central1",
+            ]
+        )
+        XCTAssertEqual(
+            request.url?.absoluteString,
+            "https://us-central1-aiplatform.googleapis.com/v1/projects/sample-project/locations/us-central1/publishers/google/models/gemini-2.5-flash:streamGenerateContent?alt=sse"
+        )
+        XCTAssertEqual(request.value(forHTTPHeaderField: "x-goog-api-key"), "key")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "X-Generated"), "catalog")
+    }
+
     func testSSEDecoderPreservesUnicodeSeparators() {
         var decoder = SSEDecoder()
         let input = "event: message\ndata: {\"text\":\"a\u{2028}b\"}\n\n"
         let records = input.utf8.flatMap { decoder.push($0) }
         XCTAssertEqual(records, [SSERecord(event: "message", data: "{\"text\":\"a\u{2028}b\"}")])
+    }
+
+    func testSSEDecoderSplitsCRLFRecords() {
+        var decoder = SSEDecoder()
+        let input = "event: first\r\ndata: one\r\n\r\nevent: second\r\ndata: two\r\n\r\n"
+        let records = input.utf8.flatMap { decoder.push($0) }
+        XCTAssertEqual(
+            records,
+            [
+                SSERecord(event: "first", data: "one"),
+                SSERecord(event: "second", data: "two"),
+            ]
+        )
     }
 
     func testCodexWebSocketPoolReusesAndEvictsIdleConnections() async throws {
@@ -436,6 +770,22 @@ final class ZetaAITests: XCTestCase {
         guard case .error(.error, let message) = terminal else { return XCTFail("Expected terminal error") }
         XCTAssertEqual(message.stopReason, .error)
     }
+}
+
+private func jsonPath(_ value: JSONValue, _ path: String...) -> JSONValue? {
+    var current = value
+    for component in path {
+        if case .object(let object) = current, let next = object[component] {
+            current = next
+        } else if case .array(let array) = current,
+            let index = Int(component), array.indices.contains(index)
+        {
+            current = array[index]
+        } else {
+            return nil
+        }
+    }
+    return current
 }
 
 private actor WebSocketFactoryRecorder {

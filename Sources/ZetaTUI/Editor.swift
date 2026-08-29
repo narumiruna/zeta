@@ -12,7 +12,6 @@ public final class Editor: Focusable, @unchecked Sendable {
     private var cursor = 0
     private var undoStack: [([Character], Int)] = []
     private var redoStack: [([Character], Int)] = []
-    private var pasteCounter = 0
     private var completions: [String] = []
 
     public init() {}
@@ -53,6 +52,7 @@ public final class Editor: Focusable, @unchecked Sendable {
         case "\r", "\n":
             guard !disableSubmit else { return }
             let submitted = value()
+            setValue("")
             onSubmit?(submitted)
         case "\u{1B}\r", "\u{1B}\n", "\u{1B}[13;2u", "\u{1B}[13;5u":
             insert("\n")
@@ -96,13 +96,7 @@ public final class Editor: Focusable, @unchecked Sendable {
     }
 
     private func insertPaste(_ value: String) {
-        let lineCount = value.reduce(1) { $1 == "\n" ? $0 + 1 : $0 }
-        if lineCount > 10 {
-            pasteCounter += 1
-            insert("[paste #\(pasteCounter) +\(lineCount) lines]")
-        } else {
-            insert(value)
-        }
+        insert(value)
     }
 
     private func checkpoint() {

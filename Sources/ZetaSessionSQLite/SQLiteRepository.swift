@@ -89,6 +89,7 @@ public actor SQLiteSessionRepository {
     nonisolated(unsafe) private var database: OpaquePointer?
     public let url: URL
     public let leaseTTL: Int64
+    private var searchInitialized = false
 
     public init(url: URL, leaseTTL: Int64 = 30_000) throws {
         self.url = url
@@ -539,7 +540,14 @@ public actor SQLiteSessionRepository {
     }
 
     public func initializeSearch() throws {
-        try Self.execute(database!, Self.searchSchema)
+        guard !searchInitialized else { return }
+        guard let database else { throw SQLiteRepositoryError.open("closed") }
+        try transaction {
+            let needsRebuild = try !Self.searchIndexExists(database)
+            try Self.execute(database, Self.searchSchema)
+            if needsRebuild { try Self.execute(database, Self.searchRebuild) }
+        }
+        searchInitialized = true
     }
 
     public func search(_ phrase: String, limit: Int = 100) throws -> [(
@@ -893,6 +901,23 @@ public actor SQLiteSessionRepository {
         sqlite3_finalize(statement)
     }
 
+    private static func searchIndexExists(_ database: OpaquePointer) throws -> Bool {
+        var statement: OpaquePointer?
+        guard
+            sqlite3_prepare_v2(
+                database,
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='entries_fts'",
+                -1,
+                &statement,
+                nil
+            ) == SQLITE_OK, let statement
+        else {
+            throw SQLiteRepositoryError.execute(String(cString: sqlite3_errmsg(database)))
+        }
+        defer { sqlite3_finalize(statement) }
+        return sqlite3_step(statement) == SQLITE_ROW
+    }
+
     private static let schema = """
         CREATE TABLE IF NOT EXISTS migrations(id TEXT PRIMARY KEY,applied_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY,created_at INTEGER NOT NULL,cwd TEXT NOT NULL,parent_session_id TEXT NULL,metadata TEXT NULL) WITHOUT ROWID;
@@ -929,8 +954,9 @@ public actor SQLiteSessionRepository {
         CREATE TRIGGER IF NOT EXISTS entries_fts_ai AFTER INSERT ON entries BEGIN INSERT INTO entries_fts(rowid,payload) VALUES(new.rowid,new.payload); END;
         CREATE TRIGGER IF NOT EXISTS entries_fts_ad AFTER DELETE ON entries BEGIN INSERT INTO entries_fts(entries_fts,rowid,payload) VALUES('delete',old.rowid,old.payload); END;
         CREATE TRIGGER IF NOT EXISTS entries_fts_au AFTER UPDATE OF payload ON entries BEGIN INSERT INTO entries_fts(entries_fts,rowid,payload) VALUES('delete',old.rowid,old.payload); INSERT INTO entries_fts(rowid,payload) VALUES(new.rowid,new.payload); END;
-        INSERT INTO entries_fts(entries_fts) VALUES('rebuild');
         """
+
+    private static let searchRebuild = "INSERT INTO entries_fts(entries_fts) VALUES('rebuild');"
 }
 
 private let sqliteTransient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)

@@ -19,16 +19,11 @@ extension ZetaCLI {
                 return try await runAuth(Array(arguments.dropFirst()))
             }
             if command == "migrate" {
-                let home = FileManager.default.homeDirectoryForCurrentUser
-                let source = URL(
-                    fileURLWithPath: value(after: "--source", in: arguments)
-                        ?? home.appendingPathComponent(".pi/agent").path
-                )
-                let destination = URL(
-                    fileURLWithPath: value(after: "--destination", in: arguments)
-                        ?? home.appendingPathComponent(".zeta/agent").path
-                )
-                let report = try PiMigrator(source: source, destination: destination).migrate()
+                let locations = migrationLocations(arguments: arguments)
+                let report = try PiMigrator(
+                    source: locations.source,
+                    destination: locations.destination
+                ).migrate()
                 let data = try JSONEncoder().encode(report)
                 print(String(decoding: data, as: UTF8.self))
                 return 0
@@ -160,6 +155,29 @@ extension ZetaCLI {
         case _ where unit?.isNumber == true: return number
         default: throw CLIArgumentError.invalidValue("--min-expiry")
         }
+    }
+
+    static func migrationLocations(
+        arguments: [String],
+        home: URL = FileManager.default.homeDirectoryForCurrentUser,
+        workingDirectory: URL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath),
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> (source: URL, destination: URL) {
+        let paths = ZetaPaths(
+            home: home,
+            workingDirectory: workingDirectory,
+            environment: environment
+        )
+        return (
+            URL(
+                fileURLWithPath: value(after: "--source", in: arguments)
+                    ?? home.appendingPathComponent(".pi/agent").path
+            ),
+            URL(
+                fileURLWithPath: value(after: "--destination", in: arguments)
+                    ?? paths.agentDirectory.path
+            )
+        )
     }
 
     private static func value(

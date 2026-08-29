@@ -314,7 +314,6 @@ public enum ZetaCLI {
                         group.addTask {
                             let response = await runtime.handle(request)
                             await writer.write(response.encodedLine())
-                            await runtime.afterResponse(request)
                         }
                     }
                 }
@@ -323,11 +322,11 @@ public enum ZetaCLI {
                     group.addTask {
                         let response = await runtime.handle(request)
                         await writer.write(response.encodedLine())
-                        await runtime.afterResponse(request)
                     }
                 }
                 try await group.waitForAll()
             }
+            await runtime.waitForIdle()
             await agent.waitForIdle()
             return 0
         } catch {
@@ -477,7 +476,12 @@ public enum ZetaCLI {
         let shell = ShellTool(workingDirectory: cwd)
         var values: [AgentTool] = [
             AgentTool(
-                definition: ToolDefinition(name: "read", description: "Read a file", parameters: [:]), label: "read"
+                definition: ToolDefinition(
+                    name: "read", description: "Read a file",
+                    parameters: BuiltinToolSchemas.definitionParameters(for: "read")
+                ),
+                label: "read",
+                parameterSchema: BuiltinToolSchemas.schema(for: "read")
             ) { _, arguments, _ in
                 guard case .object(let object) = arguments, case .string(let path)? = object["path"] else {
                     throw FileToolError.invalidPath("path")
@@ -485,8 +489,13 @@ public enum ZetaCLI {
                 return AgentToolResult(content: [.text(text: try files.read(path: path))])
             },
             AgentTool(
-                definition: ToolDefinition(name: "write", description: "Write a file", parameters: [:]), label: "write",
-                executionMode: .sequential
+                definition: ToolDefinition(
+                    name: "write", description: "Write a file",
+                    parameters: BuiltinToolSchemas.definitionParameters(for: "write")
+                ),
+                label: "write",
+                executionMode: .sequential,
+                parameterSchema: BuiltinToolSchemas.schema(for: "write")
             ) { _, arguments, _ in
                 guard case .object(let object) = arguments, case .string(let path)? = object["path"],
                     case .string(let content)? = object["content"]
@@ -495,9 +504,13 @@ public enum ZetaCLI {
                 return AgentToolResult(content: [.text(text: "Successfully wrote to \(path).")])
             },
             AgentTool(
-                definition: ToolDefinition(name: "edit", description: "Edit a file", parameters: [:]),
+                definition: ToolDefinition(
+                    name: "edit", description: "Edit a file",
+                    parameters: BuiltinToolSchemas.definitionParameters(for: "edit")
+                ),
                 label: "edit",
-                executionMode: .sequential
+                executionMode: .sequential,
+                parameterSchema: BuiltinToolSchemas.schema(for: "edit")
             ) { _, arguments, _ in
                 guard case .object(let object) = arguments,
                     case .string(let path)? = object["path"],
@@ -525,8 +538,12 @@ public enum ZetaCLI {
                 )
             },
             AgentTool(
-                definition: ToolDefinition(name: "bash", description: "Run a shell command", parameters: [:]),
-                label: "bash"
+                definition: ToolDefinition(
+                    name: "bash", description: "Run a shell command",
+                    parameters: BuiltinToolSchemas.definitionParameters(for: "bash")
+                ),
+                label: "bash",
+                parameterSchema: BuiltinToolSchemas.schema(for: "bash")
             ) { _, arguments, update in
                 guard case .object(let object) = arguments, case .string(let command)? = object["command"] else {
                     throw FileToolError.invalidEdit("command")
@@ -542,8 +559,12 @@ public enum ZetaCLI {
         if allow?.contains("grep") == true {
             values.append(
                 AgentTool(
-                    definition: ToolDefinition(name: "grep", description: "Search file contents", parameters: [:]),
-                    label: "grep"
+                    definition: ToolDefinition(
+                        name: "grep", description: "Search file contents",
+                        parameters: BuiltinToolSchemas.definitionParameters(for: "grep")
+                    ),
+                    label: "grep",
+                    parameterSchema: BuiltinToolSchemas.schema(for: "grep")
                 ) { _, arguments, _ in
                     guard case .object(let object) = arguments,
                         case .string(let pattern)? = object["pattern"]
@@ -560,8 +581,12 @@ public enum ZetaCLI {
         if allow?.contains("find") == true {
             values.append(
                 AgentTool(
-                    definition: ToolDefinition(name: "find", description: "Find paths", parameters: [:]),
-                    label: "find"
+                    definition: ToolDefinition(
+                        name: "find", description: "Find paths",
+                        parameters: BuiltinToolSchemas.definitionParameters(for: "find")
+                    ),
+                    label: "find",
+                    parameterSchema: BuiltinToolSchemas.schema(for: "find")
                 ) { _, arguments, _ in
                     guard case .object(let object) = arguments,
                         case .string(let pattern)? = object["pattern"]
@@ -577,8 +602,12 @@ public enum ZetaCLI {
         if allow?.contains("ls") == true {
             values.append(
                 AgentTool(
-                    definition: ToolDefinition(name: "ls", description: "List a directory", parameters: [:]),
-                    label: "ls"
+                    definition: ToolDefinition(
+                        name: "ls", description: "List a directory",
+                        parameters: BuiltinToolSchemas.definitionParameters(for: "ls")
+                    ),
+                    label: "ls",
+                    parameterSchema: BuiltinToolSchemas.schema(for: "ls")
                 ) { _, arguments, _ in
                     let path: String
                     if case .object(let object) = arguments,

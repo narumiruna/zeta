@@ -8,7 +8,9 @@ Use `ZetaPluginSDK` to implement executable Swift plugins.
 
 Plugins run as separate processes through protocol version 1.
 The manifest declares name, version, executable, protocol version, and capabilities.
-Capabilities include tools, commands, flags, events, providers, authentication, resources, sessions, and UI.
+Protocol capabilities describe tools, commands, flags, events, providers, authentication, resources, sessions, and UI.
+The current Zeta CLI wires tool registrations only and rejects other registration kinds at initialization with a diagnostic.
+Other hosts may implement the remaining version 1 capability kinds.
 Startup registration is transactional.
 A failed or incompatible plugin leaves no registrations behind.
 Runtime generations invalidate stale callbacks after session replacement.

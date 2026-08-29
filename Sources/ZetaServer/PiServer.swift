@@ -45,6 +45,10 @@ public actor PiServer {
         var connections: Set<String> = []
         var operations = 0
     }
+    private struct RuntimeOpen {
+        let token: UUID
+        let task: Task<any PiSessionRuntime, Error>
+    }
 
     public let serverID: String
     private let service: any PiServerService
@@ -52,6 +56,7 @@ public actor PiServer {
     private let handshakeTimeout: Duration
     private var clients: [String: ClientState] = [:]
     private var runtimes: [String: RuntimeState] = [:]
+    private var runtimeOpens: [String: RuntimeOpen] = [:]
     private var revision: Int64 = 0
 
     public init(
@@ -105,6 +110,9 @@ public actor PiServer {
         for value in values { await value.close() }
         let runtimeValues = runtimes.values.map(\.runtime)
         runtimes.removeAll()
+        let openingTasks = runtimeOpens.values.map(\.task)
+        runtimeOpens.removeAll()
+        for task in openingTasks { task.cancel() }
         for runtime in runtimeValues { await runtime.dispose() }
     }
 
@@ -213,13 +221,47 @@ public actor PiServer {
 
     private func openRuntime(_ id: String) async throws -> any PiSessionRuntime {
         if let state = runtimes[id] { return state.runtime }
-        let runtime = try await service.openSession(id)
-        guard runtime.id == id else {
-            await runtime.dispose()
-            throw PiServerFailure.invalidRequest("Runtime session id mismatch")
+
+        let opening: RuntimeOpen
+        if let existing = runtimeOpens[id] {
+            opening = existing
+        } else {
+            let token = UUID()
+            let service = service
+            let task = Task.detached { () throws -> any PiSessionRuntime in
+                let runtime = try await service.openSession(id)
+                guard !Task.isCancelled else {
+                    await runtime.dispose()
+                    throw CancellationError()
+                }
+                guard runtime.id == id else {
+                    await runtime.dispose()
+                    throw PiServerFailure.invalidRequest("Runtime session id mismatch")
+                }
+                return runtime
+            }
+            opening = RuntimeOpen(token: token, task: task)
+            runtimeOpens[id] = opening
         }
-        runtimes[id] = RuntimeState(runtime: runtime)
-        return runtime
+
+        do {
+            let runtime = try await opening.task.value
+            if runtimeOpens[id]?.token == opening.token {
+                runtimeOpens[id] = nil
+                if let state = runtimes[id] {
+                    Task.detached { await runtime.dispose() }
+                    return state.runtime
+                }
+                runtimes[id] = RuntimeState(runtime: runtime)
+                return runtime
+            }
+            if let state = runtimes[id] { return state.runtime }
+            await runtime.dispose()
+            throw PiServerFailure.busy
+        } catch {
+            if runtimeOpens[id]?.token == opening.token { runtimeOpens[id] = nil }
+            throw error
+        }
     }
 
     private func detachRuntime(_ id: String, connectionID: String) async {

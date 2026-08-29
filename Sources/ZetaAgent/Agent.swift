@@ -259,7 +259,11 @@ public actor Agent {
         guard runTask == nil else { throw AgentError.alreadyRunning }
         let model = internalState.model
         let context = Context(
-            messages: [.user(UserMessage(summaryPrompt))]
+            messages: MessageTransforms.forModel(
+                [.user(UserMessage(summaryPrompt))],
+                target: model,
+                knownTools: internalState.tools.map(\.definition)
+            )
         )
         let response = await stream(
             model,
@@ -316,9 +320,14 @@ public actor Agent {
                     return true
                 }
                 : internalState.messages
-            let requestMessages =
+            let transformedMessages =
                 await transformContext?(liveMessages)
                 ?? liveMessages
+            let requestMessages = MessageTransforms.forModel(
+                transformedMessages,
+                target: model,
+                knownTools: internalState.tools.map(\.definition)
+            )
             let context = Context(
                 systemPrompt: internalState.systemPrompt,
                 messages: requestMessages,

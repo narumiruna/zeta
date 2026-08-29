@@ -23,6 +23,45 @@ final class ZetaSessionSQLiteTests: XCTestCase {
         XCTAssertEqual(hits.first?.entryID, "e")
     }
 
+    func testSearchBuildsOnceAndTriggersMaintainTheIndexAcrossReopen() async throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("\(UUID().uuidString).sqlite")
+        defer { try? FileManager.default.removeItem(at: url) }
+        var repository: SQLiteSessionRepository? = try SQLiteSessionRepository(url: url)
+        try await repository?.createSession(SQLiteSessionMetadata(id: "s", createdAt: 1, cwd: "/tmp"))
+        let storedLease = try await repository?.acquireLease(sessionID: "s", ownerID: "owner", now: 1)
+        let lease = try XCTUnwrap(storedLease)
+        _ = try await repository?.append(
+            sessionID: "s", id: "before", parentID: nil, type: "message", timestamp: 2,
+            payload: ["text": "beforetoken"], lease: lease, now: 2)
+        let initialHits = try await repository?.search("beforetoken") ?? []
+        XCTAssertEqual(initialHits.map(\.entryID), ["before"])
+        _ = try await repository?.append(
+            sessionID: "s", id: "after", parentID: "before", type: "message", timestamp: 3,
+            payload: ["text": "aftertoken"], lease: lease, now: 3)
+        let triggeredHits = try await repository?.search("aftertoken") ?? []
+        XCTAssertEqual(triggeredHits.map(\.entryID), ["after"])
+        repository = nil
+
+        var database: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(url.path, &database), SQLITE_OK)
+        XCTAssertEqual(
+            sqlite3_exec(
+                database,
+                "INSERT INTO entries_fts(entries_fts,rowid,payload) "
+                    + "SELECT 'delete',rowid,payload FROM entries WHERE id='before'",
+                nil,
+                nil,
+                nil
+            ),
+            SQLITE_OK
+        )
+        sqlite3_close(database)
+
+        let reopened = try SQLiteSessionRepository(url: url)
+        let hits = try await reopened.search("beforetoken")
+        XCTAssertTrue(hits.isEmpty)
+    }
+
     func testRecordsFactsBranchesAndRepair() async throws {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("\(UUID().uuidString).sqlite")

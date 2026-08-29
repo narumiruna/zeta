@@ -43,17 +43,21 @@ public struct HTTPProvider: AIProvider {
         let output = AssistantEventStream()
         Task {
             do {
+                let requestEnvironment = environment().merging(options.environment) {
+                    _, override in override
+                }
                 let apiKey =
                     options.apiKey
                     ?? configuration.apiKeyEnvironmentVariables.lazy.compactMap {
-                        options.environment[$0] ?? environment()[$0]
+                        requestEnvironment[$0]
                     }.first
                 guard let apiKey else { throw ProviderError.missingCredential(configuration.id) }
                 let request = try await buildRequest(
                     model: model,
                     context: context,
                     apiKey: apiKey,
-                    options: options
+                    options: options,
+                    environment: requestEnvironment
                 )
                 let (bytes, response) = try await session.bytes(for: request)
                 guard let http = response as? HTTPURLResponse else {
@@ -105,25 +109,34 @@ public struct HTTPProvider: AIProvider {
         return output
     }
 
-    private func buildRequest(
+    func buildRequest(
         model: Model,
         context: Context,
         apiKey: String,
-        options: StreamOptions
+        options: StreamOptions,
+        environment: [String: String]? = nil
     ) async throws -> URLRequest {
-        let baseURL = effectiveBaseURL(model: model, environment: options.environment)
+        let requestEnvironment =
+            environment
+            ?? self.environment().merging(options.environment) { _, override in override }
+        let baseURL = effectiveBaseURL(model: model, environment: requestEnvironment)
         let endpoint: URL
         switch model.api {
         case "anthropic-messages": endpoint = baseURL.appendingPathComponent("v1/messages")
         case "openai-responses", "azure-openai-responses", "openai-codex-responses":
             endpoint = baseURL.appendingPathComponent("responses")
-        case "google-generative-ai", "google-vertex":
+        case "google-generative-ai":
             var components = URLComponents(
                 url: baseURL.appendingPathComponent("models/\(model.id):streamGenerateContent"),
                 resolvingAgainstBaseURL: false
             )!
             components.queryItems = [URLQueryItem(name: "alt", value: "sse")]
             endpoint = components.url!
+        case "google-vertex":
+            endpoint = try vertexEndpoint(
+                model: model,
+                environment: requestEnvironment
+            )
         case "mistral-conversations": endpoint = baseURL.appendingPathComponent("v1/conversations")
         case "pi-messages": endpoint = baseURL.appendingPathComponent("v1/messages")
         default: endpoint = baseURL.appendingPathComponent("chat/completions")
@@ -168,6 +181,53 @@ public struct HTTPProvider: AIProvider {
             try ProviderPayloadBuilder.build(model: model, context: context, options: options)
         )
         return request
+    }
+
+    private func vertexEndpoint(
+        model: Model,
+        environment: [String: String]
+    ) throws -> URL {
+        guard
+            let project = environment["GOOGLE_CLOUD_PROJECT"]
+                ?? environment["GCLOUD_PROJECT"],
+            !project.isEmpty
+        else {
+            throw ProviderError.invalidResponse(
+                "Vertex AI requires GOOGLE_CLOUD_PROJECT or GCLOUD_PROJECT"
+            )
+        }
+        guard let location = environment["GOOGLE_CLOUD_LOCATION"],
+            !location.isEmpty
+        else {
+            throw ProviderError.invalidResponse(
+                "Vertex AI requires GOOGLE_CLOUD_LOCATION"
+            )
+        }
+        let rawBaseURL = model.baseURLTemplate ?? model.baseURL.absoluteString
+        guard
+            let baseURL = URL(
+                string: rawBaseURL.replacingOccurrences(
+                    of: "{location}",
+                    with: location
+                )
+            )
+        else {
+            throw ProviderError.invalidResponse("Invalid Vertex AI base URL")
+        }
+        let url =
+            baseURL
+            .appendingPathComponent("v1")
+            .appendingPathComponent("projects")
+            .appendingPathComponent(project)
+            .appendingPathComponent("locations")
+            .appendingPathComponent(location)
+            .appendingPathComponent("publishers")
+            .appendingPathComponent("google")
+            .appendingPathComponent("models")
+            .appendingPathComponent("\(model.id):streamGenerateContent")
+        var components = URLComponents(url: url, resolvingAgainstBaseURL: false)!
+        components.queryItems = [URLQueryItem(name: "alt", value: "sse")]
+        return components.url!
     }
 
     private func effectiveBaseURL(
@@ -217,18 +277,43 @@ public struct SSEDecoder: Sendable {
     }
     private mutating func drain() -> [SSERecord] {
         var output: [SSERecord] = []
-        while let range = buffer.range(of: Data("\n\n".utf8)) {
+        while let range = recordBoundary() {
             let data = buffer[..<range.lowerBound]
             buffer.removeSubrange(..<range.upperBound)
             output += parse(String(decoding: data, as: UTF8.self))
         }
         return output
     }
+    private func recordBoundary() -> Range<Data.Index>? {
+        let bytes = Array(buffer)
+        for offset in bytes.indices {
+            let length: Int
+            if offset + 3 < bytes.count,
+                bytes[offset...offset + 3] == [0x0D, 0x0A, 0x0D, 0x0A]
+            {
+                length = 4
+            } else if offset + 1 < bytes.count,
+                (bytes[offset] == 0x0A && bytes[offset + 1] == 0x0A)
+                    || (bytes[offset] == 0x0D && bytes[offset + 1] == 0x0D)
+            {
+                length = 2
+            } else {
+                continue
+            }
+            let lower = buffer.index(buffer.startIndex, offsetBy: offset)
+            let upper = buffer.index(lower, offsetBy: length)
+            return lower..<upper
+        }
+        return nil
+    }
     private func parse(_ raw: String) -> [SSERecord] {
         var event: String?
         var data: [String] = []
-        for rawLine in raw.split(separator: "\n", omittingEmptySubsequences: false) {
-            let line = rawLine.last == "\r" ? rawLine.dropLast() : rawLine[...]
+        let normalized =
+            raw
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+        for line in normalized.split(separator: "\n", omittingEmptySubsequences: false) {
             if line.hasPrefix("event:") {
                 event = line.dropFirst(6).trimmingCharacters(in: .whitespaces)
             } else if line.hasPrefix("data:") {

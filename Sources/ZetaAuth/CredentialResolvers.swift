@@ -101,10 +101,7 @@ public enum CredentialResolver {
         if let bearer = environment["AWS_BEARER_TOKEN_BEDROCK"],
             !bearer.isEmpty
         {
-            return AWSCredential(
-                accessKeyID: "bearer",
-                secretAccessKey: bearer
-            )
+            return AWSCredential(bearerToken: bearer)
         }
         guard let access = environment["AWS_ACCESS_KEY_ID"],
             let secret = environment["AWS_SECRET_ACCESS_KEY"],

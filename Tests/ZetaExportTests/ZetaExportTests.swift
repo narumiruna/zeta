@@ -18,6 +18,23 @@ final class ZetaExportTests: XCTestCase {
         XCTAssertTrue(html.contains(Data("{}\n".utf8).base64EncodedString()))
     }
 
+    func testStandaloneHTMLEscapesAllTranscriptMarkupIncludingUnquotedHandlers() {
+        let transcript =
+            #"<img src=x onerror=alert(1)><svg/onload=alert(2)><a href=javascript:alert(3)>link</a><strong>text</strong>"#
+        let html = SessionExporter.standaloneHTML(
+            title: "Security",
+            sessionJSONL: Data(),
+            renderedTranscript: transcript
+        )
+
+        XCTAssertFalse(html.contains("<img"))
+        XCTAssertFalse(html.contains("<svg"))
+        XCTAssertFalse(html.contains("<a href=javascript:"))
+        XCTAssertFalse(html.contains("<strong>text</strong>"))
+        XCTAssertTrue(html.contains("&lt;img src=x onerror=alert(1)&gt;"))
+        XCTAssertTrue(html.contains("&lt;strong&gt;text&lt;/strong&gt;"))
+    }
+
     func testURLAllowList() {
         XCTAssertNotNil(SessionExporter.safeURL("https://example.com"))
         XCTAssertNotNil(SessionExporter.safeURL("mailto:a@example.com"))

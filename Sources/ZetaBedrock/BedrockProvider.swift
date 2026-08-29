@@ -105,6 +105,31 @@ public struct BedrockProvider: AIProvider {
 
     public var models: [Model] { get async { modelDefinitions } }
 
+    static func authorizedRequest(
+        _ request: URLRequest,
+        body: Data,
+        region: String,
+        credential: AWSCredential,
+        date: Date
+    ) throws -> URLRequest {
+        switch credential.authentication {
+        case .bearer(let token):
+            var authorized = request
+            authorized.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+            authorized.httpBody = body
+            return authorized
+        case .signatureV4:
+            return try AWSSignatureV4.sign(
+                request: request,
+                body: body,
+                service: "bedrock",
+                region: region,
+                credential: credential,
+                date: date
+            ).request
+        }
+    }
+
     public func stream(
         model: Model,
         context: Context,
@@ -130,15 +155,14 @@ public struct BedrockProvider: AIProvider {
                 )
                 request.httpMethod = "POST"
                 request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-                let signed = try AWSSignatureV4.sign(
-                    request: request,
+                request = try Self.authorizedRequest(
+                    request,
                     body: body,
-                    service: "bedrock",
                     region: region,
                     credential: try await credential(),
                     date: Date()
                 )
-                let (bytes, response) = try await session.bytes(for: signed.request)
+                let (bytes, response) = try await session.bytes(for: request)
                 guard let http = response as? HTTPURLResponse,
                     200..<300 ~= http.statusCode
                 else {
@@ -154,6 +178,7 @@ public struct BedrockProvider: AIProvider {
                 )
                 await result.emit(.start(partial))
                 var decoder = AWSEventStreamDecoder()
+                var toolInputBuffers: [Int: String] = [:]
                 var chunk = Data()
                 for try await byte in bytes {
                     chunk.append(byte)
@@ -161,6 +186,7 @@ public struct BedrockProvider: AIProvider {
                         try await consume(
                             decoder.push(chunk),
                             partial: &partial,
+                            toolInputBuffers: &toolInputBuffers,
                             stream: result
                         )
                         chunk.removeAll(keepingCapacity: true)
@@ -169,10 +195,16 @@ public struct BedrockProvider: AIProvider {
                 try await consume(
                     decoder.push(chunk),
                     partial: &partial,
+                    toolInputBuffers: &toolInputBuffers,
                     stream: result
                 )
                 try decoder.finish()
-                if partial.stopReason == .pending { partial.stopReason = .stop }
+                if partial.stopReason == .pending {
+                    partial.stopReason =
+                        partial.content.contains {
+                            if case .toolCall = $0 { true } else { false }
+                        } ? .toolUse : .stop
+                }
                 await result.emit(.done(reason: partial.stopReason, message: partial))
             } catch is CancellationError {
                 await result.failBeforeStart(
@@ -194,9 +226,10 @@ public struct BedrockProvider: AIProvider {
         return result
     }
 
-    private func consume(
+    func consume(
         _ messages: [AWSEventStreamMessage],
         partial: inout AssistantMessage,
+        toolInputBuffers: inout [Int: String],
         stream: AssistantEventStream
     ) async throws {
         for message in messages {
@@ -210,30 +243,107 @@ public struct BedrockProvider: AIProvider {
             else {
                 continue
             }
-            if case .object(let delta)? = object["contentBlockDelta"],
-                case .object(let content)? = delta["delta"],
-                case .string(let text)? = content["text"]
+
+            if case .object(let blockStart)? = object["contentBlockStart"],
+                let index = blockStart.integer("contentBlockIndex"),
+                case .object(let start)? = blockStart["start"],
+                case .object(let toolUse)? = start["toolUse"]
             {
-                let index: Int
-                if let existing = partial.content.firstIndex(where: {
-                    if case .text = $0 { true } else { false }
-                }) {
-                    index = existing
-                } else {
-                    index = partial.content.count
-                    partial.content.append(.text(text: ""))
-                    await stream.emit(.textStart(index: index, partial: partial))
-                }
-                if case .text(let current, let signature) = partial.content[index] {
+                let call = ToolCall(
+                    id: toolUse.string("toolUseId") ?? "call-\(index)",
+                    name: toolUse.string("name") ?? "tool"
+                )
+                try setContent(.toolCall(call), at: index, partial: &partial)
+                toolInputBuffers[index] = ""
+                await stream.emit(.toolCallStart(index: index, partial: partial))
+            }
+
+            if case .object(let blockDelta)? = object["contentBlockDelta"],
+                let index = blockDelta.integer("contentBlockIndex"),
+                case .object(let delta)? = blockDelta["delta"]
+            {
+                if let text = delta.string("text") {
+                    if index == partial.content.count {
+                        partial.content.append(.text(text: ""))
+                        await stream.emit(.textStart(index: index, partial: partial))
+                    }
+                    guard partial.content.indices.contains(index),
+                        case .text(let current, let signature) = partial.content[index]
+                    else {
+                        throw ProviderError.invalidResponse(
+                            "Invalid Bedrock text content block index \(index)"
+                        )
+                    }
                     partial.content[index] = .text(
                         text: current + text,
                         signature: signature
                     )
+                    await stream.emit(
+                        .textDelta(index: index, delta: text, partial: partial)
+                    )
                 }
-                await stream.emit(
-                    .textDelta(index: index, delta: text, partial: partial)
-                )
+                if case .object(let toolUse)? = delta["toolUse"],
+                    let input = toolUse.string("input")
+                {
+                    guard partial.content.indices.contains(index),
+                        case .toolCall(var call) = partial.content[index]
+                    else {
+                        throw ProviderError.invalidResponse(
+                            "Invalid Bedrock tool-use content block index \(index)"
+                        )
+                    }
+                    toolInputBuffers[index, default: ""] += input
+                    if let arguments = decodedToolInput(toolInputBuffers[index]!) {
+                        call.arguments = arguments
+                        partial.content[index] = .toolCall(call)
+                    }
+                    await stream.emit(
+                        .toolCallDelta(index: index, delta: input, partial: partial)
+                    )
+                }
             }
+
+            if case .object(let blockStop)? = object["contentBlockStop"],
+                let index = blockStop.integer("contentBlockIndex"),
+                partial.content.indices.contains(index)
+            {
+                switch partial.content[index] {
+                case .text(let text, _):
+                    await stream.emit(
+                        .textEnd(index: index, content: text, partial: partial)
+                    )
+                case .toolCall(var call):
+                    let input = toolInputBuffers[index] ?? ""
+                    guard let arguments = decodedToolInput(input) else {
+                        throw ProviderError.invalidResponse(
+                            "Invalid Bedrock tool-use input at content block index \(index)"
+                        )
+                    }
+                    call.arguments = arguments
+                    partial.content[index] = .toolCall(call)
+                    await stream.emit(
+                        .toolCallEnd(index: index, call: call, partial: partial)
+                    )
+                    toolInputBuffers[index] = nil
+                case .thinking, .image:
+                    break
+                }
+            }
+
+            if case .object(let messageStop)? = object["messageStop"],
+                let reason = messageStop.string("stopReason")
+            {
+                partial.rawStopReason = reason
+                switch reason {
+                case "tool_use", "toolUse":
+                    partial.stopReason = .toolUse
+                case "max_tokens", "maxTokens":
+                    partial.stopReason = .length
+                default:
+                    partial.stopReason = .stop
+                }
+            }
+
             if case .object(let metadata)? = object["metadata"],
                 case .object(let usage)? = metadata["usage"]
             {
@@ -246,6 +356,28 @@ public struct BedrockProvider: AIProvider {
                 partial.usage.totalTokens = partial.usage.input + partial.usage.output
             }
         }
+    }
+
+    private func setContent(
+        _ block: ContentBlock,
+        at index: Int,
+        partial: inout AssistantMessage
+    ) throws {
+        guard index >= 0, index <= partial.content.count else {
+            throw ProviderError.invalidResponse(
+                "Invalid Bedrock content block index \(index)"
+            )
+        }
+        if index == partial.content.count {
+            partial.content.append(block)
+        } else {
+            partial.content[index] = block
+        }
+    }
+
+    private func decodedToolInput(_ input: String) -> JSONValue? {
+        if input.isEmpty { return [:] }
+        return try? OrderedJSON.decode(Data(input.utf8))
     }
 }
 
@@ -282,5 +414,10 @@ private extension OrderedJSONObject {
             return nil
         }
         return Int(value)
+    }
+
+    func string(_ key: String) -> String? {
+        guard case .string(let value)? = self[key] else { return nil }
+        return value
     }
 }

@@ -4,7 +4,7 @@ public enum StoredCredential: Codable, Sendable, Equatable {
     case apiKey(key: String?, environment: [String: String]?)
     case oauth(access: String, refresh: String, expires: Int64, extras: [String: String])
 
-    private enum CodingKeys: String, CodingKey { case type, key, env, access, refresh, expires }
+    private enum CodingKeys: String, CodingKey { case type, key, env, access, refresh, expires, extras }
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
@@ -19,7 +19,7 @@ public enum StoredCredential: Codable, Sendable, Equatable {
                 access: try container.decode(String.self, forKey: .access),
                 refresh: try container.decode(String.self, forKey: .refresh),
                 expires: try container.decode(Int64.self, forKey: .expires),
-                extras: [:]
+                extras: try container.decodeIfPresent([String: String].self, forKey: .extras) ?? [:]
             )
         default:
             throw DecodingError.dataCorruptedError(
@@ -34,11 +34,12 @@ public enum StoredCredential: Codable, Sendable, Equatable {
             try container.encode("api_key", forKey: .type)
             try container.encodeIfPresent(key, forKey: .key)
             try container.encodeIfPresent(environment, forKey: .env)
-        case .oauth(let access, let refresh, let expires, _):
+        case .oauth(let access, let refresh, let expires, let extras):
             try container.encode("oauth", forKey: .type)
             try container.encode(access, forKey: .access)
             try container.encode(refresh, forKey: .refresh)
             try container.encode(expires, forKey: .expires)
+            try container.encode(extras, forKey: .extras)
         }
     }
 

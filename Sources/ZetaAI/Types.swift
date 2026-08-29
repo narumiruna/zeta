@@ -349,10 +349,15 @@ public struct Model: Codable, Sendable, Equatable, Identifiable {
     public var contextWindow: Int
     public var maximumTokens: Int
     public var headers: [String: String]?
+    public var compat: JSONValue?
+    public var thinkingLevelMap: JSONValue?
+    public var baseURLTemplate: String?
 
     public init(
         id: String, name: String, api: APIID, provider: ProviderID, baseURL: URL, reasoning: Bool = false,
-        input: Set<String> = ["text"], cost: ModelCost = ModelCost(), contextWindow: Int, maximumTokens: Int
+        input: Set<String> = ["text"], cost: ModelCost = ModelCost(), contextWindow: Int, maximumTokens: Int,
+        headers: [String: String]? = nil, compat: JSONValue? = nil, thinkingLevelMap: JSONValue? = nil,
+        baseURLTemplate: String? = nil
     ) {
         self.id = id
         self.name = name
@@ -364,6 +369,69 @@ public struct Model: Codable, Sendable, Equatable, Identifiable {
         self.cost = cost
         self.contextWindow = contextWindow
         self.maximumTokens = maximumTokens
+        self.headers = headers
+        self.compat = compat
+        self.thinkingLevelMap = thinkingLevelMap
+        self.baseURLTemplate = baseURLTemplate
+    }
+
+    public func compatibility(_ key: String) -> JSONValue? {
+        guard case .object(let values)? = compat else { return nil }
+        return values[key]
+    }
+
+    public func compatibilityBool(_ key: String) -> Bool? {
+        guard case .bool(let value)? = compatibility(key) else { return nil }
+        return value
+    }
+
+    public func compatibilityString(_ key: String) -> String? {
+        guard case .string(let value)? = compatibility(key) else { return nil }
+        return value
+    }
+
+    public func resolvedThinkingLevel(_ requested: ThinkingLevel) -> ThinkingLevel {
+        let available = ThinkingLevel.allCases.filter { level in
+            guard reasoning else { return level == .off }
+            guard case .object(let values)? = thinkingLevelMap else {
+                return level != .xhigh && level != .max
+            }
+            if values[level.rawValue] == .null { return false }
+            if level == .xhigh || level == .max {
+                return values[level.rawValue] != nil
+            }
+            return true
+        }
+        if available.contains(requested) { return requested }
+        guard let requestedIndex = ThinkingLevel.allCases.firstIndex(of: requested) else {
+            return available.first ?? .off
+        }
+        for index in requestedIndex..<ThinkingLevel.allCases.count {
+            let level = ThinkingLevel.allCases[index]
+            if available.contains(level) { return level }
+        }
+        if requestedIndex > 0 {
+            for index in stride(from: requestedIndex - 1, through: 0, by: -1) {
+                let level = ThinkingLevel.allCases[index]
+                if available.contains(level) { return level }
+            }
+        }
+        return available.first ?? .off
+    }
+
+    public func thinkingLevelMapValue(_ level: ThinkingLevel) -> JSONValue? {
+        guard case .object(let values)? = thinkingLevelMap else { return nil }
+        return values[level.rawValue]
+    }
+
+    public func requestThinkingValue(_ requested: ThinkingLevel) -> String? {
+        let level = resolvedThinkingLevel(requested)
+        guard let mapped = thinkingLevelMapValue(level)
+        else {
+            return level.rawValue
+        }
+        if case .string(let value) = mapped { return value }
+        return mapped == .null ? nil : level.rawValue
     }
 }
 

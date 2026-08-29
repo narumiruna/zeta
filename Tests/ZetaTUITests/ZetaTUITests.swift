@@ -18,8 +18,9 @@ final class ZetaTUITests: XCTestCase {
         XCTAssertEqual(editor.value(), "hello world")
         editor.handleInput("\u{1A}")
         XCTAssertEqual(editor.value(), "hello")
-        editor.handleInput("\u{1B}[200~" + String(repeating: "x\n", count: 11) + "\u{1B}[201~")
-        XCTAssertTrue(editor.value().contains("[paste #1"))
+        let largePaste = String(repeating: "x\n", count: 11)
+        editor.handleInput("\u{1B}[200~" + largePaste + "\u{1B}[201~")
+        XCTAssertEqual(editor.value(), "hello" + largePaste)
         editor.autocompleteProvider = CombinedAutocompleteProvider(
             commands: ["help", "history"],
             baseDirectory: FileManager.default.temporaryDirectory
@@ -27,6 +28,19 @@ final class ZetaTUITests: XCTestCase {
         editor.setValue("/he")
         editor.handleInput("\t")
         XCTAssertEqual(editor.value(), "/help")
+    }
+
+    func testEditorClearsFullValueAfterSubmit() {
+        let recorder = SubmissionRecorder()
+        let editor = Editor()
+        editor.onSubmit = { recorder.record($0) }
+        let largePaste = String(repeating: "submitted line\n", count: 20)
+        editor.handleInput("\u{1B}[200~" + largePaste + "\u{1B}[201~")
+
+        editor.handleInput("\r")
+
+        XCTAssertEqual(recorder.value, largePaste)
+        XCTAssertEqual(editor.value(), "")
     }
 
     func testInteractiveComponentsAndLayouts() {
@@ -153,5 +167,22 @@ final class ZetaTUITests: XCTestCase {
         XCTAssertTrue(terminal.output.contains("\u{1B}[0m"))
         XCTAssertTrue(terminal.output.contains("\u{1B}]8;;\u{07}"))
         tui.stop()
+    }
+}
+
+private final class SubmissionRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storedValue: String?
+
+    var value: String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return storedValue
+    }
+
+    func record(_ value: String) {
+        lock.lock()
+        storedValue = value
+        lock.unlock()
     }
 }

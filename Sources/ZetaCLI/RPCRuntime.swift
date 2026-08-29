@@ -15,6 +15,10 @@ public actor CLIRPCRuntime {
     private var autoRetry = true
     private var sessionName: String?
     private let session: PersistentSessionController?
+    private var promptTask: Task<Void, Never>?
+    private var promptRunID: UUID?
+    private var queuedPrompts: [UserMessage] = []
+    private var activeBash: (id: UUID, task: Task<ShellResult, Error>)?
 
     init(
         agent: Agent,
@@ -50,17 +54,23 @@ public actor CLIRPCRuntime {
     private func execute(_ request: StrictRPCRequest) async throws -> JSONValue? {
         switch request.command {
         case .prompt:
-            let message = try requiredString("message", request.fields)
-            let state = await agent.state()
-            if state.isStreaming {
+            let message = UserMessage(try requiredString("message", request.fields))
+            if promptTask != nil {
+                queuedPrompts.append(message)
+                return ["queued": true]
+            }
+            if (await agent.state()).isStreaming {
                 let behavior = optionalString("streamingBehavior", request.fields) ?? "steer"
                 if behavior == "followUp" {
-                    await agent.followUp(UserMessage(message))
+                    await agent.followUp(message)
                 } else {
-                    await agent.steer(UserMessage(message))
+                    await agent.steer(message)
                 }
                 return ["queued": true]
             }
+            let id = UUID()
+            promptRunID = id
+            promptTask = Task { await self.runPrompt(message, id: id) }
             return ["accepted": true]
         case .steer:
             await agent.steer(UserMessage(try requiredString("message", request.fields)))
@@ -72,13 +82,22 @@ public actor CLIRPCRuntime {
             await agent.abort()
             return ["aborted": true]
         case .clearQueue:
+            queuedPrompts.removeAll()
             await agent.clearQueues()
             return ["cleared": true]
         case .newSession:
+            queuedPrompts.removeAll()
+            promptTask?.cancel()
             await agent.abort()
             await agent.waitForIdle()
+            if let promptTask { await promptTask.value }
             try await agent.reset()
-            return ["created": true]
+            let file = try await session?.newSession()
+            sessionName = nil
+            return [
+                "created": true,
+                "path": file.map { .string($0.path) } ?? .null,
+            ]
         case .getState:
             return try await stateJSON()
         case .setModel:
@@ -167,13 +186,26 @@ public actor CLIRPCRuntime {
             return ["aborted": true]
         case .bash:
             let command = try requiredString("command", request.fields)
-            let result = try await shell.run(command: command)
+            guard activeBash == nil else {
+                throw AgentError.blocked("A bash command is already running")
+            }
+            let id = UUID()
+            let task = Task { try await shell.run(command: command) }
+            activeBash = (id, task)
+            defer {
+                if activeBash?.id == id { activeBash = nil }
+            }
+            let result = try await task.value
             return [
                 "output": .string(result.output),
                 "exitCode": .number(JSONNumber(Int(result.exitCode))),
                 "truncated": .bool(result.truncated),
             ]
         case .abortBash:
+            guard let activeBash else { return ["aborted": false] }
+            activeBash.task.cancel()
+            _ = await activeBash.task.result
+            if self.activeBash?.id == activeBash.id { self.activeBash = nil }
             return ["aborted": true]
         case .getSessionStats:
             let state = await agent.state()
@@ -250,14 +282,46 @@ public actor CLIRPCRuntime {
         }
     }
 
-    func afterResponse(_ request: StrictRPCRequest) async {
-        guard request.command == .prompt,
-            let message = try? requiredString("message", request.fields),
-            !(await agent.state().isStreaming)
+    func waitForIdle() async {
+        if let promptTask { await promptTask.value }
+    }
+
+    private func runPrompt(_ message: UserMessage, id: UUID) async {
+        var next: UserMessage? = message
+        while let current = next, !Task.isCancelled {
+            try? await compactIfNeeded()
+            try? await agent.prompt(current)
+            if !Task.isCancelled {
+                try? await compactIfNeeded()
+            }
+            next = queuedPrompts.isEmpty ? nil : queuedPrompts.removeFirst()
+        }
+        if promptRunID == id {
+            promptRunID = nil
+            promptTask = nil
+        }
+    }
+
+    private func compactIfNeeded() async throws {
+        guard autoCompaction else { return }
+        let state = await agent.state()
+        guard
+            Compaction.shouldCompact(
+                messages: state.messages,
+                contextWindow: state.model.contextWindow,
+                reserveTokens: 16_384
+            ), let preparation = Compaction.prepare(messages: state.messages)
         else {
             return
         }
-        try? await agent.prompt(UserMessage(message))
+        let summary = try await agent.compact(
+            summaryPrompt: Compaction.summaryPrompt(preparation: preparation),
+            retainedTail: preparation.retainedTail
+        )
+        try await session?.recordCompaction(
+            summary: summary,
+            preparation: preparation
+        )
     }
 
     private func stateJSON() async throws -> JSONValue {

@@ -5,6 +5,7 @@ public struct AWSCredential: Sendable, Equatable {
     public var accessKeyID: String
     public var secretAccessKey: String
     public var sessionToken: String?
+    package var authentication: AWSAuthentication
 
     public init(
         accessKeyID: String,
@@ -14,7 +15,20 @@ public struct AWSCredential: Sendable, Equatable {
         self.accessKeyID = accessKeyID
         self.secretAccessKey = secretAccessKey
         self.sessionToken = sessionToken
+        authentication = .signatureV4
     }
+
+    package init(bearerToken: String) {
+        accessKeyID = ""
+        secretAccessKey = ""
+        sessionToken = nil
+        authentication = .bearer(token: bearerToken)
+    }
+}
+
+package enum AWSAuthentication: Sendable, Equatable {
+    case bearer(token: String)
+    case signatureV4
 }
 
 public struct AWSSignedRequest: Sendable {

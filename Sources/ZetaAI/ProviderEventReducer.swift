@@ -4,6 +4,7 @@ import ZetaCore
 public struct ProviderEventReducer: Sendable {
     public private(set) var partial: AssistantMessage
     private var toolArgumentBuffers: [Int: String] = [:]
+    private var openAIToolContentIndices: [Int: Int] = [:]
 
     public init(model: Model) {
         partial = AssistantMessage(
@@ -34,8 +35,24 @@ public struct ProviderEventReducer: Sendable {
             case "text":
                 ensureIndex(index, block: .text(text: ""))
                 events.append(.textStart(index: index, partial: partial))
-            case "thinking", "redacted_thinking":
-                ensureIndex(index, block: .thinking(text: ""))
+            case "thinking":
+                ensureIndex(
+                    index,
+                    block: .thinking(
+                        text: block.string("thinking") ?? "",
+                        signature: block.string("signature")
+                    )
+                )
+                events.append(.thinkingStart(index: index, partial: partial))
+            case "redacted_thinking":
+                ensureIndex(
+                    index,
+                    block: .thinking(
+                        text: "[Reasoning redacted]",
+                        signature: block.string("data"),
+                        redacted: true
+                    )
+                )
                 events.append(.thinkingStart(index: index, partial: partial))
             case "tool_use":
                 let call = ToolCall(
@@ -51,8 +68,7 @@ public struct ProviderEventReducer: Sendable {
         }
 
         let textDelta =
-            object.string("delta")
-            ?? object.pathString(["delta", "text"])
+            object.pathString(["delta", "text"])
             ?? object.pathString(["choices", "0", "delta", "content"])
             ?? (type.contains("output_text.delta") ? object.string("delta") : nil)
             ?? object.pathString(["candidates", "0", "content", "parts", "0", "text"])
@@ -68,11 +84,24 @@ public struct ProviderEventReducer: Sendable {
             events += appendThinking(thinkingDelta)
         }
 
+        events += consumeOpenAIChatToolCalls(object)
+
+        if let signatureDelta = object.pathString(["delta", "signature"]),
+            let providerIndex = object.integer("index"),
+            partial.content.indices.contains(providerIndex),
+            case .thinking(let text, let signature, let redacted) = partial.content[providerIndex]
+        {
+            partial.content[providerIndex] = .thinking(
+                text: text,
+                signature: (signature ?? "") + signatureDelta,
+                redacted: redacted
+            )
+        }
+
         let toolDelta =
             object.pathString(["delta", "partial_json"])
             ?? (type.contains("function_call_arguments.delta")
                 ? object.string("delta") : nil)
-            ?? object.pathString(["choices", "0", "delta", "tool_calls", "0", "function", "arguments"])
         if let toolDelta {
             let index =
                 object.integer("index")
@@ -122,6 +151,9 @@ public struct ProviderEventReducer: Sendable {
         if let stop = object.pathString(["choices", "0", "finish_reason"])
             ?? object.string("stop_reason")
         {
+            if object.pathString(["choices", "0", "finish_reason"]) != nil {
+                events += finishOpenAIChatToolCalls()
+            }
             partial.rawStopReason = stop
             partial.stopReason = mapStopReason(stop)
         }
@@ -132,6 +164,81 @@ public struct ProviderEventReducer: Sendable {
             partial.responseId = responseID
         }
         updateUsage(object)
+        return events
+    }
+
+    private mutating func consumeOpenAIChatToolCalls(
+        _ object: OrderedJSONObject
+    ) -> [AssistantEvent] {
+        guard
+            case .array(let values)? = object.path([
+                "choices", "0", "delta", "tool_calls",
+            ])
+        else {
+            return []
+        }
+        var events: [AssistantEvent] = []
+        for (position, value) in values.enumerated() {
+            guard case .object(let toolCall) = value else { continue }
+            let streamIndex = toolCall.integer("index") ?? position
+            let id = toolCall.string("id")
+            let name = toolCall.pathString(["function", "name"])
+            let contentIndex: Int
+            if let existing = openAIToolContentIndices[streamIndex] {
+                contentIndex = existing
+                if partial.content.indices.contains(contentIndex),
+                    case .toolCall(var call) = partial.content[contentIndex]
+                {
+                    if let id, !id.isEmpty { call.id = id }
+                    if let name, !name.isEmpty { call.name = name }
+                    partial.content[contentIndex] = .toolCall(call)
+                }
+            } else {
+                contentIndex = partial.content.count
+                partial.content.append(
+                    .toolCall(
+                        ToolCall(
+                            id: id ?? "call-\(streamIndex)",
+                            name: name ?? "tool"
+                        )
+                    )
+                )
+                openAIToolContentIndices[streamIndex] = contentIndex
+                toolArgumentBuffers[contentIndex] = ""
+                events.append(.toolCallStart(index: contentIndex, partial: partial))
+            }
+            if let arguments = toolCall.pathString(["function", "arguments"]),
+                !arguments.isEmpty
+            {
+                toolArgumentBuffers[contentIndex, default: ""] += arguments
+                updateToolArguments(contentIndex)
+                events.append(
+                    .toolCallDelta(
+                        index: contentIndex,
+                        delta: arguments,
+                        partial: partial
+                    )
+                )
+            }
+        }
+        return events
+    }
+
+    private mutating func finishOpenAIChatToolCalls() -> [AssistantEvent] {
+        var events: [AssistantEvent] = []
+        for contentIndex in openAIToolContentIndices.values.sorted() {
+            updateToolArguments(contentIndex)
+            guard partial.content.indices.contains(contentIndex),
+                case .toolCall(let call) = partial.content[contentIndex]
+            else {
+                continue
+            }
+            events.append(
+                .toolCallEnd(index: contentIndex, call: call, partial: partial)
+            )
+            toolArgumentBuffers[contentIndex] = nil
+        }
+        openAIToolContentIndices.removeAll()
         return events
     }
 

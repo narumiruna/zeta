@@ -60,6 +60,14 @@ final class ZetaAuthTests: XCTestCase {
                 sessionToken: "session"
             )
         )
+        XCTAssertEqual(
+            CredentialResolver.aws(environment: [
+                "AWS_BEARER_TOKEN_BEDROCK": "bedrock-token",
+                "AWS_ACCESS_KEY_ID": "ignored-access",
+                "AWS_SECRET_ACCESS_KEY": "ignored-secret",
+            ])?.authentication,
+            .bearer(token: "bedrock-token")
+        )
 
         let server = OAuthCallbackServer(expectedState: "state")
         var components = URLComponents(
