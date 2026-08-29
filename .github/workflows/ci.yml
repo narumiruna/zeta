@@ -39,6 +39,8 @@ jobs:
           uv --version
           test "$(uv --version | awk '{print $2}')" = "0.9.26"
       - name: Run repository checks
+        env:
+          ZETA_SWIFT_TOOLCHAIN_CONFIGURED: "1"
         run: scripts/check-repository.sh
 
   swift:

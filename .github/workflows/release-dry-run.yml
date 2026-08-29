@@ -42,6 +42,8 @@ jobs:
           uv --version
           test "$(uv --version | awk '{print $2}')" = "0.9.26"
       - name: Run repository gates
+        env:
+          ZETA_SWIFT_TOOLCHAIN_CONFIGURED: "1"
         run: scripts/check-repository.sh
       - name: Build unsigned local artifacts
         run: scripts/build-release.sh --arch "${{ matrix.arch }}" --out "$PWD/release-output"

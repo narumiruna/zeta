@@ -6,7 +6,7 @@ if [[ ! -f Package.swift ]]; then
   exit 0
 fi
 
-if [[ -z "${DEVELOPER_DIR:-}" && -d /Applications/Xcode.app/Contents/Developer ]]; then
+if [[ -z "${DEVELOPER_DIR:-}" && -z "${ZETA_SWIFT_TOOLCHAIN_CONFIGURED:-}" && -d /Applications/Xcode.app/Contents/Developer ]]; then
   export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
 fi
 
