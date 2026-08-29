@@ -157,13 +157,15 @@ public enum ZetaCLI {
                 result = await runPrint(
                     agent: agent,
                     prompt: initial!.message,
-                    remaining: Array(parsed.messages.dropFirst())
+                    remaining: Array(parsed.messages.dropFirst()),
+                    session: persistentSession
                 )
             case .json:
                 result = await runJSON(
                     agent: agent,
                     prompt: initial!.message,
-                    remaining: Array(parsed.messages.dropFirst())
+                    remaining: Array(parsed.messages.dropFirst()),
+                    session: persistentSession
                 )
             case .interactive:
                 result = await runInteractive(
@@ -176,7 +178,8 @@ public enum ZetaCLI {
                     agent: agent,
                     models: models,
                     session: persistentSession,
-                    compactionSettings: settings.compaction
+                    compactionSettings: settings.compaction,
+                    retrySettings: settings.retry
                 )
             }
             await pluginRuntime.stop()
@@ -187,10 +190,19 @@ public enum ZetaCLI {
         }
     }
 
-    private static func runPrint(agent: Agent, prompt: UserMessage, remaining: [String]) async -> Int32 {
+    private static func runPrint(
+        agent: Agent,
+        prompt: UserMessage,
+        remaining: [String],
+        session: PersistentSessionController?
+    ) async -> Int32 {
         do {
-            try await agent.prompt(prompt)
-            for message in remaining { try await agent.prompt(UserMessage(message)) }
+            try await CLISessionBoundary.prompt(prompt, agent: agent, session: session)
+            for message in remaining {
+                try await CLISessionBoundary.prompt(
+                    UserMessage(message), agent: agent, session: session
+                )
+            }
             let state = await agent.state()
             guard case .assistant(let assistant)? = state.messages.last else { return 1 }
             for block in assistant.content { if case .text(let text, _) = block { print(text, terminator: "") } }
@@ -209,7 +221,8 @@ public enum ZetaCLI {
     private static func runJSON(
         agent: Agent,
         prompt: UserMessage,
-        remaining: [String]
+        remaining: [String],
+        session: PersistentSessionController?
     ) async -> Int32 {
         await agent.subscribe { event in
             if let data = try? JSONEncoder().encode(JSONAgentEvent(event)), var line = Optional(data) {
@@ -218,8 +231,12 @@ public enum ZetaCLI {
             }
         }
         do {
-            try await agent.prompt(prompt)
-            for message in remaining { try await agent.prompt(UserMessage(message)) }
+            try await CLISessionBoundary.prompt(prompt, agent: agent, session: session)
+            for message in remaining {
+                try await CLISessionBoundary.prompt(
+                    UserMessage(message), agent: agent, session: session
+                )
+            }
             return 0
         } catch {
             FileHandle.standardError.write(Data("\(error.localizedDescription)\n".utf8))
@@ -263,7 +280,12 @@ public enum ZetaCLI {
                 try? await Task.sleep(for: .milliseconds(25))
             }
             if Task.isCancelled { await runner.requestExit() }
-            return Int32(0)
+            do {
+                try await session?.drainPersistenceErrors()
+            } catch {
+                await runner.report(error)
+            }
+            return await runner.hadFailure() ? Int32(1) : Int32(0)
         } onCancel: {
             tui.stop()
             Task.detached { await runner.requestExit() }
@@ -276,7 +298,8 @@ public enum ZetaCLI {
         agent: Agent,
         models: [Model],
         session: PersistentSessionController?,
-        compactionSettings: ZetaConfig.CompactionSettings
+        compactionSettings: ZetaConfig.CompactionSettings,
+        retrySettings: RetrySettings
     ) async -> Int32 {
         let runtime = CLIRPCRuntime(
             agent: agent,
@@ -285,7 +308,8 @@ public enum ZetaCLI {
                 fileURLWithPath: FileManager.default.currentDirectoryPath
             ),
             session: session,
-            compactionSettings: compactionSettings
+            compactionSettings: compactionSettings,
+            retrySettings: retrySettings
         )
         let writer = RPCOutputWriter()
         await agent.subscribe { event in
@@ -322,6 +346,8 @@ public enum ZetaCLI {
             }
             await runtime.waitForIdle()
             await agent.waitForIdle()
+            try await session?.drainPersistenceErrors()
+            try await runtime.drainErrors()
             return 0
         } catch {
             FileHandle.standardError.write(Data("\(error.localizedDescription)\n".utf8))
@@ -670,6 +696,54 @@ private struct InitialPrompt {
     }
 }
 
+enum CLISessionBoundary {
+    static func prompt(
+        _ message: UserMessage,
+        agent: Agent,
+        session: PersistentSessionController?
+    ) async throws {
+        try await session?.drainPersistenceErrors()
+        try await agent.prompt(message)
+        try await session?.drainPersistenceErrors()
+    }
+
+    static func compact(
+        agent: Agent,
+        session: PersistentSessionController?,
+        preparation: CompactionPreparation,
+        summaryPrompt: String
+    ) async throws -> String {
+        try await session?.drainPersistenceErrors()
+        let originalMessages = await agent.state().messages
+        let summary = try await agent.compact(
+            summaryPrompt: summaryPrompt,
+            retainedTail: preparation.retainedTail
+        )
+        do {
+            try await session?.recordCompaction(
+                summary: summary,
+                preparation: preparation
+            )
+            return summary
+        } catch {
+            try? await agent.setMessages(originalMessages)
+            throw error
+        }
+    }
+}
+
+enum InteractiveTranscript {
+    static func assistantText(_ message: AssistantMessage) -> String {
+        let text = message.content.compactMap {
+            if case .text(let text, _) = $0 { text } else { nil }
+        }.joined()
+        if text.isEmpty, [.error, .aborted].contains(message.stopReason) {
+            return message.errorMessage ?? text
+        }
+        return text
+    }
+}
+
 enum InteractiveSessionCommands {
     static func setThinkingLevel(
         _ level: ThinkingLevel,
@@ -703,6 +777,7 @@ private actor InteractiveRunner {
     private let shell: ShellTool
     private let session: PersistentSessionController?
     private var exitRequested = false
+    private var failed = false
 
     init(
         agent: Agent,
@@ -722,11 +797,10 @@ private actor InteractiveRunner {
     }
 
     func submit(_ message: UserMessage) async {
-        let state = await agent.state()
-        if state.isStreaming {
-            await agent.steer(message)
-        } else {
-            try? await agent.prompt(message)
+        do {
+            try await submitMessage(message)
+        } catch {
+            report(error)
         }
     }
 
@@ -734,15 +808,9 @@ private actor InteractiveRunner {
         guard !text.isEmpty else { return }
         do {
             if try await command(text) { return }
-            let state = await agent.state()
-            if state.isStreaming {
-                await agent.steer(UserMessage(text))
-            } else {
-                try await agent.prompt(UserMessage(text))
-            }
+            try await submitMessage(UserMessage(text))
         } catch {
-            transcript.add(Text(error.localizedDescription))
-            tui.requestRender()
+            report(error)
         }
     }
 
@@ -753,6 +821,24 @@ private actor InteractiveRunner {
     }
 
     func shouldExit() -> Bool { exitRequested }
+    func hadFailure() -> Bool { failed }
+
+    func report(_ error: Error) {
+        failed = true
+        transcript.add(Text(error.localizedDescription))
+        tui.requestRender()
+    }
+
+    private func submitMessage(_ message: UserMessage) async throws {
+        let state = await agent.state()
+        if state.isStreaming {
+            await agent.steer(message)
+        } else {
+            try await CLISessionBoundary.prompt(
+                message, agent: agent, session: session
+            )
+        }
+    }
 
     func receive(_ event: AgentEvent) {
         switch event {
@@ -766,13 +852,7 @@ private actor InteractiveRunner {
                 )
             )
         case .messageEnd(.assistant(let message)):
-            transcript.add(
-                Markdown(
-                    message.content.compactMap {
-                        if case .text(let text, _) = $0 { text } else { nil }
-                    }.joined()
-                )
-            )
+            transcript.add(Markdown(InteractiveTranscript.assistantText(message)))
         case .toolExecutionStart(_, let name, _):
             transcript.add(Text("[\(name)]"))
         default:
@@ -831,13 +911,11 @@ private actor InteractiveRunner {
                 tui.requestRender()
                 return true
             }
-            let summary = try await agent.compact(
-                summaryPrompt: Compaction.summaryPrompt(preparation: preparation),
-                retainedTail: preparation.retainedTail
-            )
-            try await session?.recordCompaction(
-                summary: summary,
-                preparation: preparation
+            _ = try await CLISessionBoundary.compact(
+                agent: agent,
+                session: session,
+                preparation: preparation,
+                summaryPrompt: Compaction.summaryPrompt(preparation: preparation)
             )
             transcript.add(Text("Compacted at message \(preparation.firstRetainedMessageIndex)"))
             tui.requestRender()

@@ -403,6 +403,96 @@ final class ZetaPackagesTests: XCTestCase {
         XCTAssertFalse(leftovers.contains(where: { $0.hasPrefix(".staging-") }))
     }
 
+    func testNPMArchiveDownloadRejectsCompressedSizeLimitWithoutPublication() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        NPMArchiveURLProtocol.configure(
+            archiveStatus: 200,
+            archiveChunks: [Data(repeating: 0x61, count: 40), Data(repeating: 0x62, count: 40)]
+        )
+        let session = npmTestSession()
+        let manager = try ResourcePackageManager(
+            root: root,
+            session: session,
+            maximumCompressedArchiveBytes: 64
+        )
+
+        do {
+            try await manager.install(.npm(name: "test", version: nil))
+            XCTFail("Expected compressed archive size rejection")
+        } catch PackageManagerError.unsafeArchive {
+        } catch {
+            XCTFail("Expected unsafe archive error, got \(error)")
+        }
+
+        let installed = await manager.list()
+        XCTAssertTrue(installed.isEmpty)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: root.path), [])
+    }
+
+    func testNPMArchiveDownloadPreservesHTTPStatusAndCleanup() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        NPMArchiveURLProtocol.configure(
+            archiveStatus: 503,
+            archiveChunks: [Data("unavailable".utf8)]
+        )
+        let manager = try ResourcePackageManager(
+            root: root,
+            session: npmTestSession(),
+            maximumCompressedArchiveBytes: 64
+        )
+
+        do {
+            try await manager.install(.npm(name: "test", version: nil))
+            XCTFail("Expected status rejection")
+        } catch PackageManagerError.invalidSource(let source) {
+            XCTAssertEqual(source, "npm:test")
+        } catch {
+            XCTFail("Expected invalid source error, got \(error)")
+        }
+
+        let installed = await manager.list()
+        XCTAssertTrue(installed.isEmpty)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: root.path), [])
+    }
+
+    func testNPMArchiveDownloadCancellationCleansPartialFiles() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        NPMArchiveURLProtocol.configure(
+            archiveStatus: 200,
+            archiveChunks: (0..<200).map { _ in Data(repeating: 0x61, count: 1_024) },
+            delayMicroseconds: 10_000
+        )
+        let manager = try ResourcePackageManager(
+            root: root,
+            session: npmTestSession(),
+            maximumCompressedArchiveBytes: 1_000_000
+        )
+        let task = Task {
+            try await manager.install(.npm(name: "test", version: nil))
+        }
+        defer { task.cancel() }
+        for _ in 0..<200 where !NPMArchiveURLProtocol.archiveStarted {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertTrue(NPMArchiveURLProtocol.archiveStarted)
+
+        task.cancel()
+        do {
+            try await task.value
+            XCTFail("Expected cancellation")
+        } catch is CancellationError {
+        } catch {
+            XCTFail("Expected CancellationError, got \(error)")
+        }
+
+        let installed = await manager.list()
+        XCTAssertTrue(installed.isEmpty)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: root.path), [])
+    }
+
     func testExtensionBearingPackageIsRejectedWithoutPublication() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString)
@@ -429,6 +519,93 @@ final class ZetaPackagesTests: XCTestCase {
         let packages = await manager.list()
         XCTAssertTrue(packages.isEmpty)
     }
+}
+
+private func npmTestSession() -> URLSession {
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.protocolClasses = [NPMArchiveURLProtocol.self]
+    return URLSession(configuration: configuration)
+}
+
+private final class NPMArchiveURLProtocol: URLProtocol, @unchecked Sendable {
+    private struct Script: Sendable {
+        var archiveStatus: Int
+        var archiveChunks: [Data]
+        var delayMicroseconds: useconds_t
+    }
+
+    private final class Storage: @unchecked Sendable {
+        let lock = NSLock()
+        var script = Script(archiveStatus: 200, archiveChunks: [], delayMicroseconds: 0)
+        var archiveStarted = false
+    }
+
+    private static let storage = Storage()
+    private let stopLock = NSLock()
+    private var stopped = false
+
+    static var archiveStarted: Bool {
+        storage.lock.withLock { storage.archiveStarted }
+    }
+
+    static func configure(
+        archiveStatus: Int,
+        archiveChunks: [Data],
+        delayMicroseconds: useconds_t = 0
+    ) {
+        storage.lock.withLock {
+            storage.script = Script(
+                archiveStatus: archiveStatus,
+                archiveChunks: archiveChunks,
+                delayMicroseconds: delayMicroseconds
+            )
+            storage.archiveStarted = false
+        }
+    }
+
+    override class func canInit(with request: URLRequest) -> Bool {
+        request.url?.scheme == "https"
+    }
+
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest {
+        request
+    }
+
+    override func startLoading() {
+        guard let url = request.url else { return }
+        let script = Self.storage.lock.withLock { Self.storage.script }
+        let isArchive = url.host == "packages.test"
+        let status = isArchive ? script.archiveStatus : 200
+        let chunks = isArchive ? script.archiveChunks : [Self.metadata]
+        if isArchive {
+            Self.storage.lock.withLock { Self.storage.archiveStarted = true }
+        }
+        guard
+            let response = HTTPURLResponse(
+                url: url,
+                statusCode: status,
+                httpVersion: "HTTP/1.1",
+                headerFields: ["Content-Type": "application/octet-stream"]
+            )
+        else { return }
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        for chunk in chunks {
+            guard !stopLock.withLock({ stopped }) else { return }
+            client?.urlProtocol(self, didLoad: chunk)
+            if script.delayMicroseconds > 0 { usleep(script.delayMicroseconds) }
+        }
+        guard !stopLock.withLock({ stopped }) else { return }
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {
+        stopLock.withLock { stopped = true }
+    }
+
+    private static let metadata = Data(
+        #"{"versions":{"1.0.0":{"dist":{"tarball":"https://packages.test/archive.tgz"}}},"dist-tags":{"latest":"1.0.0"}}"#
+            .utf8
+    )
 }
 
 private func createGitPackage(at directory: URL, marker: String) throws {

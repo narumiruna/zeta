@@ -192,6 +192,43 @@ final class ZetaSessionsTests: XCTestCase {
         XCTAssertEqual(cloneEntries.count, 2)
     }
 
+    func testV1MigrationSkipsMalformedJSONAndPreservesUndecodableObjects() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let file = directory.appendingPathComponent("v1-unknown.jsonl")
+        let content = """
+            {"type":"session","id":"legacy","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp"}
+            {"type":"message","timestamp":"2026-01-01T00:00:01Z","message":{"role":"user","content":[{"type":"text","text":"hello"}],"timestamp":1}}
+            not valid json
+            {"type":"future_entry","timestamp":"2026-01-01T00:00:02Z","futureValue":42}
+            {"type":"message","timestamp":"2026-01-01T00:00:03Z"}
+            """
+        try Data(content.utf8).write(to: file)
+
+        let manager = try SessionManager.load(file: file)
+        let entries = await manager.allEntries()
+        XCTAssertEqual(entries.count, 1)
+        try await manager.materialize()
+
+        let migratedData = try Data(contentsOf: file)
+        let migratedText = String(decoding: migratedData, as: UTF8.self)
+        XCTAssertFalse(migratedText.contains("not valid json"))
+        let objects = try migratedData.split(separator: 0x0A).map {
+            try XCTUnwrap(JSONSerialization.jsonObject(with: Data($0)) as? [String: Any])
+        }
+        XCTAssertEqual(objects.count, 4)
+        XCTAssertEqual(objects[0]["version"] as? Int, currentCodingSessionVersion)
+        let firstID = try XCTUnwrap(objects[1]["id"] as? String)
+        let futureID = try XCTUnwrap(objects[2]["id"] as? String)
+        XCTAssertEqual(objects[2]["type"] as? String, "future_entry")
+        XCTAssertEqual(objects[2]["futureValue"] as? Int, 42)
+        XCTAssertEqual(objects[2]["parentId"] as? String, firstID)
+        XCTAssertEqual(objects[3]["type"] as? String, "message")
+        XCTAssertNil(objects[3]["message"])
+        XCTAssertEqual(objects[3]["parentId"] as? String, futureID)
+    }
+
     func testStrictJSONLSplitsOnlyLF() {
         var decoder = StrictJSONLDecoder()
         let records = decoder.push(Data("{\"x\":\"a\u{2028}b\"}\r\nlast".utf8)) + decoder.finish()

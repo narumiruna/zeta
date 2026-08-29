@@ -21,6 +21,9 @@ actor CLIPluginRuntime {
     ) async -> [String] {
         await stop()
         var diagnostics: [String] = []
+        var loadedHosts: [PluginHost] = []
+        var loadedBindings: [ToolBinding] = []
+        var registeredToolNames = Set(BuiltinToolSchemas.values.keys)
         let roots = [
             (agentDirectory.appendingPathComponent("plugins"), true),
             (workingDirectory.appendingPathComponent(".pi/plugins"), projectTrusted),
@@ -47,7 +50,13 @@ actor CLIPluginRuntime {
                         )
                     }
                     let bindings: [ToolBinding]
+                    var candidateNames = registeredToolNames
                     do {
+                        for registration in registrations {
+                            guard candidateNames.insert(registration.name).inserted else {
+                                throw CLIPluginRuntimeError.duplicateToolName(registration.name)
+                            }
+                        }
                         bindings = try registrations.map { registration in
                             ToolBinding(
                                 registration: registration,
@@ -59,13 +68,16 @@ actor CLIPluginRuntime {
                         await host.stop()
                         throw error
                     }
-                    hosts.append(host)
-                    toolBindings.append(contentsOf: bindings)
+                    loadedHosts.append(host)
+                    loadedBindings.append(contentsOf: bindings)
+                    registeredToolNames = candidateNames
                 } catch {
                     diagnostics.append("Swift plugin \(manifestURL.path): \(error.localizedDescription)")
                 }
             }
         }
+        hosts = loadedHosts
+        toolBindings = loadedBindings
         return diagnostics
     }
 
@@ -130,10 +142,13 @@ actor CLIPluginRuntime {
 }
 
 private enum CLIPluginRuntimeError: LocalizedError {
+    case duplicateToolName(String)
     case unsupportedRegistrations([String])
 
     var errorDescription: String? {
         switch self {
+        case .duplicateToolName(let name):
+            return "Plugin tool name collides with another plugin or built-in tool: \(name)"
         case .unsupportedRegistrations(let kinds):
             let names = Array(Set(kinds)).sorted().joined(separator: ", ")
             return

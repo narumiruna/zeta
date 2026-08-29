@@ -31,6 +31,20 @@ final class ZetaBedrockTests: XCTestCase {
         XCTAssertThrowsError(try truncated.finish())
     }
 
+    func testEventStreamRejectsDeclaredLengthAboveLimitFromPrelude() throws {
+        var prelude = Data()
+        prelude.appendUInt32(1_025)
+        prelude.appendUInt32(0)
+        prelude.appendUInt32(0)
+        var decoder = AWSEventStreamDecoder(maximumMessageLength: 1_024)
+
+        XCTAssertThrowsError(try decoder.push(prelude)) { error in
+            guard case AWSEventStreamError.invalidLength = error else {
+                return XCTFail("Expected invalid length, got \(error)")
+            }
+        }
+    }
+
     func testBearerAndSigV4RequestsUseDistinctAuthorization() throws {
         var request = URLRequest(url: URL(string: "https://bedrock.example.com/model/test")!)
         request.httpMethod = "POST"

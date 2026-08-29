@@ -4,12 +4,37 @@ import ZetaAgent
 import ZetaCompaction
 import ZetaSessions
 
+enum PersistentSessionOperation: Sendable, Equatable {
+    case recordMessage
+    case recordCompaction
+    case recordModel
+    case recordThinkingLevel
+    case setName
+    case materializeName
+    case materializeNewSession
+}
+
+struct DeferredPersistenceError: LocalizedError, Sendable, Equatable {
+    let failures: [String]
+
+    var errorDescription: String? {
+        "Session persistence failed: " + failures.joined(separator: "; ")
+    }
+}
+
 actor PersistentSessionController {
+    typealias FailureInjector = @Sendable (PersistentSessionOperation) throws -> Void
+
     private var manager: SessionManager
     private var errors: [String] = []
+    private let injectFailure: FailureInjector
 
-    init(manager: SessionManager) {
+    init(
+        manager: SessionManager,
+        injectFailure: @escaping FailureInjector = { _ in }
+    ) {
         self.manager = manager
+        self.injectFailure = injectFailure
     }
 
     static func open(
@@ -71,6 +96,7 @@ actor PersistentSessionController {
     func record(_ event: AgentEvent) async {
         guard case .messageEnd(let message) = event else { return }
         do {
+            try injectFailure(.recordMessage)
             let parent = await manager.leaf()?.base.id
             let base = SessionEntryBase(
                 id: String(UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(8)).lowercased(),
@@ -91,18 +117,27 @@ actor PersistentSessionController {
     func exportSnapshot() async -> (header: SessionHeader, entries: [SessionEntry], leafID: String?) {
         await (manager.header, manager.allEntries(), manager.leaf()?.base.id)
     }
-    func persistenceErrors() -> [String] { errors }
+
+    func drainPersistenceErrors() throws {
+        guard !errors.isEmpty else { return }
+        let failures = errors
+        errors.removeAll()
+        throw DeferredPersistenceError(failures: failures)
+    }
 
     @discardableResult
-    func newSession() async throws -> URL? {
+    func newSession(parentSession: String? = nil) async throws -> URL? {
+        try drainPersistenceErrors()
         let currentFile = await manager.file
         let root =
             currentFile?.deletingLastPathComponent()
             ?? FileManager.default.temporaryDirectory
         let replacement = try Self.create(
             root: root,
-            cwd: await manager.header.cwd
+            cwd: await manager.header.cwd,
+            parentSession: parentSession
         )
+        try injectFailure(.materializeNewSession)
         try await replacement.materialize()
         manager = replacement
         errors = []
@@ -113,6 +148,7 @@ actor PersistentSessionController {
         summary: String,
         preparation: CompactionPreparation
     ) async throws {
+        try injectFailure(.recordCompaction)
         let branch = try await manager.branch()
         let contextEntries = Self.projectedContextEntries(branch)
         guard contextEntries.indices.contains(preparation.firstRetainedMessageIndex) else {
@@ -138,6 +174,7 @@ actor PersistentSessionController {
     }
 
     func recordModel(_ model: Model) async throws {
+        try injectFailure(.recordModel)
         let base = SessionEntryBase(
             id: String(UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(8)).lowercased(),
             parentId: await manager.leaf()?.base.id,
@@ -150,6 +187,7 @@ actor PersistentSessionController {
     }
 
     func recordThinkingLevel(_ level: ThinkingLevel) async throws {
+        try injectFailure(.recordThinkingLevel)
         if try await manager.context().thinkingLevel == level {
             return
         }
@@ -163,12 +201,15 @@ actor PersistentSessionController {
     }
 
     func setName(_ name: String?) async throws {
+        try injectFailure(.setName)
         let base = SessionEntryBase(
             id: String(UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(8)).lowercased(),
             parentId: await manager.leaf()?.base.id,
             timestamp: ISO8601DateFormatter().string(from: Date())
         )
         try await manager.append(.sessionInfo(base, name: name))
+        try injectFailure(.materializeName)
+        try await manager.materialize()
     }
 
     func clone() async throws -> SessionManager {
@@ -295,13 +336,15 @@ actor PersistentSessionController {
     private static func create(
         root: URL,
         cwd: String,
-        id: String? = nil
+        id: String? = nil,
+        parentSession: String? = nil
     ) throws -> SessionManager {
         try SessionManager(
             header: SessionHeader(
                 id: id ?? UUID().uuidString.lowercased(),
                 timestamp: ISO8601DateFormatter().string(from: Date()),
-                cwd: cwd
+                cwd: cwd,
+                parentSession: parentSession
             ),
             file: sessionFile(root: root)
         )

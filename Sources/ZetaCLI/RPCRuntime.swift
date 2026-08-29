@@ -16,7 +16,9 @@ public actor CLIRPCRuntime {
     private let workingDirectory: URL
     private var autoCompaction: Bool
     private let compactionPolicy: ZetaCompaction.CompactionSettings
-    private var autoRetry = true
+    private let retryPolicy: RetrySettings
+    private var autoRetry: Bool
+    private var retryPolicyInitialized = false
     private var sessionName: String?
     private let session: PersistentSessionController?
     private var promptTask: Task<Void, Never>?
@@ -25,20 +27,26 @@ public actor CLIRPCRuntime {
     private var activeBash: (id: UUID, task: Task<ShellResult, Error>)?
     private var sessionMutationInProgress = false
     private var compactionInProgress = false
+    private var deferredErrors: [String] = []
 
     init(
         agent: Agent,
         models: [Model],
         workingDirectory: URL,
         session: PersistentSessionController? = nil,
-        compactionSettings: ZetaConfig.CompactionSettings? = nil
+        compactionSettings: ZetaConfig.CompactionSettings? = nil,
+        retrySettings: RetrySettings? = nil
     ) {
-        let compactionSettings = compactionSettings ?? Settings().compaction
+        let defaults = Settings()
+        let compactionSettings = compactionSettings ?? defaults.compaction
+        let retrySettings = retrySettings ?? defaults.retry
         self.agent = agent
         self.models = models
         self.session = session
         self.workingDirectory = workingDirectory
         autoCompaction = compactionSettings.enabled
+        retryPolicy = retrySettings
+        autoRetry = retrySettings.enabled
         compactionPolicy = ZetaCompaction.CompactionSettings(
             reserveTokens: compactionSettings.reserveTokens,
             keepRecentTokens: compactionSettings.keepRecentTokens
@@ -99,6 +107,9 @@ public actor CLIRPCRuntime {
     }
 
     private func execute(_ request: StrictRPCRequest) async throws -> JSONValue? {
+        try surfaceDeferredErrors()
+        try await session?.drainPersistenceErrors()
+        await initializeRetryPolicy()
         switch request.command {
         case .prompt:
             guard !sessionMutationInProgress, !compactionInProgress else {
@@ -145,7 +156,9 @@ public actor CLIRPCRuntime {
             await agent.waitForIdle()
             if let promptTask { await promptTask.value }
             try await agent.reset()
-            let file = try await session?.newSession()
+            let file = try await session?.newSession(
+                parentSession: optionalString("parentSession", request.fields)
+            )
             sessionName = nil
             return [
                 "created": true,
@@ -176,6 +189,7 @@ public actor CLIRPCRuntime {
                 optionalString("direction", request.fields) == "previous"
                 ? -1 : 1
             let index = (current + direction + models.count) % models.count
+            try await session?.recordModel(models[index])
             await agent.setModel(models[index])
             return [
                 "provider": .string(models[index].provider),
@@ -224,16 +238,14 @@ public actor CLIRPCRuntime {
             else {
                 return ["compacted": false]
             }
-            let summary = try await agent.compact(
+            _ = try await CLISessionBoundary.compact(
+                agent: agent,
+                session: session,
+                preparation: preparation,
                 summaryPrompt: Compaction.summaryPrompt(
                     preparation: preparation,
                     customInstructions: optionalString("customInstructions", request.fields)
-                ),
-                retainedTail: preparation.retainedTail
-            )
-            try await session?.recordCompaction(
-                summary: summary,
-                preparation: preparation
+                )
             )
             return [
                 "compacted": true,
@@ -246,8 +258,9 @@ public actor CLIRPCRuntime {
         case .setAutoRetry:
             autoRetry = try requiredBool("enabled", request.fields)
             await agent.configureRetry(
-                maximumRetries: autoRetry ? 3 : 0,
-                baseDelayMilliseconds: 2_000
+                maximumRetries: autoRetry ? retryPolicy.maxRetries : 0,
+                baseDelayMilliseconds: retryPolicy.baseDelayMs,
+                maximumDelayMilliseconds: retryPolicy.maxRetryDelayMs
             )
             return ["enabled": .bool(autoRetry)]
         case .abortRetry:
@@ -297,6 +310,11 @@ public actor CLIRPCRuntime {
                     .joined(separator: "\n\n"),
                 leafID: exported.leafID
             )
+            if let outputPath = optionalString("outputPath", request.fields) {
+                let output = URL(fileURLWithPath: outputPath).standardizedFileURL
+                try Data(html.utf8).write(to: output, options: .atomic)
+                return ["path": .string(output.path)]
+            }
             return ["html": .string(html)]
         case .switchSession:
             guard let session else { return ["switched": false, "reason": "No persistent session selected"] }
@@ -367,9 +385,10 @@ public actor CLIRPCRuntime {
             }.first
             return ["text": value.map(JSONValue.string) ?? .null]
         case .setSessionName:
-            sessionName = try requiredString("name", request.fields)
-            try await session?.setName(sessionName)
-            return ["name": sessionName.map(JSONValue.string) ?? .null]
+            let name = try requiredString("name", request.fields)
+            try await session?.setName(name)
+            sessionName = name
+            return ["name": .string(name)]
         case .getCommands:
             return .array(RPCCommandName.allCases.map { .string($0.rawValue) })
         }
@@ -377,6 +396,10 @@ public actor CLIRPCRuntime {
 
     func waitForIdle() async {
         if let promptTask { await promptTask.value }
+    }
+
+    func drainErrors() throws {
+        try surfaceDeferredErrors()
     }
 
     private func finishAdmittedBash(
@@ -422,13 +445,19 @@ public actor CLIRPCRuntime {
 
     private func runPrompt(_ message: UserMessage, id: UUID) async {
         var next: UserMessage? = message
-        while let current = next, !Task.isCancelled {
-            try? await compactIfNeeded()
-            try? await agent.prompt(current)
-            if !Task.isCancelled {
-                try? await compactIfNeeded()
+        do {
+            while let current = next, !Task.isCancelled {
+                try await compactIfNeeded()
+                try await agent.prompt(current)
+                try await session?.drainPersistenceErrors()
+                if !Task.isCancelled {
+                    try await compactIfNeeded()
+                }
+                next = queuedPrompts.isEmpty ? nil : queuedPrompts.removeFirst()
             }
-            next = queuedPrompts.isEmpty ? nil : queuedPrompts.removeFirst()
+        } catch {
+            deferredErrors.append(error.localizedDescription)
+            queuedPrompts.removeAll()
         }
         if promptRunID == id {
             promptRunID = nil
@@ -452,13 +481,28 @@ public actor CLIRPCRuntime {
         else {
             return
         }
-        let summary = try await agent.compact(
-            summaryPrompt: Compaction.summaryPrompt(preparation: preparation),
-            retainedTail: preparation.retainedTail
+        _ = try await CLISessionBoundary.compact(
+            agent: agent,
+            session: session,
+            preparation: preparation,
+            summaryPrompt: Compaction.summaryPrompt(preparation: preparation)
         )
-        try await session?.recordCompaction(
-            summary: summary,
-            preparation: preparation
+    }
+
+    private func surfaceDeferredErrors() throws {
+        guard !deferredErrors.isEmpty else { return }
+        let failures = deferredErrors
+        deferredErrors.removeAll()
+        throw DeferredPersistenceError(failures: failures)
+    }
+
+    private func initializeRetryPolicy() async {
+        guard !retryPolicyInitialized else { return }
+        retryPolicyInitialized = true
+        await agent.configureRetry(
+            maximumRetries: autoRetry ? retryPolicy.maxRetries : 0,
+            baseDelayMilliseconds: retryPolicy.baseDelayMs,
+            maximumDelayMilliseconds: retryPolicy.maxRetryDelayMs
         )
     }
 

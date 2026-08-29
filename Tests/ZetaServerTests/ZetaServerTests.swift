@@ -273,6 +273,88 @@ final class ZetaServerTests: XCTestCase {
         XCTAssertEqual(finalSecondDisposeCount, 1)
     }
 
+    func testDisconnectedAttachWaiterCannotPublishToReplacementConnectionID() async throws {
+        let gate = OpenGate()
+        let tracker = RuntimeTracker()
+        let server = try PiServer(
+            serverID: "server",
+            service: GatedOpenService(gate: gate, tracker: tracker)
+        )
+        let original = TestConnection(id: "reused")
+        try await server.accept(original)
+        await server.receive(try encodeClientMessage(.hello(try ClientHello())), connectionID: original.id)
+        try await waitUntil { await original.count == 1 }
+
+        let attach = try RequestEnvelope(id: "stale-attach", request: .attach(sessionID: "slow"))
+        await server.receive(try encodeClientMessage(.request(attach)), connectionID: original.id)
+        try await waitUntil { await gate.entered }
+        await server.disconnected(original.id)
+
+        let replacement = TestConnection(id: original.id)
+        try await server.accept(replacement)
+        await server.receive(try encodeClientMessage(.hello(try ClientHello())), connectionID: replacement.id)
+        try await waitUntil { await replacement.count == 1 }
+        await gate.release()
+
+        try await waitUntil { await tracker.disposeCount == 1 }
+        try await Task.sleep(for: .milliseconds(20))
+        let replacementCount = await replacement.count
+        XCTAssertEqual(replacementCount, 1)
+        await server.disconnected(replacement.id)
+        let finalDisposeCount = await tracker.disposeCount
+        XCTAssertEqual(finalDisposeCount, 1)
+        await server.close()
+    }
+
+    func testHandshakePendingRequestCountLimitClosesOffender() async throws {
+        let gate = HandshakeGate()
+        let server = try PiServer(
+            serverID: "server",
+            maximumPendingHandshakeRequests: 1,
+            service: GatedHandshakeService(gate: gate)
+        )
+        let connection = TestConnection()
+        try await server.accept(connection)
+        await server.receive(try encodeClientMessage(.hello(try ClientHello())), connectionID: connection.id)
+        try await waitUntil { await gate.entered }
+
+        await server.receive(
+            try encodeClientMessage(.request(try RequestEnvelope(id: "first", request: .list))),
+            connectionID: connection.id
+        )
+        await server.receive(
+            try encodeClientMessage(.request(try RequestEnvelope(id: "second", request: .list))),
+            connectionID: connection.id
+        )
+
+        try await waitUntil { await connection.isClosed }
+        await gate.release()
+        await server.close()
+    }
+
+    func testHandshakePendingRequestByteLimitClosesOffender() async throws {
+        let gate = HandshakeGate()
+        let request = try encodeClientMessage(
+            .request(try RequestEnvelope(id: "oversized-pending", request: .list))
+        )
+        let server = try PiServer(
+            serverID: "server",
+            maximumPendingHandshakeRequests: 64,
+            maximumPendingHandshakeBytes: request.count - 1,
+            service: GatedHandshakeService(gate: gate)
+        )
+        let connection = TestConnection()
+        try await server.accept(connection)
+        await server.receive(try encodeClientMessage(.hello(try ClientHello())), connectionID: connection.id)
+        try await waitUntil { await gate.entered }
+
+        await server.receive(request, connectionID: connection.id)
+
+        try await waitUntil { await connection.isClosed }
+        await gate.release()
+        await server.close()
+    }
+
     func testConcurrentAttachmentsShareOneRuntimeAndPreserveBothConnections() async throws {
         let tracker = RuntimeTracker()
         let service = CountingService(tracker: tracker)
@@ -386,6 +468,42 @@ private actor RacingCreateService: PiServerService {
     func openSession(_ id: String) async throws -> any PiSessionRuntime { TestRuntime(id: id) }
 }
 
+private actor GatedOpenService: PiServerService {
+    let gate: OpenGate
+    let tracker: RuntimeTracker
+
+    init(gate: OpenGate, tracker: RuntimeTracker) {
+        self.gate = gate
+        self.tracker = tracker
+    }
+
+    func listSessions() async throws -> [SessionMetadata] { [] }
+    func listModels() async throws -> [ModelMetadata] { [] }
+    func createSession(_ options: CreateCommandOptions) async throws -> any PiSessionRuntime {
+        TestRuntime(id: "created")
+    }
+    func openSession(_ id: String) async throws -> any PiSessionRuntime {
+        await gate.wait()
+        return TestRuntime(id: id, tracker: tracker)
+    }
+}
+
+private actor GatedHandshakeService: PiServerService {
+    let gate: HandshakeGate
+
+    init(gate: HandshakeGate) { self.gate = gate }
+
+    func listSessions() async throws -> [SessionMetadata] {
+        await gate.wait()
+        return []
+    }
+    func listModels() async throws -> [ModelMetadata] { [] }
+    func createSession(_ options: CreateCommandOptions) async throws -> any PiSessionRuntime {
+        TestRuntime(id: "created")
+    }
+    func openSession(_ id: String) async throws -> any PiSessionRuntime { TestRuntime(id: id) }
+}
+
 private actor CountingService: PiServerService {
     private(set) var openCount = 0
     let tracker: RuntimeTracker
@@ -401,6 +519,39 @@ private actor CountingService: PiServerService {
         openCount += 1
         try await Task.sleep(for: .milliseconds(50))
         return TestRuntime(id: id, tracker: tracker)
+    }
+}
+
+private actor OpenGate {
+    private(set) var entered = false
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var released = false
+
+    func wait() async {
+        entered = true
+        if released { return }
+        await withCheckedContinuation { continuation = $0 }
+    }
+
+    func release() {
+        released = true
+        continuation?.resume()
+        continuation = nil
+    }
+}
+
+private actor HandshakeGate {
+    private(set) var entered = false
+    private var continuation: CheckedContinuation<Void, Never>?
+
+    func wait() async {
+        entered = true
+        await withCheckedContinuation { continuation = $0 }
+    }
+
+    func release() {
+        continuation?.resume()
+        continuation = nil
     }
 }
 

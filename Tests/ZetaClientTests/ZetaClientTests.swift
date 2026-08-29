@@ -46,6 +46,32 @@ final class ZetaClientTests: XCTestCase {
         await client.disconnect()
     }
 
+    func testCancellingOneConnectWaiterKeepsSharedAttemptAlive() async throws {
+        let factory = ControlledConnectionFactory()
+        let client = try PiClient { handlers in try await factory.open(handlers) }
+        let first = Task { try await client.connect() }
+        try await waitUntil { await factory.attemptCount == 1 }
+        let second = Task { try await client.connect() }
+        try await Task.sleep(for: .milliseconds(20))
+
+        first.cancel()
+        do {
+            try await first.value
+            XCTFail("Expected first waiter cancellation")
+        } catch is CancellationError {}
+
+        let connectingState = await client.connectionState()
+        XCTAssertEqual(connectingState, .connecting)
+        let attemptCount = await factory.attemptCount
+        XCTAssertEqual(attemptCount, 1)
+
+        await factory.succeed()
+        try await second.value
+        let connectedState = await client.connectionState()
+        XCTAssertEqual(connectedState, .connected)
+        await client.disconnect()
+    }
+
     func testConcurrentConnectFailureIsSharedAndLaterRetrySucceeds() async throws {
         let factory = ControlledConnectionFactory()
         let client = try PiClient { handlers in try await factory.open(handlers) }
@@ -299,7 +325,6 @@ final class ZetaClientTests: XCTestCase {
         let cancelledValue = await firstOutcome.value
         XCTAssertEqual(cancelledValue, .cancelled)
 
-        await transport.completeList(at: 0)
         await cancelledRequest.value
 
         let completedRequest = Task { try await client.listSessions() }
@@ -316,6 +341,52 @@ final class ZetaClientTests: XCTestCase {
         await transport.completeList(at: 2)
         let disconnectedValue = await disconnectedRequest.value
         XCTAssertEqual(disconnectedValue, .disconnected)
+    }
+
+    func testUnknownResponseIDFailsConnectionAndPendingRequest() async throws {
+        let box = ControlledTransportBox()
+        let client = try PiClient { handlers in
+            let transport = ControlledTransport(handlers: handlers)
+            await box.set(transport)
+            return transport
+        }
+        try await client.connect()
+        let transport = await box.wait()
+        let request = Task { try await client.listSessions() }
+        try await waitUntil { await transport.listCount == 1 }
+
+        await transport.sendListResponse(id: "unknown")
+
+        do {
+            _ = try await request.value
+            XCTFail("Expected protocol failure")
+        } catch PiClientError.protocolFailure(let message) {
+            XCTAssertTrue(message.contains("unknown"))
+        }
+        try await waitUntil { await client.connectionState() == .disconnected }
+        let closeCount = await transport.closeCount
+        XCTAssertEqual(closeCount, 1)
+    }
+
+    func testDuplicateResponseIDFailsConnection() async throws {
+        let box = ControlledTransportBox()
+        let client = try PiClient { handlers in
+            let transport = ControlledTransport(handlers: handlers)
+            await box.set(transport)
+            return transport
+        }
+        try await client.connect()
+        let transport = await box.wait()
+        let request = Task { try await client.listSessions() }
+        try await waitUntil { await transport.listCount == 1 }
+        await transport.completeList(at: 0)
+        _ = try await request.value
+
+        await transport.completeList(at: 0)
+
+        try await waitUntil { await client.connectionState() == .disconnected }
+        let closeCount = await transport.closeCount
+        XCTAssertEqual(closeCount, 1)
     }
 }
 
@@ -464,6 +535,7 @@ private actor ControlledTransport: ByteTransport {
     private var attachments: [RequestEnvelope] = []
     private var lists: [RequestEnvelope] = []
     private(set) var detachCount = 0
+    private(set) var closeCount = 0
     var attachCount: Int { attachments.count }
     var listCount: Int { lists.count }
 
@@ -505,12 +577,16 @@ private actor ControlledTransport: ByteTransport {
 
     func completeList(at index: Int) {
         guard lists.indices.contains(index) else { return }
-        handlers.onData(
-            try! encodeServerMessage(
-                .response(.success(id: lists[index].id, result: .list([])))))
+        sendListResponse(id: lists[index].id)
     }
 
-    func close() {}
+    func sendListResponse(id: String) {
+        handlers.onData(
+            try! encodeServerMessage(
+                .response(.success(id: id, result: .list([])))))
+    }
+
+    func close() { closeCount += 1 }
 
     private func makeSnapshot(id: String) throws -> SessionSnapshot {
         try SessionSnapshot(

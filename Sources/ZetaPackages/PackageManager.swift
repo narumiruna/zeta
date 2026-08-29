@@ -139,14 +139,30 @@ enum PackageInternalError: Error, LocalizedError, Sendable {
 }
 
 public actor ResourcePackageManager {
+    private static let defaultMaximumCompressedArchiveBytes: Int64 = 100 * 1_024 * 1_024
+
     private let root: URL
     private let session: URLSession
+    private let maximumCompressedArchiveBytes: Int64
     private var installed: [String: InstalledPackage] = [:]
 
     public init(root: URL, session: URLSession = .shared) throws {
+        try self.init(
+            root: root,
+            session: session,
+            maximumCompressedArchiveBytes: Self.defaultMaximumCompressedArchiveBytes
+        )
+    }
+
+    init(
+        root: URL,
+        session: URLSession,
+        maximumCompressedArchiveBytes: Int64
+    ) throws {
         let standardizedRoot = root.standardizedFileURL
         self.root = standardizedRoot
         self.session = session
+        self.maximumCompressedArchiveBytes = maximumCompressedArchiveBytes
         try FileManager.default.createDirectory(
             at: standardizedRoot,
             withIntermediateDirectories: true,
@@ -303,13 +319,9 @@ public actor ResourcePackageManager {
         else {
             throw PackageManagerError.invalidSource("npm:\(name)")
         }
-        let (archive, archiveResponse) = try await session.data(from: tarballURL)
-        guard (archiveResponse as? HTTPURLResponse)?.statusCode == 200 else {
-            throw PackageManagerError.invalidSource("npm:\(name)")
-        }
         let temporary = root.appendingPathComponent(".archive-\(UUID().uuidString).tgz")
         defer { try? FileManager.default.removeItem(at: temporary) }
-        try archive.write(to: temporary, options: .atomic)
+        try await downloadArchive(from: tarballURL, to: temporary, packageName: name)
         let listing = String(
             decoding: try await Self.run("/usr/bin/tar", ["-tzf", temporary.path]),
             as: UTF8.self
@@ -337,6 +349,36 @@ public actor ResourcePackageManager {
             "/usr/bin/tar",
             ["-xzf", temporary.path, "--strip-components", "1", "-C", staging.path]
         )
+    }
+
+    private func downloadArchive(
+        from url: URL,
+        to destination: URL,
+        packageName: String
+    ) async throws {
+        let delegate = BoundedDownloadDelegate(maximumBytes: maximumCompressedArchiveBytes)
+        let downloaded: URL
+        let response: URLResponse
+        do {
+            (downloaded, response) = try await session.download(
+                for: URLRequest(url: url),
+                delegate: delegate
+            )
+        } catch {
+            if Task.isCancelled { throw CancellationError() }
+            if delegate.exceededLimit { throw PackageManagerError.unsafeArchive }
+            throw error
+        }
+        defer { try? FileManager.default.removeItem(at: downloaded) }
+        try Task.checkCancellation()
+        guard (response as? HTTPURLResponse)?.statusCode == 200 else {
+            throw PackageManagerError.invalidSource("npm:\(packageName)")
+        }
+        let size = try downloaded.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
+        guard Int64(size) <= maximumCompressedArchiveBytes else {
+            throw PackageManagerError.unsafeArchive
+        }
+        try FileManager.default.moveItem(at: downloaded, to: destination)
     }
 
     private func validatePackageTree(_ directory: URL) throws {
@@ -505,5 +547,37 @@ public actor ResourcePackageManager {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         try encoder.encode(packages).write(to: indexURL, options: .atomic)
+    }
+}
+
+private final class BoundedDownloadDelegate: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
+    private let maximumBytes: Int64
+    private let lock = NSLock()
+    private var exceeded = false
+
+    init(maximumBytes: Int64) {
+        self.maximumBytes = maximumBytes
+    }
+
+    var exceededLimit: Bool {
+        lock.withLock { exceeded }
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        downloadTask: URLSessionDownloadTask,
+        didFinishDownloadingTo location: URL
+    ) {}
+
+    func urlSession(
+        _ session: URLSession,
+        downloadTask: URLSessionDownloadTask,
+        didWriteData bytesWritten: Int64,
+        totalBytesWritten: Int64,
+        totalBytesExpectedToWrite: Int64
+    ) {
+        guard totalBytesWritten > maximumBytes else { return }
+        lock.withLock { exceeded = true }
+        downloadTask.cancel()
     }
 }

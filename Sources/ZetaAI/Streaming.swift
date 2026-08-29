@@ -29,7 +29,9 @@ public actor AssistantEventStream: AsyncSequence {
     private var started = false
     private var finished = false
 
-    public init(bufferingPolicy: AsyncThrowingStream<AssistantEvent, Error>.Continuation.BufferingPolicy = .unbounded) {
+    public init(
+        bufferingPolicy: AsyncThrowingStream<AssistantEvent, Error>.Continuation.BufferingPolicy = .bufferingNewest(64)
+    ) {
         let pair = AsyncThrowingStream<AssistantEvent, Error>.makeStream(bufferingPolicy: bufferingPolicy)
         let producerTermination = ProducerTermination()
         stream = pair.stream

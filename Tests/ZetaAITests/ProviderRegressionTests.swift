@@ -498,6 +498,36 @@ final class ProviderRegressionTests: XCTestCase {
         XCTAssertEqual(terminal, result)
     }
 
+    func testDefaultAssistantEventBufferIsBoundedAndRetainsTerminalState() async throws {
+        let stream = AssistantEventStream()
+        var partial = AssistantMessage(
+            api: "test-api",
+            provider: "test-provider",
+            model: "test-model"
+        )
+        await stream.emit(.start(partial))
+        partial.content = [.text(text: "")]
+        await stream.emit(.textStart(index: 0, partial: partial))
+        for index in 0..<200 {
+            let text = String(repeating: "x", count: index + 1)
+            partial.content[0] = .text(text: text)
+            await stream.emit(.textDelta(index: 0, delta: "x", partial: partial))
+        }
+        partial.stopReason = .stop
+        await stream.emit(.done(reason: .stop, message: partial))
+
+        var events: [AssistantEvent] = []
+        for try await event in stream { events.append(event) }
+
+        XCTAssertLessThanOrEqual(events.count, 64)
+        guard case .done(.stop, let terminal) = events.last else {
+            return XCTFail("Expected buffered terminal event")
+        }
+        XCTAssertEqual(terminal, partial)
+        let result = await stream.result()
+        XCTAssertEqual(result, partial)
+    }
+
     func testCodexPoolPartitionsByCredentialAndEndpoint() async throws {
         let factory = CompletingCodexFactory()
         let pool = CodexWebSocketPool { url, headers in

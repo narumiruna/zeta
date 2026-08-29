@@ -81,24 +81,44 @@ public struct ZetaPaths: Sendable {
 
 public actor SettingsStore {
     private let paths: ZetaPaths
+    private let projectOverrides: [String: Any]
+    private var globalSettings: Settings
     private var settings: Settings
 
     public init(paths: ZetaPaths, includeProject: Bool = true) throws {
         self.paths = paths
-        self.settings = try Self.loadMerged(
+        let globalSettings = try Self.loadMerged(
             globalURL: paths.globalSettings,
-            projectURL: includeProject && FileManager.default.fileExists(atPath: paths.projectSettings.path)
-                ? paths.projectSettings : nil
+            projectURL: nil
+        )
+        let projectOverrides =
+            includeProject
+            ? Self.migrate(try Self.readObject(paths.projectSettings) ?? [:])
+            : [:]
+        self.projectOverrides = projectOverrides
+        self.globalSettings = globalSettings
+        self.settings = try Self.applying(
+            projectOverrides: projectOverrides,
+            to: globalSettings
         )
     }
 
     public func current() -> Settings { settings }
 
     public func modify(_ body: @Sendable (inout Settings) -> Void) throws {
-        var candidate = settings
-        body(&candidate)
-        try Self.write(candidate, to: paths.globalSettings)
-        settings = candidate
+        var effectiveCandidate = settings
+        body(&effectiveCandidate)
+        let globalCandidate = try Self.applyingChanges(
+            from: settings,
+            to: effectiveCandidate,
+            global: globalSettings
+        )
+        try Self.write(globalCandidate, to: paths.globalSettings)
+        globalSettings = globalCandidate
+        settings = try Self.applying(
+            projectOverrides: projectOverrides,
+            to: globalCandidate
+        )
     }
 
     /// Returns after all settings accepted by this actor are durable.
@@ -124,9 +144,59 @@ public actor SettingsStore {
         let defaults = try encodedObject(Settings())
         let global = migrate(try readObject(globalURL) ?? [:])
         let project = migrate(try projectURL.flatMap(readObject) ?? [:])
-        let merged = mergeJSON(mergeJSON(defaults, global), project)
-        let data = try JSONSerialization.data(withJSONObject: merged, options: [.sortedKeys])
+        return try decode(mergeJSON(mergeJSON(defaults, global), project))
+    }
+
+    private static func applying(
+        projectOverrides: [String: Any],
+        to global: Settings
+    ) throws -> Settings {
+        try decode(mergeJSON(encodedObject(global), projectOverrides))
+    }
+
+    private static func decode(_ object: [String: Any]) throws -> Settings {
+        let data = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
         return try JSONDecoder().decode(Settings.self, from: data)
+    }
+
+    private static func applyingChanges(
+        from original: Settings,
+        to modified: Settings,
+        global: Settings
+    ) throws -> Settings {
+        let changes = try changedValues(
+            from: encodedObject(original),
+            to: encodedObject(modified)
+        )
+        return try decode(mergeJSON(encodedObject(global), changes))
+    }
+
+    private static func changedValues(
+        from original: [String: Any],
+        to modified: [String: Any]
+    ) throws -> [String: Any] {
+        var changes: [String: Any] = [:]
+        for (key, modifiedValue) in modified {
+            if let originalNested = original[key] as? [String: Any],
+                let modifiedNested = modifiedValue as? [String: Any]
+            {
+                let nestedChanges = try changedValues(
+                    from: originalNested,
+                    to: modifiedNested
+                )
+                if !nestedChanges.isEmpty { changes[key] = nestedChanges }
+            } else if try !jsonValuesEqual(original[key], modifiedValue) {
+                changes[key] = modifiedValue
+            }
+        }
+        return changes
+    }
+
+    private static func jsonValuesEqual(_ lhs: Any?, _ rhs: Any) throws -> Bool {
+        guard let lhs else { return false }
+        let left = try JSONSerialization.data(withJSONObject: [lhs], options: [.sortedKeys])
+        let right = try JSONSerialization.data(withJSONObject: [rhs], options: [.sortedKeys])
+        return left == right
     }
 
     private static func migrate(_ input: [String: Any]) -> [String: Any] {

@@ -115,8 +115,10 @@ public actor SessionManager {
             }
         }
         if version < currentCodingSessionVersion {
-            var migrated = try Self.line(header)
-            for entry in entries { migrated.append(try Self.line(entry)) }
+            var migrated = Data()
+            for index in [headerIndex] + entryIndices {
+                migrated.append(try Self.line(objects[index]))
+            }
             try migrated.write(to: file, options: .atomic)
         } else if needsNewlineRepair {
             data.append(0x0A)
@@ -196,7 +198,7 @@ public actor SessionManager {
     }
 
     public func materialize() throws {
-        guard file != nil else { return }
+        guard file != nil, !physicallyCreated else { return }
         try rewriteAll()
         physicallyCreated = true
     }
@@ -298,6 +300,12 @@ public actor SessionManager {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.withoutEscapingSlashes]
         var data = try encoder.encode(value)
+        data.append(0x0A)
+        return data
+    }
+
+    private static func line(_ object: [String: Any]) throws -> Data {
+        var data = try JSONSerialization.data(withJSONObject: object, options: [.withoutEscapingSlashes])
         data.append(0x0A)
         return data
     }

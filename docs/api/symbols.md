@@ -472,6 +472,7 @@ Regenerate it with `uv run python scripts/generate-api-docs.py`.
 | `AWSEventStreamError.truncated` | Case |
 | `AWSEventStreamError` | Enumeration |
 | `init()` | Initializer |
+| `init(maximumMessageLength:)` | Initializer |
 | `init(models:region:session:credential:)` | Initializer |
 | `finish()` | Instance Method |
 | `push(_:)` | Instance Method |
@@ -484,6 +485,7 @@ Regenerate it with `uv run python scripts/generate-api-docs.py`.
 | `AWSEventStreamDecoder` | Structure |
 | `AWSEventStreamMessage` | Structure |
 | `BedrockProvider` | Structure |
+| `defaultMaximumMessageLength` | Type Property |
 
 ## ZetaCLI
 
@@ -1572,6 +1574,7 @@ Regenerate it with `uv run python scripts/generate-api-docs.py`.
 | `PiServerFailure.notImplemented` | Case |
 | `PiServer` | Class |
 | `PiServerFailure` | Enumeration |
+| `init(serverID:maximumFrameLength:handshakeTimeout:maximumPendingHandshakeRequests:maximumPendingHandshakeBytes:service:)` | Initializer |
 | `init(serverID:maximumFrameLength:handshakeTimeout:service:)` | Initializer |
 | `abort()` | Instance Method |
 | `accept(_:)` | Instance Method |

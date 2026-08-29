@@ -16,8 +16,18 @@ public enum AWSEventStreamError: Error, Sendable {
 }
 
 public struct AWSEventStreamDecoder: Sendable {
+    public static let defaultMaximumMessageLength = 16 * 1_024 * 1_024
+
+    private let maximumMessageLength: Int
     private var buffer = Data()
-    public init() {}
+
+    public init() {
+        maximumMessageLength = Self.defaultMaximumMessageLength
+    }
+
+    public init(maximumMessageLength: Int) {
+        self.maximumMessageLength = maximumMessageLength
+    }
 
     public mutating func push(_ data: Data) throws -> [AWSEventStreamMessage] {
         buffer.append(data)
@@ -25,7 +35,7 @@ public struct AWSEventStreamDecoder: Sendable {
         while buffer.count >= 12 {
             let total = Int(buffer.uint32(at: 0))
             let headersLength = Int(buffer.uint32(at: 4))
-            guard total >= 16, headersLength <= total - 16 else {
+            guard total >= 16, total <= maximumMessageLength, headersLength <= total - 16 else {
                 throw AWSEventStreamError.invalidLength
             }
             guard buffer.count >= total else { break }

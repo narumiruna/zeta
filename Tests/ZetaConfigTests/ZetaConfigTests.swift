@@ -69,6 +69,95 @@ final class ZetaConfigTests: XCTestCase {
         XCTAssertEqual(try String(contentsOf: blockedAgentDirectory, encoding: .utf8), "blocker")
     }
 
+    func testGlobalModificationDoesNotPersistProjectOverrides() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let agentDirectory = directory.appendingPathComponent("agent")
+        let projectDirectory = directory.appendingPathComponent("project")
+        let global = agentDirectory.appendingPathComponent("settings.json")
+        let project = projectDirectory.appendingPathComponent(".pi/settings.json")
+        try FileManager.default.createDirectory(
+            at: global.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.createDirectory(
+            at: project.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try Data(
+            #"{"theme":"global","retry":{"enabled":true,"maxRetries":2}}"#.utf8
+        ).write(to: global)
+        try Data(
+            #"{"theme":"project","retry":{"enabled":false}}"#.utf8
+        ).write(to: project)
+        let paths = ZetaPaths(
+            home: directory,
+            workingDirectory: projectDirectory,
+            environment: ["PI_CODING_AGENT_DIR": agentDirectory.path]
+        )
+        let store = try SettingsStore(paths: paths)
+
+        try await store.modify {
+            $0.outputPadding = 0
+            $0.retry.maxRetries = 7
+        }
+
+        let persisted = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(contentsOf: global)) as? [String: Any]
+        )
+        let persistedRetry = try XCTUnwrap(persisted["retry"] as? [String: Any])
+        XCTAssertEqual(persisted["theme"] as? String, "global")
+        XCTAssertEqual(persistedRetry["enabled"] as? Bool, true)
+        XCTAssertEqual(persistedRetry["maxRetries"] as? Int, 7)
+        XCTAssertEqual(persisted["outputPadding"] as? Int, 0)
+
+        let effective = await store.current()
+        XCTAssertEqual(effective.theme, "project")
+        XCTAssertFalse(effective.retry.enabled)
+        XCTAssertEqual(effective.retry.maxRetries, 7)
+
+        let globalOnly = try SettingsStore(paths: paths, includeProject: false)
+        let globalCurrent = await globalOnly.current()
+        XCTAssertEqual(globalCurrent.theme, "global")
+        XCTAssertTrue(globalCurrent.retry.enabled)
+        XCTAssertEqual(globalCurrent.retry.maxRetries, 7)
+    }
+
+    func testFailedGlobalModificationRetainsProjectOverlayAndGlobalState() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let agentDirectory = directory.appendingPathComponent("agent")
+        let projectDirectory = directory.appendingPathComponent("project")
+        let global = agentDirectory.appendingPathComponent("settings.json")
+        let project = projectDirectory.appendingPathComponent(".pi/settings.json")
+        try FileManager.default.createDirectory(at: agentDirectory, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(
+            at: project.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try Data(#"{"theme":"global"}"#.utf8).write(to: global)
+        try Data(#"{"theme":"project"}"#.utf8).write(to: project)
+        let paths = ZetaPaths(
+            home: directory,
+            workingDirectory: projectDirectory,
+            environment: ["PI_CODING_AGENT_DIR": agentDirectory.path]
+        )
+        let store = try SettingsStore(paths: paths)
+        let originalData = try Data(contentsOf: global)
+        try FileManager.default.setAttributes([.immutable: true], ofItemAtPath: global.path)
+        defer { try? FileManager.default.setAttributes([.immutable: false], ofItemAtPath: global.path) }
+
+        do {
+            try await store.modify { $0.outputPadding = 0 }
+            XCTFail("Expected persistence failure")
+        } catch {}
+
+        let effective = await store.current()
+        XCTAssertEqual(effective.theme, "project")
+        XCTAssertEqual(effective.outputPadding, 1)
+        XCTAssertEqual(try Data(contentsOf: global), originalData)
+    }
+
     func testAuthPersistenceFailureDoesNotPublishSetOrDelete() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }

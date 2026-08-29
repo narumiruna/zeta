@@ -48,6 +48,7 @@ public actor PiClient {
     private struct ConnectionOperation {
         let token: UUID
         let task: Task<Void, Error>
+        var waiters: [UUID: CheckedContinuation<Void, Error>] = [:]
     }
     private struct HandshakeOperation {
         let generation: UInt64
@@ -129,29 +130,60 @@ public actor PiClient {
             let task = Task { try await self.performConnection(generation: activeGeneration) }
             operation = ConnectionOperation(token: token, task: task)
             connectionOperation = operation
+            Task { await self.observeConnection(operation) }
         }
-        do {
-            try await waitForConnection(operation)
-            clearConnectionOperation(operation.token)
-        } catch {
-            clearConnectionOperation(operation.token)
-            throw error
-        }
+        try await waitForConnection(operation.token)
     }
 
-    private func waitForConnection(_ operation: ConnectionOperation) async throws {
+    private func waitForConnection(_ operationToken: UUID) async throws {
+        let waiterToken = UUID()
         try await withTaskCancellationHandler {
             try Task.checkCancellation()
-            try await operation.task.value
+            try await withCheckedThrowingContinuation { continuation in
+                guard var operation = connectionOperation, operation.token == operationToken else {
+                    if stateValue == .connected {
+                        continuation.resume()
+                    } else {
+                        continuation.resume(throwing: PiClientError.disconnected)
+                    }
+                    return
+                }
+                operation.waiters[waiterToken] = continuation
+                connectionOperation = operation
+            }
         } onCancel: {
-            Task { await self.cancelConnection(operation.token) }
+            Task { await self.cancelConnectionWaiter(operationToken, waiterToken: waiterToken) }
         }
     }
 
-    private func cancelConnection(_ token: UUID) async {
+    private func observeConnection(_ operation: ConnectionOperation) async {
+        do {
+            try await operation.task.value
+            completeConnection(operation.token, result: .success(()))
+        } catch {
+            completeConnection(operation.token, result: .failure(error))
+        }
+    }
+
+    private func completeConnection(_ token: UUID, result: Result<Void, Error>) {
         guard let operation = connectionOperation, operation.token == token else { return }
-        operation.task.cancel()
-        await fail(CancellationError(), close: true)
+        connectionOperation = nil
+        for waiter in operation.waiters.values { waiter.resume(with: result) }
+    }
+
+    private func cancelConnectionWaiter(_ token: UUID, waiterToken: UUID) async {
+        guard var operation = connectionOperation, operation.token == token,
+            let waiter = operation.waiters.removeValue(forKey: waiterToken)
+        else { return }
+        waiter.resume(throwing: CancellationError())
+        if operation.waiters.isEmpty {
+            connectionOperation = nil
+            guard stateValue == .connecting else { return }
+            operation.task.cancel()
+            await fail(CancellationError(), close: true)
+        } else {
+            connectionOperation = operation
+        }
     }
 
     private func performConnection(generation activeGeneration: UInt64) async throws {
@@ -214,10 +246,6 @@ public actor PiClient {
             PiClientError.protocolFailure("Server handshake timed out"),
             close: true
         )
-    }
-
-    private func clearConnectionOperation(_ token: UUID) {
-        if connectionOperation?.token == token { connectionOperation = nil }
     }
 
     public func reconnect() async throws {
@@ -483,7 +511,17 @@ public actor PiClient {
             return
         }
         switch message {
-        case .response(let response): pending.removeValue(forKey: response.id)?.resume(returning: response)
+        case .response(let response):
+            guard let continuation = pending.removeValue(forKey: response.id) else {
+                Task {
+                    await fail(
+                        PiClientError.protocolFailure("Response has no matching request: \(response.id)"),
+                        close: true
+                    )
+                }
+                return
+            }
+            continuation.resume(returning: response)
         case .event(let event):
             reduce(event)
             eventListeners.values.forEach { $0(event) }

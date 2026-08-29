@@ -376,6 +376,89 @@ final class LatestSettingsFeedbackTests: XCTestCase {
         )
     }
 
+    func testLongAndShortLocalPackageFlagsUseTrustedProjectRootOnlyWhenApproved() {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let project = root.appendingPathComponent("project/../project")
+        let home = root.appendingPathComponent("home")
+        let expectedProjectRoot = project.standardizedFileURL.appendingPathComponent(".pi/packages")
+
+        for flag in ["-l", "--local"] {
+            let trailingArguments = ["install", "npm:test", flag]
+            let leadingArguments = ["install", flag, "npm:test"]
+            XCTAssertEqual(ZetaCLI.packageCommandSource(trailingArguments), "npm:test")
+            XCTAssertEqual(ZetaCLI.packageCommandSource(leadingArguments), "npm:test")
+            let untrusted = ZetaCLI.packageCommandLocation(
+                arguments: trailingArguments,
+                workingDirectory: project,
+                home: home
+            )
+            XCTAssertEqual(untrusted.root, expectedProjectRoot)
+            XCTAssertFalse(untrusted.trusted)
+
+            let approved = ZetaCLI.packageCommandLocation(
+                arguments: ["install", "npm:test", flag, "--approve"],
+                workingDirectory: project,
+                home: home
+            )
+            XCTAssertEqual(approved.root, expectedProjectRoot)
+            XCTAssertTrue(approved.trusted)
+        }
+
+        let global = ZetaCLI.packageCommandLocation(
+            arguments: ["install", "npm:test"],
+            workingDirectory: project,
+            home: home
+        )
+        XCTAssertEqual(
+            global.root,
+            home.standardizedFileURL.appendingPathComponent(".pi/agent/packages")
+        )
+        XCTAssertTrue(global.trusted)
+    }
+
+    func testPluginToolCollisionsAreRejectedPerHostBeforePublication() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let plugins = root.appendingPathComponent("agent/plugins")
+        try makeRegistrationPlugin(
+            in: plugins,
+            directory: "a-first",
+            registrations: [
+                ["kind": "tool", "name": "echo", "callback": "tool.echo"]
+            ]
+        )
+        try makeRegistrationPlugin(
+            in: plugins,
+            directory: "b-duplicate",
+            registrations: [
+                ["kind": "tool", "name": "echo", "callback": "tool.echo"],
+                ["kind": "tool", "name": "unreachable", "callback": "tool.unreachable"],
+            ]
+        )
+        try makeRegistrationPlugin(
+            in: plugins,
+            directory: "c-builtin",
+            registrations: [
+                ["kind": "tool", "name": "read", "callback": "tool.read"]
+            ]
+        )
+        let runtime = CLIPluginRuntime()
+
+        let diagnostics = await runtime.load(
+            agentDirectory: root.appendingPathComponent("agent"),
+            workingDirectory: root.appendingPathComponent("project"),
+            projectTrusted: false
+        )
+        let names = await runtime.tools().map(\.definition.name)
+
+        XCTAssertEqual(names, ["echo"])
+        XCTAssertEqual(diagnostics.count, 2)
+        XCTAssertTrue(diagnostics.contains { $0.contains("collides") && $0.contains("echo") })
+        XCTAssertTrue(diagnostics.contains { $0.contains("collides") && $0.contains("read") })
+        XCTAssertFalse(names.contains("unreachable"))
+        await runtime.stop()
+    }
+
     private func vertexModel(id: String = "gemini") -> Model {
         Model(
             id: id, name: id, api: "google-vertex", provider: "google-vertex",
@@ -502,6 +585,42 @@ private actor AdmissionHeldProvider {
             )
         )
     }
+}
+
+private func makeRegistrationPlugin(
+    in plugins: URL,
+    directory: String,
+    registrations: [[String: String]]
+) throws {
+    let plugin = plugins.appendingPathComponent(directory)
+    try FileManager.default.createDirectory(at: plugin, withIntermediateDirectories: true)
+    let registrationData = try JSONSerialization.data(
+        withJSONObject: registrations,
+        options: [.sortedKeys]
+    )
+    let registrationJSON = String(decoding: registrationData, as: UTF8.self)
+    let script = plugin.appendingPathComponent("plugin.py")
+    let source = #"""
+        #!/usr/bin/env python3
+        import base64,json,sys
+        registrations=json.loads('\#(registrationJSON)')
+        for line in sys.stdin:
+            request=json.loads(line)
+            payload=base64.b64encode(json.dumps(registrations,separators=(',',':')).encode()).decode()
+            response={"id":request.get("id"),"type":"response","generation":request["generation"],"payload":payload}
+            print(json.dumps(response,separators=(',',':')),flush=True)
+        """#
+    try Data(source.utf8).write(to: script)
+    try FileManager.default.setAttributes(
+        [.posixPermissions: 0o700],
+        ofItemAtPath: script.path
+    )
+    let manifest = #"""
+        {"name":"\#(directory)","version":"1","protocolVersion":1,"executable":"plugin.py","capabilities":["tools"]}
+        """#
+    try Data(manifest.utf8).write(
+        to: plugin.appendingPathComponent("zeta-plugin.json")
+    )
 }
 
 private func userText(_ message: Message) -> String? {

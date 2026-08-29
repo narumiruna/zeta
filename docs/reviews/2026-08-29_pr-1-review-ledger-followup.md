@@ -255,3 +255,187 @@ Concern: CRLF resource frontmatter is not parsed.
 Outcome: Addressed by line-ending-aware delimiter parsing that preserves body line endings.
 
 Evidence: Resource regressions load CRLF prompts and skills while retaining LF behavior.
+
+## Ninth-round inline feedback
+
+### `3885834491`
+
+Concern: Slow runtime open can attach a disconnected client and leak ownership.
+
+Outcome: Addressed by revalidating the tokenized ready client before publication and disposing an otherwise unowned runtime.
+
+Evidence: Server race regression disconnects during open and verifies no stale connection or runtime remains.
+
+### `3885834492`
+
+Concern: Cancelling one shared connect waiter aborts every waiter.
+
+Outcome: Addressed with individual waiter accounting that cancels the shared attempt only after the final waiter cancels.
+
+Evidence: Client regression cancels one concurrent waiter while the other connects successfully.
+
+### `3885834494`
+
+Concern: Deferred session persistence errors are never surfaced.
+
+Outcome: Addressed by draining persistence failures at CLI, RPC, and mode settlement boundaries before reporting success.
+
+Evidence: Injected session-write failures produce explicit failed outcomes.
+
+### `3885834496`
+
+Concern: NPM package archives are fully buffered without a compressed-size bound.
+
+Outcome: Addressed by streaming tarballs to a temporary file with a 100 MiB compressed limit and cancellation cleanup.
+
+Evidence: Package regressions cover oversize, HTTP failure, cancellation, and staging cleanup.
+
+### `3885834497`
+
+Concern: Package commands ignore the required `--local` flag.
+
+Outcome: Addressed by accepting `--local` and `-l` in either flag position and enforcing project trust and root selection.
+
+Evidence: Management-command regressions verify local and global destinations.
+
+### `3885834499`
+
+Concern: Requests queued during handshake are unbounded.
+
+Outcome: Addressed with count and encoded-byte budgets that close an exceeding peer.
+
+Evidence: Server regressions exercise both limits and ordinary same-batch requests.
+
+### `3885834502`
+
+Concern: Plugin hosts can publish duplicate or built-in tool names.
+
+Outcome: Addressed by validating cross-host and built-in collisions before any host or binding is published.
+
+Evidence: Plugin runtime regressions verify transactional rejection.
+
+## Tenth-round inline feedback
+
+### `3885868033`
+
+Concern: Undecodable v1 and v2 records should reject migration.
+
+Outcome: The requested rejection conflicts with pinned malformed-line skipping, so malformed JSON remains skipped.
+
+Outcome: Zeta now preserves every parseable unknown or malformed typed object during migration and later materialization instead of deleting it.
+
+Evidence: Pinned session-manager source and tests require malformed JSON skipping, while the new regression verifies unknown raw records survive migration.
+
+### `3885868034`
+
+Concern: `cycle_model` is not persisted.
+
+Outcome: Addressed by recording the selected model before updating and acknowledging the agent.
+
+Evidence: RPC restore regression covers cycled models.
+
+### `3885868036`
+
+Concern: Session names can be acknowledged before materialization.
+
+Outcome: Addressed by materializing the name entry before successful return.
+
+Evidence: New-session naming regression reloads the durable name.
+
+### `3885868038`
+
+Concern: RPC retry state ignores configured retry settings.
+
+Outcome: Addressed by initializing and toggling from the loaded retry count, base delay, and maximum delay policy.
+
+Evidence: RPC state and toggle regressions verify configured values are retained.
+
+### `3885868040`
+
+Concern: Assistant events use an unbounded progress buffer with cumulative snapshots.
+
+Outcome: Addressed with bounded newest-progress buffering while terminal state and `result()` remain separately reliable.
+
+Evidence: Stream stress regression verifies bounded delivery and terminal settlement.
+
+### `3885868041`
+
+Concern: Bedrock event frames trust arbitrary declared lengths.
+
+Outcome: Addressed by rejecting total lengths above a configurable default limit as soon as the prelude arrives.
+
+Evidence: Bedrock decoder regressions reject oversized preludes without buffering payload bytes.
+
+### `3885868044`
+
+Concern: One invalid OAuth callback terminates the listener.
+
+Outcome: Addressed by returning a 400 for that connection while continuing to await the expected state.
+
+Evidence: OAuth regression sends an invalid callback followed by a valid callback.
+
+### `3885868046`
+
+Concern: Unknown response IDs are silently discarded by the client.
+
+Outcome: Addressed by treating unsolicited or duplicate response IDs as fatal protocol errors that settle pending work.
+
+Evidence: Client regressions cover unknown and duplicate IDs.
+
+### `3885868048`
+
+Concern: Failed compaction persistence leaves live and durable state divergent.
+
+Outcome: Addressed by restoring the original agent messages when persistence fails in manual or automatic compaction.
+
+Evidence: Injected-failure regressions verify exact message restoration.
+
+### `3885868052`
+
+Concern: Project settings overrides leak into global writes.
+
+Outcome: Addressed by retaining separate global and project representations and persisting only the modified global candidate.
+
+Evidence: Settings regression modifies an unrelated field and verifies project-only values remain absent globally.
+
+### `3885868054`
+
+Concern: RPC `parentSession` is ignored for new sessions.
+
+Outcome: Addressed by carrying the supplied parent into the durable replacement header.
+
+Evidence: New-session regression reloads the parent relationship.
+
+### `3885868057`
+
+Concern: RPC `export_html` ignores `outputPath`.
+
+Outcome: Addressed by atomically writing the HTML to the requested path and returning it, while omitted paths retain inline output.
+
+Evidence: Export regressions cover file and inline modes.
+
+### `3885868059`
+
+Concern: Interactive assistant failures render as blank output.
+
+Outcome: Addressed by rendering `errorMessage` for error or aborted assistants without text content.
+
+Evidence: Interactive transcript regression verifies the visible diagnostic.
+
+## Ninth-round inline feedback
+
+### `3885868033`
+
+Concern: Undecodable v1 and v2 session records are omitted before the migration rewrite.
+
+Outcome: The requested rejection conflicts with the pinned contract, so malformed JSON remains intentionally skipped instead of rejecting the session.
+
+Outcome: The related parseable-record loss was addressed by rewriting every migrated JSON object, including unknown future entry types and malformed typed entries, rather than only successfully typed entries.
+
+Pinned source evidence: At commit `56700d42ed65a94a80af7376adb19a9298065164`, `packages/coding-agent/src/core/session-manager.ts` lines 503 through 509 explicitly skip malformed JSON, lines 899 and 918 through 920 pass those filtered records into migration and rewrite, and lines 980 through 986 rewrite that filtered set.
+
+Pinned source evidence: The same file's lines 235 through 255 migrate every parseable non-header object without discriminated type validation, and lines 984 through 986 preserve all such objects during rewrite.
+
+Pinned test evidence: `packages/coding-agent/test/session-manager/file-operations.test.ts` lines 52 through 55 and 71 through 80 verify malformed-only input is rejected as a session while malformed records mixed into a session are skipped.
+
+Zeta evidence: `testV1MigrationSkipsMalformedJSONAndPreservesUndecodableObjects` verifies malformed JSON is skipped while parseable unknown and malformed typed objects survive migration and later materialization.

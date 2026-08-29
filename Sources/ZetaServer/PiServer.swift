@@ -40,22 +40,33 @@ public actor PiServer {
         let sequence: ClientProtocolSequenceValidator
         var ready = false
         var pendingRequests: [RequestEnvelope] = []
+        var pendingRequestBytes = 0
         var attached: Set<String> = []
     }
     private struct RuntimeState {
+        let token: UUID
         let runtime: any PiSessionRuntime
         var connections: Set<String> = []
         var operations = 0
+        var openingClaims: Set<UUID> = []
     }
     private struct RuntimeOpen {
         let token: UUID
         let task: Task<any PiSessionRuntime, Error>
+        var claims: Set<UUID>
+    }
+    private struct RuntimeClaim {
+        let runtimeToken: UUID
+        let claimToken: UUID
+        let runtime: any PiSessionRuntime
     }
 
     public let serverID: String
     private let service: any PiServerService
     private let frameOptions: FrameDecoderOptions
     private let handshakeTimeout: Duration
+    private let maximumPendingHandshakeRequests: Int
+    private let maximumPendingHandshakeBytes: Int
     private var clients: [String: ClientState] = [:]
     private var runtimes: [String: RuntimeState] = [:]
     private var runtimeOpens: [String: RuntimeOpen] = [:]
@@ -67,9 +78,35 @@ public actor PiServer {
         handshakeTimeout: Duration = .seconds(5),
         service: any PiServerService
     ) throws {
+        try self.init(
+            serverID: serverID,
+            maximumFrameLength: maximumFrameLength,
+            handshakeTimeout: handshakeTimeout,
+            maximumPendingHandshakeRequests: 64,
+            service: service
+        )
+    }
+
+    public init(
+        serverID: String = UUID().uuidString,
+        maximumFrameLength: Int = 16 * 1_024 * 1_024,
+        handshakeTimeout: Duration = .seconds(5),
+        maximumPendingHandshakeRequests: Int,
+        maximumPendingHandshakeBytes: Int? = nil,
+        service: any PiServerService
+    ) throws {
+        guard maximumPendingHandshakeRequests > 0 else {
+            throw PiServerFailure.invalidRequest("Pending handshake request limit must be positive")
+        }
+        let pendingByteLimit = maximumPendingHandshakeBytes ?? maximumFrameLength
+        guard pendingByteLimit > 0 else {
+            throw PiServerFailure.invalidRequest("Pending handshake byte limit must be positive")
+        }
         self.serverID = serverID
         self.service = service
         self.handshakeTimeout = handshakeTimeout
+        self.maximumPendingHandshakeRequests = maximumPendingHandshakeRequests
+        self.maximumPendingHandshakeBytes = pendingByteLimit
         frameOptions = FrameDecoderOptions(maximumFrameLength: maximumFrameLength)
     }
 
@@ -99,9 +136,28 @@ public actor PiServer {
                     Task { await self.handshake(hello, connectionID: connectionID, token: token) }
                 case .request(let request):
                     if client.ready {
-                        Task { await self.dispatch(request, connectionID: connectionID) }
+                        let token = client.token
+                        Task { await self.dispatch(request, connectionID: connectionID, token: token) }
                     } else {
+                        let requestBytes = try encodeClientMessage(.request(request), options: frameOptions).count
+                        guard client.pendingRequests.count < maximumPendingHandshakeRequests,
+                            client.pendingRequestBytes <= maximumPendingHandshakeBytes - requestBytes
+                        else {
+                            let token = client.token
+                            Task {
+                                await self.close(
+                                    connectionID,
+                                    finalError: try? ProtocolErrorValue(
+                                        code: .invalidRequest,
+                                        message: "Too many requests before protocol handshake completed"
+                                    ),
+                                    token: token
+                                )
+                            }
+                            return
+                        }
                         client.pendingRequests.append(request)
+                        client.pendingRequestBytes += requestBytes
                         clients[connectionID] = client
                     }
                 }
@@ -156,28 +212,30 @@ public actor PiServer {
             current.ready = true
             let pendingRequests = current.pendingRequests
             current.pendingRequests.removeAll()
+            current.pendingRequestBytes = 0
             clients[connectionID] = current
             try await current.connection.send(
                 encodeServerMessage(
                     .hello(try ServerHello(connectionID: connectionID, snapshot: snapshot)), options: frameOptions))
             guard clients[connectionID]?.token == token else { return }
             for request in pendingRequests {
-                Task { await self.dispatch(request, connectionID: connectionID) }
+                Task { await self.dispatch(request, connectionID: connectionID, token: token) }
             }
         } catch { await close(connectionID, finalError: protocolError(error), token: token) }
     }
 
-    private func dispatch(_ request: RequestEnvelope, connectionID: String) async {
+    private func dispatch(_ request: RequestEnvelope, connectionID: String, token: UUID) async {
+        guard clients[connectionID]?.token == token, clients[connectionID]?.ready == true else { return }
         do {
-            let result = try await execute(request.request, connectionID: connectionID)
-            try await send(.response(.success(id: request.id, result: result)), to: connectionID)
+            let result = try await execute(request.request, connectionID: connectionID, token: token)
+            try await send(.response(.success(id: request.id, result: result)), to: connectionID, token: token)
         } catch {
             let value = protocolError(error)
-            try? await send(.response(.failure(id: request.id, error: value)), to: connectionID)
+            try? await send(.response(.failure(id: request.id, error: value)), to: connectionID, token: token)
         }
     }
 
-    private func execute(_ command: Command, connectionID: String) async throws -> CommandResult {
+    private func execute(_ command: Command, connectionID: String, token: UUID) async throws -> CommandResult {
         switch command {
         case .list: return .list(try await service.listSessions())
         case .create(let options):
@@ -187,11 +245,13 @@ public actor PiServer {
                 guard snapshot.id == runtime.id else {
                     throw PiServerFailure.invalidRequest("Runtime session id mismatch")
                 }
-                guard clients[connectionID]?.ready == true else {
+                guard clients[connectionID]?.token == token, clients[connectionID]?.ready == true else {
                     throw PiServerFailure.invalidRequest("Connection closed while creating session")
                 }
                 guard runtimes[runtime.id] == nil else { throw PiServerFailure.busy }
-                runtimes[runtime.id] = RuntimeState(runtime: runtime, connections: [connectionID])
+                runtimes[runtime.id] = RuntimeState(
+                    token: UUID(), runtime: runtime, connections: [connectionID]
+                )
                 clients[connectionID]?.attached.insert(runtime.id)
                 await broadcastServerSnapshot()
                 return .create(snapshot)
@@ -200,10 +260,21 @@ public actor PiServer {
                 throw error
             }
         case .attach(let id):
-            let runtime = try await openRuntime(id)
-            runtimes[id]?.connections.insert(connectionID)
+            let claim = try await openRuntime(id)
+            guard clients[connectionID]?.token == token, clients[connectionID]?.ready == true else {
+                await releaseRuntimeClaim(claim)
+                throw PiServerFailure.invalidRequest("Connection closed while attaching session")
+            }
+            guard var state = runtimes[id], state.token == claim.runtimeToken,
+                state.openingClaims.remove(claim.claimToken) != nil
+            else {
+                await releaseRuntimeClaim(claim)
+                throw PiServerFailure.busy
+            }
+            state.connections.insert(connectionID)
+            runtimes[id] = state
             clients[connectionID]?.attached.insert(id)
-            return .attach(try await runtime.snapshot(attached: true))
+            return .attach(try await claim.runtime.snapshot(attached: true))
         case .detach(let id):
             await detachRuntime(id, connectionID: connectionID)
             return .detach(sessionID: id)
@@ -259,17 +330,24 @@ public actor PiServer {
         guard var state = runtimes[id] else { return }
         state.operations -= 1
         runtimes[id] = state
-        if state.operations == 0 && state.connections.isEmpty {
+        if state.operations == 0 && state.connections.isEmpty && state.openingClaims.isEmpty {
             runtimes[id] = nil
             await state.runtime.dispose()
         }
     }
 
-    private func openRuntime(_ id: String) async throws -> any PiSessionRuntime {
-        if let state = runtimes[id] { return state.runtime }
+    private func openRuntime(_ id: String) async throws -> RuntimeClaim {
+        let claimToken = UUID()
+        if var state = runtimes[id] {
+            state.openingClaims.insert(claimToken)
+            runtimes[id] = state
+            return RuntimeClaim(runtimeToken: state.token, claimToken: claimToken, runtime: state.runtime)
+        }
 
         let opening: RuntimeOpen
-        if let existing = runtimeOpens[id] {
+        if var existing = runtimeOpens[id] {
+            existing.claims.insert(claimToken)
+            runtimeOpens[id] = existing
             opening = existing
         } else {
             let token = UUID()
@@ -286,27 +364,44 @@ public actor PiServer {
                 }
                 return runtime
             }
-            opening = RuntimeOpen(token: token, task: task)
+            opening = RuntimeOpen(token: token, task: task, claims: [claimToken])
             runtimeOpens[id] = opening
         }
 
         do {
             let runtime = try await opening.task.value
-            if runtimeOpens[id]?.token == opening.token {
+            if let current = runtimeOpens[id], current.token == opening.token {
                 runtimeOpens[id] = nil
-                if let state = runtimes[id] {
+                if var state = runtimes[id] {
+                    state.openingClaims.formUnion(current.claims)
+                    runtimes[id] = state
                     Task.detached { await runtime.dispose() }
-                    return state.runtime
+                } else {
+                    runtimes[id] = RuntimeState(
+                        token: opening.token,
+                        runtime: runtime,
+                        openingClaims: current.claims
+                    )
                 }
-                runtimes[id] = RuntimeState(runtime: runtime)
-                return runtime
             }
-            if let state = runtimes[id] { return state.runtime }
-            await runtime.dispose()
-            throw PiServerFailure.busy
+            guard let state = runtimes[id], state.openingClaims.contains(claimToken) else {
+                throw PiServerFailure.busy
+            }
+            return RuntimeClaim(runtimeToken: state.token, claimToken: claimToken, runtime: state.runtime)
         } catch {
             if runtimeOpens[id]?.token == opening.token { runtimeOpens[id] = nil }
             throw error
+        }
+    }
+
+    private func releaseRuntimeClaim(_ claim: RuntimeClaim) async {
+        guard var state = runtimes[claim.runtime.id], state.token == claim.runtimeToken else { return }
+        state.openingClaims.remove(claim.claimToken)
+        if state.connections.isEmpty && state.operations == 0 && state.openingClaims.isEmpty {
+            runtimes[claim.runtime.id] = nil
+            await state.runtime.dispose()
+        } else {
+            runtimes[claim.runtime.id] = state
         }
     }
 
@@ -315,7 +410,7 @@ public actor PiServer {
         guard var state = runtimes[id] else { return }
         state.connections.remove(connectionID)
         runtimes[id] = state
-        if state.connections.isEmpty && state.operations == 0 {
+        if state.connections.isEmpty && state.operations == 0 && state.openingClaims.isEmpty {
             runtimes[id] = nil
             await state.runtime.dispose()
         }
@@ -349,9 +444,9 @@ public actor PiServer {
         for client in ready { try? await client.connection.send(encoded) }
     }
 
-    private func send(_ message: ServerMessage, to id: String) async throws {
-        guard let connection = clients[id]?.connection else { return }
-        try await connection.send(encodeServerMessage(message, options: frameOptions))
+    private func send(_ message: ServerMessage, to id: String, token: UUID? = nil) async throws {
+        guard let client = clients[id], token == nil || client.token == token else { return }
+        try await client.connection.send(encodeServerMessage(message, options: frameOptions))
     }
 
     private func close(_ id: String, finalError: ProtocolErrorValue?, token: UUID? = nil) async {

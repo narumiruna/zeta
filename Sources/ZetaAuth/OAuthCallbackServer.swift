@@ -95,9 +95,8 @@ public final class OAuthCallbackServer: @unchecked Sendable {
             maximumLength: 16 * 1_024
         ) { [weak self] data, _, _, error in
             guard let self else { return }
-            if let error {
+            if error != nil {
                 self.respond(connection, status: "400 Bad Request", message: "Authorization failed")
-                self.finish(.failure(error))
                 return
             }
             guard let data,
@@ -110,7 +109,6 @@ public final class OAuthCallbackServer: @unchecked Sendable {
                 state == self.expectedState
             else {
                 self.respond(connection, status: "400 Bad Request", message: "Invalid authorization callback")
-                self.finish(.failure(OAuthError.invalidCallback))
                 return
             }
             self.respond(connection, status: "200 OK", message: "Authorization complete. You may close this window.")

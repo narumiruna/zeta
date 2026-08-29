@@ -4,6 +4,11 @@ import ZetaConfig
 import ZetaMigration
 import ZetaPackages
 
+struct PackageCommandLocation: Sendable, Equatable {
+    let root: URL
+    let trusted: Bool
+}
+
 extension ZetaCLI {
     static func runManagementCommand(
         _ arguments: [String]
@@ -28,38 +33,36 @@ extension ZetaCLI {
                 print(String(decoding: data, as: UTF8.self))
                 return 0
             }
-            let local = arguments.contains("-l")
-            let cwd = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-            let root =
-                local
-                ? cwd.appendingPathComponent(".pi/packages")
-                : FileManager.default.homeDirectoryForCurrentUser
-                    .appendingPathComponent(".pi/agent/packages")
-            let manager = try ResourcePackageManager(root: root)
+            let location = packageCommandLocation(
+                arguments: arguments,
+                workingDirectory: URL(
+                    fileURLWithPath: FileManager.default.currentDirectoryPath
+                ),
+                home: FileManager.default.homeDirectoryForCurrentUser
+            )
+            let manager = try ResourcePackageManager(root: location.root)
             switch command {
             case "install":
-                guard arguments.count >= 2 else {
+                guard let source = packageCommandSource(arguments) else {
                     throw CLIArgumentError.missingValue("install source")
                 }
                 try await manager.install(
-                    PackageSource(arguments[1]),
-                    trusted: !local || arguments.contains("--approve")
+                    PackageSource(source),
+                    trusted: location.trusted
                 )
-                print("Installed \(arguments[1])")
+                print("Installed \(source)")
             case "remove", "uninstall":
-                guard arguments.count >= 2 else {
+                guard let rawSource = packageCommandSource(arguments) else {
                     throw CLIArgumentError.missingValue("remove source")
                 }
-                let source = try PackageSource(arguments[1])
+                let source = try PackageSource(rawSource)
                 try await manager.remove(
                     source.identifier,
-                    trusted: !local || arguments.contains("--approve")
+                    trusted: location.trusted
                 )
                 print("Removed \(source.identifier)")
             case "update":
-                try await manager.updateAll(
-                    trusted: !local || arguments.contains("--approve")
-                )
+                try await manager.updateAll(trusted: location.trusted)
                 print("Updated unpinned resource packages")
             case "list", "config":
                 for package in await manager.list() {
@@ -205,6 +208,25 @@ extension ZetaCLI {
                     ?? paths.agentDirectory.path
             )
         )
+    }
+
+    static func packageCommandLocation(
+        arguments: [String],
+        workingDirectory: URL,
+        home: URL
+    ) -> PackageCommandLocation {
+        let local = arguments.contains("-l") || arguments.contains("--local")
+        let root =
+            local
+            ? workingDirectory.standardizedFileURL.appendingPathComponent(".pi/packages")
+            : home.standardizedFileURL.appendingPathComponent(".pi/agent/packages")
+        let approved = arguments.contains("--approve") || arguments.contains("-a")
+        let denied = arguments.contains("--no-approve") || arguments.contains("-na")
+        return PackageCommandLocation(root: root, trusted: !local || (approved && !denied))
+    }
+
+    static func packageCommandSource(_ arguments: [String]) -> String? {
+        arguments.dropFirst().first { !$0.hasPrefix("-") }
     }
 
     private static func value(

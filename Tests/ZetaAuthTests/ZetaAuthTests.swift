@@ -107,6 +107,32 @@ final class ZetaAuthTests: XCTestCase {
         )
     }
 
+    func testInvalidOAuthCallbackReturnsBadRequestAndKeepsWaiting() async throws {
+        let server = OAuthCallbackServer(expectedState: "valid-state")
+        let callbackURL = try await server.start()
+        let callback = Task { try await server.waitForCallback() }
+        try await waitUntil { server.isWaitingForCallback }
+
+        var invalid = URLComponents(url: callbackURL, resolvingAgainstBaseURL: false)!
+        invalid.queryItems = [
+            URLQueryItem(name: "code", value: "wrong-code"),
+            URLQueryItem(name: "state", value: "wrong-state"),
+        ]
+        let (_, invalidResponse) = try await URLSession.shared.data(from: invalid.url!)
+        XCTAssertEqual((invalidResponse as? HTTPURLResponse)?.statusCode, 400)
+        XCTAssertTrue(server.isWaitingForCallback)
+
+        var valid = URLComponents(url: callbackURL, resolvingAgainstBaseURL: false)!
+        valid.queryItems = [
+            URLQueryItem(name: "code", value: "valid-code"),
+            URLQueryItem(name: "state", value: "valid-state"),
+        ]
+        let (_, validResponse) = try await URLSession.shared.data(from: valid.url!)
+        XCTAssertEqual((validResponse as? HTTPURLResponse)?.statusCode, 200)
+        let value = try await callback.value
+        XCTAssertEqual(value, OAuthCallback(code: "valid-code", state: "valid-state"))
+    }
+
     func testOAuthCallbackCompletedBeforeWaiterIsPreserved() async throws {
         let server = OAuthCallbackServer(expectedState: "early-state")
         var components = URLComponents(
