@@ -8,9 +8,16 @@ public struct SearchMatch: Sendable, Equatable {
 
 public struct SearchTools: Sendable {
     public let workingDirectory: URL
+    private let useExternalCommands: Bool
 
     public init(workingDirectory: URL) {
         self.workingDirectory = workingDirectory.standardizedFileURL
+        useExternalCommands = true
+    }
+
+    init(workingDirectory: URL, useExternalCommands: Bool) {
+        self.workingDirectory = workingDirectory.standardizedFileURL
+        self.useExternalCommands = useExternalCommands
     }
 
     public func grep(
@@ -27,6 +34,14 @@ public struct SearchTools: Sendable {
         if let filePattern { arguments += ["--glob", filePattern] }
         arguments += [pattern, path]
         let result = try await command("rg", arguments: arguments)
+        if result.status == 127 {
+            return try fallbackGrep(
+                pattern: pattern,
+                path: path,
+                filePattern: filePattern,
+                maximumMatches: maximumMatches
+            )
+        }
         if result.status != 0 && result.status != 1 {
             throw FileToolError.processFailed(result.output)
         }
@@ -63,6 +78,60 @@ public struct SearchTools: Sendable {
         return result.output.split(separator: "\n").prefix(maximumResults).map(String.init)
     }
 
+    private func fallbackGrep(
+        pattern: String,
+        path: String,
+        filePattern: String?,
+        maximumMatches: Int
+    ) throws -> [SearchMatch] {
+        let root = workingDirectory.appendingPathComponent(path).standardizedFileURL
+        guard
+            let enumerator = FileManager.default.enumerator(
+                at: root,
+                includingPropertiesForKeys: [.isRegularFileKey],
+                options: [.skipsPackageDescendants]
+            )
+        else {
+            return []
+        }
+        let expression = try NSRegularExpression(pattern: pattern)
+        let fileExpression = try filePattern.map {
+            try NSRegularExpression(pattern: globRegex($0), options: [.caseInsensitive])
+        }
+        var matches: [SearchMatch] = []
+        for case let url as URL in enumerator {
+            if url.pathComponents.contains(".git") {
+                enumerator.skipDescendants()
+                continue
+            }
+            guard try url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile == true else {
+                continue
+            }
+            let relative = String(
+                url.standardizedFileURL.path.dropFirst(root.path.count + 1)
+            )
+            if let fileExpression {
+                let range = NSRange(relative.startIndex..<relative.endIndex, in: relative)
+                guard fileExpression.firstMatch(in: relative, range: range) != nil else { continue }
+            }
+            guard let text = try? String(contentsOf: url, encoding: .utf8) else { continue }
+            for (offset, line) in text.split(separator: "\n", omittingEmptySubsequences: false).enumerated() {
+                let value = String(line)
+                let range = NSRange(value.startIndex..<value.endIndex, in: value)
+                guard expression.firstMatch(in: value, range: range) != nil else { continue }
+                matches.append(
+                    SearchMatch(
+                        path: relative,
+                        line: offset + 1,
+                        text: Truncation.line(value).0
+                    )
+                )
+                if matches.count == maximumMatches { return matches }
+            }
+        }
+        return matches
+    }
+
     private func fallbackFind(
         pattern: String,
         path: String,
@@ -88,7 +157,9 @@ public struct SearchTools: Sendable {
                 enumerator.skipDescendants()
                 continue
             }
-            let relative = String(url.path.dropFirst(root.path.count + 1))
+            let relative = String(
+                url.standardizedFileURL.path.dropFirst(root.path.count + 1)
+            )
             let range = NSRange(relative.startIndex..<relative.endIndex, in: relative)
             if regex.firstMatch(in: relative, range: range) != nil {
                 let directory = try url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory == true
@@ -103,6 +174,7 @@ public struct SearchTools: Sendable {
         _ executable: String,
         arguments: [String]
     ) async throws -> (status: Int32, output: String) {
+        guard useExternalCommands else { return (127, "External search command disabled") }
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
         process.arguments = [executable] + arguments

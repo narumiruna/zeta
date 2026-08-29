@@ -23,6 +23,7 @@ One operation may be open per lane.
 ## SQLite
 
 Fresh SQLite databases use WAL, synchronous FULL, a five-second busy timeout, immediate write transactions, fenced writer leases, branch caches, and lazy FTS5 trigram search.
+When the macOS SQLite build lacks the trigram tokenizer, Zeta uses the built-in Unicode tokenizer while preserving lazy initialization and trigger maintenance.
 Historical databases that reused an older `001_initial.sql` shape are rejected without mutation.
 Export those databases with their matching Pi version before migration.
 

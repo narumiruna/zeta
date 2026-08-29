@@ -544,7 +544,13 @@ public actor SQLiteSessionRepository {
         guard let database else { throw SQLiteRepositoryError.open("closed") }
         try transaction {
             let needsRebuild = try !Self.searchIndexExists(database)
-            try Self.execute(database, Self.searchSchema)
+            do {
+                try Self.execute(database, Self.searchSchema)
+            } catch SQLiteRepositoryError.execute(let message)
+                where message.localizedCaseInsensitiveContains("tokenizer")
+            {
+                try Self.execute(database, Self.fallbackSearchSchema)
+            }
             if needsRebuild { try Self.execute(database, Self.searchRebuild) }
         }
         searchInitialized = true
@@ -951,6 +957,13 @@ public actor SQLiteSessionRepository {
 
     private static let searchSchema = """
         CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts USING fts5(payload,content='entries',content_rowid='rowid',tokenize='trigram remove_diacritics 1');
+        CREATE TRIGGER IF NOT EXISTS entries_fts_ai AFTER INSERT ON entries BEGIN INSERT INTO entries_fts(rowid,payload) VALUES(new.rowid,new.payload); END;
+        CREATE TRIGGER IF NOT EXISTS entries_fts_ad AFTER DELETE ON entries BEGIN INSERT INTO entries_fts(entries_fts,rowid,payload) VALUES('delete',old.rowid,old.payload); END;
+        CREATE TRIGGER IF NOT EXISTS entries_fts_au AFTER UPDATE OF payload ON entries BEGIN INSERT INTO entries_fts(entries_fts,rowid,payload) VALUES('delete',old.rowid,old.payload); INSERT INTO entries_fts(rowid,payload) VALUES(new.rowid,new.payload); END;
+        """
+
+    private static let fallbackSearchSchema = """
+        CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts USING fts5(payload,content='entries',content_rowid='rowid',tokenize='unicode61 remove_diacritics 2');
         CREATE TRIGGER IF NOT EXISTS entries_fts_ai AFTER INSERT ON entries BEGIN INSERT INTO entries_fts(rowid,payload) VALUES(new.rowid,new.payload); END;
         CREATE TRIGGER IF NOT EXISTS entries_fts_ad AFTER DELETE ON entries BEGIN INSERT INTO entries_fts(entries_fts,rowid,payload) VALUES('delete',old.rowid,old.payload); END;
         CREATE TRIGGER IF NOT EXISTS entries_fts_au AFTER UPDATE OF payload ON entries BEGIN INSERT INTO entries_fts(entries_fts,rowid,payload) VALUES('delete',old.rowid,old.payload); INSERT INTO entries_fts(rowid,payload) VALUES(new.rowid,new.payload); END;

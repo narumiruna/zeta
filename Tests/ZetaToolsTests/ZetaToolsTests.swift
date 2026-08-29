@@ -59,6 +59,34 @@ final class ZetaToolsTests: XCTestCase {
         } catch FileToolError.timedOut {}
     }
 
+    func testSearchFallbackWorksWithoutExternalCommands() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(
+            at: directory.appendingPathComponent("sub"),
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try Data("first\nneedle 42\n".utf8)
+            .write(to: directory.appendingPathComponent("sub/file.txt"))
+        try Data("needle ignored\n".utf8)
+            .write(to: directory.appendingPathComponent("sub/file.md"))
+        let search = SearchTools(
+            workingDirectory: directory,
+            useExternalCommands: false
+        )
+        let matches = try await search.grep(
+            pattern: #"needle \d+"#,
+            filePattern: "*.txt"
+        )
+        XCTAssertEqual(
+            matches,
+            [SearchMatch(path: "sub/file.txt", line: 2, text: "needle 42")]
+        )
+        let found = try await search.find(pattern: "*.txt")
+        XCTAssertEqual(found, ["sub/file.txt"])
+    }
+
     func testEditPreservesBOMAndCRLF() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)

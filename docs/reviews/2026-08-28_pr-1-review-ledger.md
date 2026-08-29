@@ -248,6 +248,8 @@ Initial outcome: Actionable and not yet addressed because the runner has no `uv`
 
 Final outcome: Addressed by installing pinned uv `0.9.26` with architecture-specific checksums before the gate.
 
+Final outcome: Search tests no longer require a preinstalled `rg`, and SQLite search falls back to the built-in Unicode tokenizer when the host lacks trigram support.
+
 Local evidence: Workflow YAML, embedded shell syntax, repository scripts, and the complete repository gate were validated before push.
 
 ### Swift arm64
