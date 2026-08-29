@@ -20,7 +20,8 @@ fi
 swift package dump-package >/dev/null
 swift build -Xswiftc -strict-concurrency=complete -Xswiftc -warnings-as-errors
 if [[ -n "${ZETA_SKIP_SWIFT_TESTS:-}" ]]; then
-  echo "SKIP duplicate Swift tests: architecture jobs run the strict and sanitizer suites."
+  swift build --build-tests -Xswiftc -strict-concurrency=complete -Xswiftc -warnings-as-errors
+  echo "SKIP duplicate Swift test execution: architecture jobs run the strict and sanitizer suites."
 else
   swift test -Xswiftc -strict-concurrency=complete -Xswiftc -warnings-as-errors
 fi

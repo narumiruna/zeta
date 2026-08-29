@@ -43,6 +43,7 @@ jobs:
           test "$(uv --version | awk '{print $2}')" = "0.9.26"
       - name: Run repository gates
         env:
+          DEVELOPER_DIR: /Applications/Xcode.app/Contents/Developer
           ZETA_SWIFT_TOOLCHAIN_CONFIGURED: "1"
           ZETA_SKIP_SWIFT_TESTS: "1"
         run: scripts/check-repository.sh
