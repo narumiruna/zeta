@@ -34,6 +34,6 @@ If a secret is committed, revoke it immediately and notify maintainers privately
 ## Dependency and release safety
 
 Follow [ADR 0001](docs/adr/0001-dependencies-and-macos-platform.md) for dependency review.
-Pin package dependencies and CI actions to immutable revisions.
-Release workflows in this repository are non-publishing skeletons until maintainers configure signing, notarization, protected environments, and release approval.
-Never add publishing credentials to repository files or ordinary CI logs.
+Pin package dependencies to immutable revisions.
+Release scripts must remain non-publishing until maintainers configure signing, notarization, release approval, and the required credentials outside the repository.
+Never add publishing credentials to repository files or ordinary command logs.

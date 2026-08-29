@@ -1,15 +1,27 @@
 # Release engineering
 
-Zeta release artifacts are produced locally and in a manual non-publishing workflow.
-The workflow must not create a GitHub release, push tags, upload to a package registry, use production signing identities, or submit notarization requests.
+Zeta release artifacts are produced locally.
+The local release process must not create a GitHub release, push tags, upload to a package registry, use production signing identities, or submit notarization requests.
 Publishing requires a separate reviewed change.
 
 ## Local dry run
 
-Run the repository gate first.
+Record the local environment and verify it matches the pinned toolchain and intended architecture.
+
+```sh
+sw_vers
+uname -m
+swift --version
+uv --version
+```
+
+Run the repository gate and focused platform checks.
 
 ```sh
 PI_SOURCE_ROOT=/path/to/pinned/pi scripts/check-repository.sh
+scripts/check-ios-libraries.sh
+swift test --sanitize=address
+swift test --sanitize=thread
 ```
 
 Build architecture-specific artifacts.
@@ -36,15 +48,10 @@ PREFIX=/tmp/zeta-install scripts/uninstall.sh
 
 `ZETA_CODESIGN_IDENTITY` enables the optional hardened-runtime signing hook.
 `scripts/notarize.sh` requires an explicit artifact and keychain profile and only submits when invoked directly.
-Unsigned local and CI dry runs are expected.
-
-## CI
-
-`.github/workflows/ci.yml` runs repository gates and an arm64 strict build, tests, sanitizers, and retained reports.
-`.github/workflows/release-dry-run.yml` creates and installs an unsigned arm64 artifact without publishing it.
+Unsigned local dry runs are expected.
 The x86_64 path remains available for explicit local release validation.
 
 ## Publishing activation
 
 Before publishing is enabled, maintainers must review both architecture reports, compatibility outcomes, versioning, signing, notarization, protected environments, approvals, rollback, source archives, dependency provenance, licenses, checksums, vulnerability reports, and installation evidence.
-Publishing activation must never be hidden in a workflow refactor.
+Publishing activation must never be hidden in a release-script refactor.

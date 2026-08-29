@@ -52,7 +52,7 @@ A checkout without `Package.swift` reports those Swift checks as explicit skips.
 ## Dependencies and security
 
 Follow [ADR 0001](docs/adr/0001-dependencies-and-macos-platform.md) before adding a dependency.
-Pin dependencies and CI actions to immutable revisions.
+Pin dependencies to immutable revisions.
 Never commit credentials, tokens, private keys, provider responses containing user data, or production auth files.
 Use synthetic redacted fixture values.
 Do not publish, sign, notarize, or upload release assets from local validation commands.

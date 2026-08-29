@@ -44,7 +44,7 @@ The model catalog generator records its Pi source commit and SHA-256 checksum.
 Protocol and terminal tests cover fragmentation, Unicode, malformed inputs, and restoration sequences.
 SQLite tests cover required capabilities, writer fencing, branch caches, FTS, historical-schema rejection, and integrity.
 macOS arm64 measurements are recorded under `docs/performance`.
-CI runs arm64 build, test, sanitizer, and release dry-run jobs.
+Local release validation runs arm64 build, test, sanitizer, and release dry-run checks.
 The x86_64 build remains available as a local release-engineering path.
 
 ## Current selection matrix
@@ -64,7 +64,7 @@ The x86_64 build remains available as a local release-engineering path.
 | Image output | Terminal protocols and base64 validation | Kitty, iTerm, fallback, input, and output tests |
 | Unicode width | Focused grapheme and East Asian ranges | CJK, emoji, combining mark, ANSI, and wrapping tests |
 | File locking | Darwin `flock` | Atomic settings, auth, trust, and concurrent-process fixtures |
-| Testing | XCTest plus Swift Testing | Async, parameterized, sanitizer, and CI execution |
+| Testing | XCTest plus Swift Testing | Async, parameterized, sanitizer, and local execution |
 
 ## License review
 
@@ -84,5 +84,5 @@ Non-macOS portability is not a design requirement for the executable release.
 [ADR 0002](0002-ios-library-platform.md) later extends support to the portable AI and agent library closure on iOS without changing the macOS executable contract.
 Dependencies attached to the supported iOS library closure must also pass its device, simulator, and external-consumer checks.
 Apple framework and package behavior is wrapped behind Zeta modules where deterministic substitution is useful.
-arm64 CI is required, while x86_64 validation is an explicit local release check.
+arm64 release validation is required, while x86_64 validation remains an explicit local release check.
 A universal binary is an optional packaging result and never substitutes for architecture-specific validation.
