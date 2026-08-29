@@ -72,22 +72,24 @@ public struct CLIArguments: Sendable {
         result.files = preprocessed.files
         result.messages = parsed.inputs
 
-        if let model = parsed.model,
-            let separator = model.lastIndex(of: ":"),
-            let level = ThinkingLevel(rawValue: String(model[model.index(after: separator)...]))
-        {
-            result.model = String(model[..<separator])
-            result.thinking = level
-            result.thinkingSpecified = true
-        } else {
-            result.model = parsed.model
-        }
-        if let thinking = parsed.thinking {
-            guard let level = ThinkingLevel(rawValue: thinking) else {
-                throw CLIArgumentError.invalidValue("--thinking")
+        for selection in preprocessed.thinkingSelections {
+            switch selection {
+            case .model(let model):
+                result.model = model
+                if let separator = model.lastIndex(of: ":"),
+                    let level = ThinkingLevel(rawValue: String(model[model.index(after: separator)...]))
+                {
+                    result.model = String(model[..<separator])
+                    result.thinking = level
+                    result.thinkingSpecified = true
+                }
+            case .thinking(let thinking):
+                guard let level = ThinkingLevel(rawValue: thinking) else {
+                    throw CLIArgumentError.invalidValue("--thinking")
+                }
+                result.thinking = level
+                result.thinkingSpecified = true
             }
-            result.thinking = level
-            result.thinkingSpecified = true
         }
 
         try result.validate()
@@ -151,24 +153,24 @@ private struct SwiftArgumentParserAdapter: CLIOptionParser {
 
 private struct ParsedCLIArguments: ParsableArguments {
     @Flag(name: .shortAndLong) var print = false
-    @Option(name: .long) var mode: String?
-    @Option(name: .long) var provider: String?
-    @Option(name: .long) var model: String?
-    @Option(name: .customLong("api-key")) var apiKey: String?
-    @Option(name: .long) var thinking: String?
+    @Option(name: .long, parsing: .unconditional) var mode: String?
+    @Option(name: .long, parsing: .unconditional) var provider: String?
+    @Option(name: .long, parsing: .unconditional) var model: String?
+    @Option(name: .customLong("api-key"), parsing: .unconditional) var apiKey: String?
+    @Option(name: .long, parsing: .unconditional) var thinking: String?
     @Flag(name: .customLong("no-session")) var noSession = false
     @Flag(name: [.customShort("c"), .customLong("continue")]) var continueSession = false
     @Flag(name: .shortAndLong) var resume = false
-    @Option(name: .long) var session: String?
-    @Option(name: .customLong("session-id")) var sessionID: String?
-    @Option(name: .long) var fork: String?
-    @Option(name: .customLong("session-dir")) var sessionDirectory: String?
-    @Option(name: [.customLong("n", withSingleDash: true), .long]) var name: String?
-    @Option(name: [.customLong("t", withSingleDash: true), .long]) var tools: String?
-    @Option(name: [
-        .customLong("xt", withSingleDash: true),
-        .customLong("exclude-tools"),
-    ]) var excludedTools: [String] = []
+    @Option(name: .long, parsing: .unconditional) var session: String?
+    @Option(name: .customLong("session-id"), parsing: .unconditional) var sessionID: String?
+    @Option(name: .long, parsing: .unconditional) var fork: String?
+    @Option(name: .customLong("session-dir"), parsing: .unconditional) var sessionDirectory: String?
+    @Option(name: .long, parsing: .unconditional) var name: String?
+    @Option(name: .long, parsing: .unconditional) var tools: String?
+    @Option(
+        name: .customLong("exclude-tools"),
+        parsing: .unconditionalSingleValue
+    ) var excludedTools: [String] = []
     @Flag(name: [
         .customLong("nbt", withSingleDash: true),
         .customLong("no-builtin-tools"),
@@ -192,6 +194,12 @@ private struct PreprocessedCLIArguments {
     var version = false
     var listModels: String?
     var files: [String] = []
+    var thinkingSelections: [CLIThinkingSelection] = []
+}
+
+private enum CLIThinkingSelection {
+    case model(String)
+    case thinking(String)
 }
 
 private enum CLIArgumentPreprocessor {
@@ -211,34 +219,67 @@ private enum CLIArgumentPreprocessor {
                 break
             }
             if valueOptions.contains(value), values.indices.contains(index + 1) {
-                result.values.append(value)
-                result.values.append(values[index + 1])
+                let optionValue = values[index + 1]
+                result.values.append(normalizedOptionName(value))
+                result.values.append(optionValue)
+                recordThinkingSelection(name: value, value: optionValue, in: &result)
                 index += 2
                 continue
             }
             let longParts = value.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
             let name = longParts.first.map(String.init) ?? value
-            switch name {
-            case "-h", "--help":
+            if longParts.count == 2 {
+                recordThinkingSelection(name: name, value: String(longParts[1]), in: &result)
+            }
+            switch value {
+            case "-h":
                 result.help = true
-            case "-v", "--version":
+            case "-v":
                 result.version = true
-            case "--list-models":
-                result.listModels = longParts.count == 2 ? String(longParts[1]) : ""
             case "-a":
                 result.values.append("--approve")
             case "-na":
                 result.values.append("--no-approve")
             default:
-                if value.hasPrefix("@") {
-                    result.files.append(String(value.dropFirst()))
-                } else {
-                    result.values.append(value)
+                switch name {
+                case "--help":
+                    result.help = true
+                case "--version":
+                    result.version = true
+                case "--list-models":
+                    result.listModels = longParts.count == 2 ? String(longParts[1]) : ""
+                default:
+                    if value.hasPrefix("@") {
+                        result.files.append(String(value.dropFirst()))
+                    } else {
+                        result.values.append(value)
+                    }
                 }
             }
             index += 1
         }
         return result
+    }
+
+    private static func normalizedOptionName(_ name: String) -> String {
+        switch name {
+        case "-n": "--name"
+        case "-t": "--tools"
+        case "-xt": "--exclude-tools"
+        default: name
+        }
+    }
+
+    private static func recordThinkingSelection(
+        name: String,
+        value: String,
+        in result: inout PreprocessedCLIArguments
+    ) {
+        switch name {
+        case "--model": result.thinkingSelections.append(.model(value))
+        case "--thinking": result.thinkingSelections.append(.thinking(value))
+        default: break
+        }
     }
 }
 

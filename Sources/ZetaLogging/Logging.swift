@@ -76,7 +76,9 @@ private struct SwiftLogSink: ZetaLogSink {
     private let logger: Logger
 
     init(label: String, minimumLevel: ZetaLogLevel) {
-        var logger = Logger(label: label)
+        var logger = Logger(label: label) { label in
+            StreamLogHandler.standardError(label: label)
+        }
         logger.logLevel = minimumLevel.swiftLogLevel
         self.logger = logger
     }
