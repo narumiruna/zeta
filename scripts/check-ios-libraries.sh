@@ -54,6 +54,7 @@ run_logged() {
 )
 uv run python "$root/scripts/check-package-dependencies.py" \
   --manifest "$artifacts_dir/package.json" \
+  --package-path "$root" \
   --resolved "$root/Package.resolved"
 uv run python - "$artifacts_dir/package.json" "$artifacts_dir/consumer-package.json" <<'PY'
 import json

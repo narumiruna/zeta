@@ -31,10 +31,10 @@ Neither dependency is part of the supported iOS `ZetaAI` and `ZetaAgent` library
 
 ## License review and supply-chain pinning
 
-| Identity | Repository | Exact release | Revision | License | Transitive packages |
-| --- | --- | --- | --- | --- | --- |
-| `swift-argument-parser` | `https://github.com/apple/swift-argument-parser.git` | 1.8.2 | `6a52f3251125d74daf04fcbd5e6f08a75d074382` | Apache-2.0 with Runtime Library Exception | None |
-| `swift-log` | `https://github.com/apple/swift-log.git` | 1.9.1 | `2778fd4e5a12a8aaa30a3ee8285f4ce54c5f3181` | Apache-2.0 | None |
+| Identity | Repository | Exact release | Revision | License | Transitive packages | Advisory review |
+| --- | --- | --- | --- | --- | --- | --- |
+| `swift-argument-parser` | `https://github.com/apple/swift-argument-parser.git` | 1.8.2 | `6a52f3251125d74daf04fcbd5e6f08a75d074382` | Apache-2.0 with Runtime Library Exception | None | 0 published on 2026-08-29 |
+| `swift-log` | `https://github.com/apple/swift-log.git` | 1.9.1 | `2778fd4e5a12a8aaa30a3ee8285f4ce54c5f3181` | Apache-2.0 | None | 0 published on 2026-08-29 |
 
 Both repositories are maintained by Apple under the Swift Server and Swift project organizations and publish versioned releases.
 Their selected package manifests declare no external package dependencies.

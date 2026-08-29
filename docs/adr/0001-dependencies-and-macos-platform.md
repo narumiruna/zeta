@@ -38,8 +38,8 @@ XCTest and Swift Testing both run through SwiftPM because the pinned toolchain e
 ## Evidence
 
 `Package.swift` currently resolves two external dependencies reviewed in [ADR 0003](0003-command-line-and-logging-dependencies.md).
-`scripts/check-package-dependencies.py` rejects mutable requirements and requires direct dependencies to match a committed `Package.resolved` graph.
-`scripts/check-licenses.py` verifies the project license and requires every resolved dependency to have an explicit identity row in the current license review.
+`scripts/check-package-dependencies.py` rejects mutable requirements, verifies direct dependency origins and pins, and compares the committed `Package.resolved` with an independent resolution.
+`scripts/check-licenses.py` verifies the project license and requires every resolved dependency to have a structured row matching its repository, exact release, and revision in the current license review.
 `scripts/check-repository.sh` verifies strict concurrency, warnings as errors, formatting, tests, generated files, fixtures, secrets, and API symbols.
 The model catalog generator records its Pi source commit and SHA-256 checksum.
 Protocol and terminal tests cover fragmentation, Unicode, malformed inputs, and restoration sequences.
@@ -72,8 +72,9 @@ The repository is MIT licensed.
 The current external dependency license review is recorded in [ADR 0003](0003-command-line-and-logging-dependencies.md).
 Apple SDK frameworks are platform components and are not vendored.
 SQLite is public domain and is loaded from the macOS SDK.
-Each external dependency must have an explicit identity row in the current license review with its repository URL, exact release or revision, direct license, transitive packages and licenses, and advisory review.
-Mentions outside the current license review section and unstructured prose do not satisfy the license review check.
+Each external dependency must have a structured row in the current license review with its repository URL, exact release or revision, direct license, transitive packages and licenses, and advisory review.
+The reviewed repository, exact release, and revision must match the committed resolution pin.
+Mentions outside the current license review section and incomplete or unstructured rows do not satisfy the license review check.
 A separate superseding ADR is not required for an ordinary dependency update.
 
 ## Consequences

@@ -42,8 +42,8 @@ uv run python scripts/check-licenses.py
 `check-docs.py` checks required files, local links, and the one-prose-sentence-per-source-line convention.
 `check-file-length.py` enforces the 1,000-line limit outside declared generated artifacts.
 `check-secrets.py` scans tracked and untracked repository text without printing candidate secret values.
-`check-package-dependencies.py` permits only exact releases and revisions, requires `Package.resolved` for external dependencies, and verifies each direct requirement against its resolved pin.
-`check-licenses.py` requires every `Package.resolved` identity to have an explicit identity row in the current dependency ADR's License review section.
+`check-package-dependencies.py` permits only exact releases and revisions, verifies each direct origin and requirement against its pin, and compares the complete lock graph with an independent resolution.
+`check-licenses.py` requires every `Package.resolved` identity to have a complete structured row matching its resolved repository, exact release, and revision in the current dependency ADR's License review section.
 
 ## Swift checks
 

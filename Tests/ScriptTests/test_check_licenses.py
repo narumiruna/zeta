@@ -16,39 +16,71 @@ CHECK = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(CHECK)
 
 
-def create_repository(root: Path, adr: str, identities: list[str]) -> None:
+def pin(
+    identity: str,
+    repository: str | None = None,
+    version: str = "1.2.3",
+    revision: str = "revision-hash",
+) -> dict[str, object]:
+    return {
+        "identity": identity,
+        "kind": "remoteSourceControl",
+        "location": repository or f"https://example.com/{identity}.git",
+        "state": {"version": version, "revision": revision},
+    }
+
+
+def create_repository(root: Path, adr: str, pins: list[dict[str, object]]) -> None:
     (root / "LICENSE").write_text("MIT\n", encoding="utf-8")
     adr_path = root / CHECK.LICENSE_REVIEW_PATH
     adr_path.parent.mkdir(parents=True)
     adr_path.write_text(adr, encoding="utf-8")
-    if identities:
-        pins = [
-            {"identity": identity, "state": {"version": "1.2.3"}}
-            for identity in identities
-        ]
+    if pins:
         (root / "Package.resolved").write_text(
-            json.dumps({"version": 2, "pins": pins}), encoding="utf-8"
+            json.dumps({"version": 3, "pins": pins}), encoding="utf-8"
         )
 
 
-def review_table(*identities: str) -> str:
-    rows = "\n".join(
-        f"| `{identity}` | https://example.com/{identity} | 1.2.3 | MIT | None |"
-        for identity in identities
+def review_row(
+    identity: str,
+    repository: str | None = None,
+    version: str = "1.2.3",
+    revision: str = "revision-hash",
+    license_name: str = "MIT",
+    transitive: str = "None",
+    advisory: str = "0 published on 2026-08-29",
+) -> str:
+    values = (
+        f"`{identity}`",
+        f"`{repository or f'https://example.com/{identity}.git'}`",
+        version,
+        f"`{revision}`",
+        license_name,
+        transitive,
+        advisory,
     )
+    return "| " + " | ".join(values) + " |"
+
+
+def review_table(*rows: str) -> str:
+    joined_rows = "\n".join(rows)
     return f"""## License review and supply-chain pinning
 
-| Identity | Repository | Exact release | License | Transitive packages |
-| --- | --- | --- | --- | --- |
-{rows}
+| Identity | Repository | Exact release | Revision | License | Transitive packages | Advisory review |
+| --- | --- | --- | --- | --- | --- | --- |
+{joined_rows}
 """
 
 
 class LicenseReviewTests(unittest.TestCase):
-    def test_accepts_explicit_identity_row_in_license_review(self) -> None:
+    def test_accepts_structured_review_matching_resolved_pin(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            create_repository(root, f"# ADR\n\n{review_table('example')}", ["example"])
+            create_repository(
+                root,
+                f"# ADR\n\n{review_table(review_row('example'))}",
+                [pin("example")],
+            )
 
             count = CHECK.check_license_review(root)
 
@@ -65,7 +97,7 @@ The example package is selected.
 """
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            create_repository(root, adr, ["example"])
+            create_repository(root, adr, [pin("example")])
 
             with self.assertRaisesRegex(ValueError, "missing from license ADR"):
                 CHECK.check_license_review(root)
@@ -77,11 +109,11 @@ The example package is selected.
 
 ## Consequences
 
-| `example` | not a license review row |
+{review_row("example")}
 """
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            create_repository(root, adr, ["example"])
+            create_repository(root, adr, [pin("example")])
 
             with self.assertRaisesRegex(ValueError, "missing from license ADR"):
                 CHECK.check_license_review(root)
@@ -99,12 +131,68 @@ The policy applies.
 """
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            create_repository(root, adr, ["example"])
+            create_repository(root, adr, [pin("example")])
 
-            with self.assertRaisesRegex(ValueError, "missing from license ADR"):
+            with self.assertRaisesRegex(ValueError, "structured license review table"):
                 CHECK.check_license_review(root)
 
-    def test_accepts_no_resolved_dependencies_without_identity_rows(self) -> None:
+    def test_rejects_one_cell_identity_row(self) -> None:
+        adr = f"# ADR\n\n{review_table('| `example` |')}"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            create_repository(root, adr, [pin("example")])
+
+            with self.assertRaisesRegex(ValueError, "seven columns"):
+                CHECK.check_license_review(root)
+
+    def test_rejects_review_repository_that_does_not_match_pin(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            create_repository(
+                root,
+                f"# ADR\n\n{review_table(review_row('example', repository='https://example.com/old.git'))}",
+                [pin("example")],
+            )
+
+            with self.assertRaisesRegex(ValueError, "repository.*does not match"):
+                CHECK.check_license_review(root)
+
+    def test_rejects_review_release_or_revision_that_does_not_match_pin(self) -> None:
+        cases = (
+            (review_row("example", version="1.2.2"), "exact release"),
+            (review_row("example", revision="old-hash"), "revision"),
+        )
+        for row, message in cases:
+            with self.subTest(message=message), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                create_repository(
+                    root,
+                    f"# ADR\n\n{review_table(row)}",
+                    [pin("example")],
+                )
+
+                with self.assertRaisesRegex(ValueError, f"{message}.*does not match"):
+                    CHECK.check_license_review(root)
+
+    def test_rejects_empty_required_review_details(self) -> None:
+        rows = (
+            review_row("example", license_name=""),
+            review_row("example", transitive=""),
+            review_row("example", advisory=""),
+        )
+        for row in rows:
+            with self.subTest(row=row), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                create_repository(
+                    root,
+                    f"# ADR\n\n{review_table(row)}",
+                    [pin("example")],
+                )
+
+                with self.assertRaisesRegex(ValueError, "empty fields"):
+                    CHECK.check_license_review(root)
+
+    def test_accepts_no_resolved_dependencies_without_review_rows(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             create_repository(root, f"# ADR\n\n{review_table()}", [])
