@@ -24,6 +24,7 @@ uv run python scripts/check-generated-files.py
 uv run python scripts/check-docs.py
 uv run python scripts/check-file-length.py
 uv run python scripts/check-secrets.py
+uv run python scripts/check-package-dependencies.py
 uv run python scripts/check-licenses.py
 
 scripts/check-swift-gates.sh
