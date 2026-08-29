@@ -22,7 +22,7 @@ scripts/check-ios-libraries.sh
 ```
 
 The iOS gate validates the manifest, warning and strict-concurrency builds for both supported products and SDKs, the external consumer build, and two synthetic simulator tests with zero allowed skips.
-Its default diagnostics directory is `/tmp/zeta-ios-libraries` and CI overrides it with an uploaded artifact path.
+Its default diagnostics directory is `/tmp/zeta-ios-libraries`, and callers can override it with `ZETA_IOS_ARTIFACTS_DIR`.
 The gate marks directories that it creates and refuses to clear an existing unmarked directory.
 
 ```sh
@@ -51,12 +51,14 @@ After a package workspace exists, run package validation with warning and strict
 swift package dump-package
 swift build -Xswiftc -strict-concurrency=complete -Xswiftc -warnings-as-errors
 swift test -Xswiftc -strict-concurrency=complete -Xswiftc -warnings-as-errors
+swift test --sanitize=address
+swift test --sanitize=thread
 ```
 
 Formatting uses bundled `swift format` from the pinned toolchain.
 API breakage uses `ZETA_API_BASELINE` when supplied and otherwise uses the previous committed package baseline when one exists.
-Sanitizers and architecture-specific integration remain CI skeleton gates until compatible Swift tests exist.
-Do not represent deferred sanitizer or architecture results as passing today.
+Run sanitizers and architecture-specific integration as explicit local release checks.
+Do not represent unavailable sanitizer or architecture results as passing.
 
 ## Baseline oracle
 

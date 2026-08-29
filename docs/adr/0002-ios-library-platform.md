@@ -18,7 +18,7 @@ The supported consumer products are `ZetaAI` and `ZetaAgent`.
 Consumers may add `ZetaCore` directly when tool implementations name its public JSON or schema types.
 The iOS application owns its user interface, lifecycle, credential acquisition, sandbox access, and `AgentTool` effects.
 Provider credentials must be injected explicitly instead of relying on process environment variables in a production iOS application.
-A generic iPhoneOS build and focused external-consumer tests on an iOS Simulator are required CI checks.
+A generic iPhoneOS build and focused external-consumer tests on an iOS Simulator are required local release checks.
 The macOS 14 deployment target, executable products, compatibility formats, and release process remain unchanged.
 
 ## Supported boundary
@@ -42,7 +42,7 @@ Zeta propagates cancellation, but the host application remains responsible for b
 ## Consequences
 
 The package manifest advertises iOS even though only the named module closure is supported there.
-Documentation and CI must keep that narrower product contract explicit.
+Documentation and local release checks must keep that narrower product contract explicit.
 The external consumer fixture validates resource embedding and public imports without compiling unrelated macOS-only targets.
 The supported iOS library closure does not link an external dependency or binary framework.
 This decision extends the non-macOS portability consequence in [ADR 0001](0001-dependencies-and-macos-platform.md) only for the named iOS libraries.

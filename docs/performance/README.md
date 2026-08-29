@@ -32,7 +32,7 @@ Its source and exact method are recorded in implementation history and the basel
 
 A release check fails only after the same workload exceeds its budget in three consecutive isolated runs.
 The first cold startup may include operating-system code-signature and page-cache work and is recorded separately from the warm median.
-Architecture-specific CI retains benchmark output so regressions can be investigated rather than hidden.
+Architecture-specific release validation retains benchmark output so regressions can be investigated rather than hidden.
 
 ## Interpretation
 
