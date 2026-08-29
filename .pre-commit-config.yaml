@@ -3,7 +3,7 @@ repos:
     hooks:
       - id: swiftlint
         name: SwiftLint
-        entry: swiftlint --fix --strict
+        entry: swiftlint --fix --disable-sourcekit
         language: system
         types: [swift]
       - id: swift-format

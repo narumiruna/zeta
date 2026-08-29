@@ -22,7 +22,7 @@ public struct ShellTool: Sendable {
         environment: [String: String] = [:],
         onUpdate: (@Sendable (String) -> Void)? = nil
     ) async throws -> ShellResult {
-        if let timeout, (!timeout.isFinite || timeout <= 0 || timeout * 1_000 > Double(Int32.max)) {
+        if let timeout, !timeout.isFinite || timeout <= 0 || timeout * 1_000 > Double(Int32.max) {
             throw FileToolError.invalidEdit("timeout must be positive and fit signed 32-bit milliseconds")
         }
         let process = Process()

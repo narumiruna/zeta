@@ -161,9 +161,9 @@ public struct JSONNumber: Sendable, Hashable, Codable, ExpressibleByIntegerLiter
             guard index < bytes.count, bytes[index] >= 0x30, bytes[index] <= 0x39 else { return false }
             repeat { index += 1 } while index < bytes.count && bytes[index] >= 0x30 && bytes[index] <= 0x39
         }
-        if index < bytes.count, (bytes[index] == 0x65 || bytes[index] == 0x45) {
+        if index < bytes.count, bytes[index] == 0x65 || bytes[index] == 0x45 {
             index += 1
-            if index < bytes.count, (bytes[index] == 0x2b || bytes[index] == 0x2d) { index += 1 }
+            if index < bytes.count, bytes[index] == 0x2b || bytes[index] == 0x2d { index += 1 }
             guard index < bytes.count, bytes[index] >= 0x30, bytes[index] <= 0x39 else { return false }
             repeat { index += 1 } while index < bytes.count && bytes[index] >= 0x30 && bytes[index] <= 0x39
         }
@@ -584,9 +584,9 @@ private struct JSONParser {
             while index < scalars.count, scalars[index].value >= 0x30, scalars[index].value <= 0x39 { index += 1 }
             guard index > fractionStart else { throw error(.invalidNumber, "JSON fraction requires a digit") }
         }
-        if index < scalars.count, (scalars[index].value == 0x65 || scalars[index].value == 0x45) {
+        if index < scalars.count, scalars[index].value == 0x65 || scalars[index].value == 0x45 {
             index += 1
-            if index < scalars.count, (scalars[index].value == 0x2b || scalars[index].value == 0x2d) { index += 1 }
+            if index < scalars.count, scalars[index].value == 0x2b || scalars[index].value == 0x2d { index += 1 }
             let exponentStart = index
             while index < scalars.count, scalars[index].value >= 0x30, scalars[index].value <= 0x39 { index += 1 }
             guard index > exponentStart else { throw error(.invalidNumber, "JSON exponent requires a digit") }

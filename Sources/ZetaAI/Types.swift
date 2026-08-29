@@ -223,7 +223,7 @@ public struct AssistantMessage: Codable, Sendable, Equatable {
     public var responseId: String?
     public var usage: Usage
     public var stopReason: StopReason
-    public var deferred: DeferredHandle? = nil
+    public var deferred: DeferredHandle?
     public var errorMessage: String?
     public var rawStopReason: String?
     public var endTurn: Bool?
