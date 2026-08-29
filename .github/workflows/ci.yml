@@ -63,7 +63,7 @@ jobs:
           checksum: fcf0a9ea6599c6ae28a4c854ac6da76f2c889354d7c36ce136ef071f7ab9721f
       - name: Record environment
         env:
-          DEVELOPER_DIR: /Applications/Xcode.app/Contents/Developer
+          DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
         run: |
           mkdir -p artifacts
           sw_vers | tee artifacts/ios-environment.txt
@@ -73,11 +73,12 @@ jobs:
           uv --version | tee -a artifacts/ios-environment.txt
           xcrun --sdk iphoneos --show-sdk-version | tee -a artifacts/ios-environment.txt
           xcrun --sdk iphonesimulator --show-sdk-version | tee -a artifacts/ios-environment.txt
+          grep -q '^Xcode 26\.3$' artifacts/ios-environment.txt
           grep -Eq 'Swift version 6\.2(\.0)?([[:space:]]|$)' artifacts/ios-environment.txt
           test "$(uv --version | awk '{print $2}')" = "0.9.26"
       - name: Run iOS library checks
         env:
-          DEVELOPER_DIR: /Applications/Xcode.app/Contents/Developer
+          DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
           ZETA_IOS_ARTIFACTS_DIR: artifacts/ios-libraries
         run: scripts/check-ios-libraries.sh
       - name: Retain failure diagnostics
