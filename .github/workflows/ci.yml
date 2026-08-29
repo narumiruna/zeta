@@ -41,6 +41,7 @@ jobs:
       - name: Run repository checks
         env:
           ZETA_SWIFT_TOOLCHAIN_CONFIGURED: "1"
+          ZETA_SKIP_SWIFT_TESTS: "1"
         run: scripts/check-repository.sh
 
   swift:

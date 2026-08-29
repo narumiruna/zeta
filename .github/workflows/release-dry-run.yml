@@ -44,6 +44,7 @@ jobs:
       - name: Run repository gates
         env:
           ZETA_SWIFT_TOOLCHAIN_CONFIGURED: "1"
+          ZETA_SKIP_SWIFT_TESTS: "1"
         run: scripts/check-repository.sh
       - name: Build unsigned local artifacts
         run: scripts/build-release.sh --arch "${{ matrix.arch }}" --out "$PWD/release-output"
