@@ -30,7 +30,7 @@ public enum Compaction {
         case .user(let value):
             estimate(value.content)
         case .assistant(let value):
-            max(value.usage.totalTokens, estimate(value.content))
+            max(value.usage.output, estimate(value.content))
         case .toolResult(let value):
             estimate(value.content)
         case .custom(let value):

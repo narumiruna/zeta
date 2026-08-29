@@ -248,6 +248,27 @@ public actor SQLiteSessionRepository {
                     .text(OrderedJSON.string(payload)),
                 ]
             )
+            if type == "usage" {
+                let usage = try sqliteUsageStatsDelta(payload)
+                try execute(
+                    """
+                    UPDATE session_stats
+                    SET cached_tokens=cached_tokens+?,
+                        uncached_tokens=uncached_tokens+?,
+                        total_tokens=total_tokens+?,
+                        cost_total=cost_total+?
+                    WHERE session_id=?
+                    """,
+                    [
+                        .double(usage.cachedTokens), .double(usage.uncachedTokens),
+                        .double(usage.totalTokens), .double(usage.costTotal),
+                        .text(sessionID),
+                    ]
+                )
+                guard sqlite3_changes(database) == 1 else {
+                    throw SQLiteRepositoryError.execute("Missing session statistics")
+                }
+            }
             return SQLiteRecord(
                 sessionID: sessionID,
                 sequence: sequence,

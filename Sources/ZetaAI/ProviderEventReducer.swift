@@ -5,6 +5,8 @@ public struct ProviderEventReducer: Sendable {
     public private(set) var partial: AssistantMessage
     private var toolArgumentBuffers: [Int: String] = [:]
     private var openAIToolContentIndices: [Int: Int] = [:]
+    private var googleCurrentBlockIndex: Int?
+    private var googleToolCallCounter = 0
 
     public init(model: Model) {
         partial = AssistantMessage(
@@ -25,7 +27,7 @@ public struct ProviderEventReducer: Sendable {
             throw ProviderError.invalidResponse(error)
         }
         let type = object.string("type") ?? eventName ?? ""
-        var events: [AssistantEvent] = []
+        var events = consumeGoogleParts(object)
 
         if type == "content_block_start",
             case .object(let block)? = object["content_block"]
@@ -71,7 +73,6 @@ public struct ProviderEventReducer: Sendable {
             object.pathString(["delta", "text"])
             ?? object.pathString(["choices", "0", "delta", "content"])
             ?? (type.contains("output_text.delta") ? object.string("delta") : nil)
-            ?? object.pathString(["candidates", "0", "content", "parts", "0", "text"])
         if let textDelta, !textDelta.isEmpty {
             events += appendText(textDelta)
         }
@@ -157,14 +158,160 @@ public struct ProviderEventReducer: Sendable {
             partial.rawStopReason = stop
             partial.stopReason = mapStopReason(stop)
         }
+        if let stop = object.pathString(["candidates", "0", "finishReason"]) {
+            events += finishGoogleContentBlock()
+            partial.rawStopReason = stop
+            partial.stopReason = mapStopReason(stop)
+            if partial.stopReason == .stop,
+                partial.content.contains(where: {
+                    if case .toolCall = $0 { true } else { false }
+                })
+            {
+                partial.stopReason = .toolUse
+            }
+        }
         if type == "message_stop" || type == "response.completed" {
             if partial.stopReason == .pending { partial.stopReason = .stop }
         }
-        if let responseID = object.string("id") ?? object.pathString(["response", "id"]) {
+        if let responseID = object.string("id")
+            ?? object.string("responseId")
+            ?? object.pathString(["response", "id"])
+        {
             partial.responseId = responseID
         }
         updateUsage(object)
         return events
+    }
+
+    private mutating func consumeGoogleParts(
+        _ object: OrderedJSONObject
+    ) -> [AssistantEvent] {
+        guard
+            case .array(let values)? = object.path([
+                "candidates", "0", "content", "parts",
+            ])
+        else {
+            return []
+        }
+        var events: [AssistantEvent] = []
+        for value in values {
+            guard case .object(let part) = value else { continue }
+            if case .string(let text)? = part["text"] {
+                let thinking = part.boolean("thought") == true
+                let signature = part.string("thoughtSignature")
+                let needsBlock: Bool
+                if let index = googleCurrentBlockIndex,
+                    partial.content.indices.contains(index)
+                {
+                    switch partial.content[index] {
+                    case .thinking: needsBlock = !thinking
+                    case .text: needsBlock = thinking
+                    default: needsBlock = true
+                    }
+                } else {
+                    needsBlock = true
+                }
+                if needsBlock {
+                    events += finishGoogleContentBlock()
+                    let index = partial.content.count
+                    googleCurrentBlockIndex = index
+                    if thinking {
+                        partial.content.append(.thinking(text: "", signature: signature))
+                        events.append(.thinkingStart(index: index, partial: partial))
+                    } else {
+                        partial.content.append(.text(text: "", signature: signature))
+                        events.append(.textStart(index: index, partial: partial))
+                    }
+                }
+                guard let index = googleCurrentBlockIndex else { continue }
+                switch partial.content[index] {
+                case .thinking(let current, let existingSignature, let redacted):
+                    partial.content[index] = .thinking(
+                        text: current + text,
+                        signature: retainedSignature(existingSignature, incoming: signature),
+                        redacted: redacted
+                    )
+                    events.append(.thinkingDelta(index: index, delta: text, partial: partial))
+                case .text(let current, let existingSignature):
+                    partial.content[index] = .text(
+                        text: current + text,
+                        signature: retainedSignature(existingSignature, incoming: signature)
+                    )
+                    events.append(.textDelta(index: index, delta: text, partial: partial))
+                default:
+                    break
+                }
+            }
+
+            if case .object(let functionCall)? = part["functionCall"] {
+                events += finishGoogleContentBlock()
+                let name = functionCall.string("name") ?? ""
+                let providedID = functionCall.string("id")
+                let duplicateID =
+                    providedID.map { id in
+                        partial.content.contains {
+                            if case .toolCall(let call) = $0 { call.id == id } else { false }
+                        }
+                    } ?? true
+                googleToolCallCounter += 1
+                let id: String
+                if let providedID, !duplicateID {
+                    id = providedID
+                } else {
+                    id = "\(name.isEmpty ? "call" : name)-\(googleToolCallCounter)"
+                }
+                let arguments: JSONValue
+                if let value = functionCall["args"], case .object = value {
+                    arguments = value
+                } else {
+                    arguments = [:]
+                }
+                let call = ToolCall(
+                    id: id,
+                    name: name,
+                    arguments: arguments,
+                    thoughtSignature: part.string("thoughtSignature")
+                )
+                let index = partial.content.count
+                partial.content.append(.toolCall(call))
+                events.append(.toolCallStart(index: index, partial: partial))
+                events.append(
+                    .toolCallDelta(
+                        index: index,
+                        delta: OrderedJSON.string(arguments),
+                        partial: partial
+                    )
+                )
+                events.append(.toolCallEnd(index: index, call: call, partial: partial))
+            }
+        }
+        return events
+    }
+
+    private mutating func finishGoogleContentBlock() -> [AssistantEvent] {
+        guard let index = googleCurrentBlockIndex,
+            partial.content.indices.contains(index)
+        else {
+            googleCurrentBlockIndex = nil
+            return []
+        }
+        googleCurrentBlockIndex = nil
+        switch partial.content[index] {
+        case .text(let text, _):
+            return [.textEnd(index: index, content: text, partial: partial)]
+        case .thinking(let text, _, _):
+            return [.thinkingEnd(index: index, content: text, partial: partial)]
+        default:
+            return []
+        }
+    }
+
+    private func retainedSignature(
+        _ existing: String?,
+        incoming: String?
+    ) -> String? {
+        if let incoming, !incoming.isEmpty { return incoming }
+        return existing
     }
 
     private mutating func consumeOpenAIChatToolCalls(
@@ -330,6 +477,22 @@ public struct ProviderEventReducer: Sendable {
     }
 
     private mutating func updateUsage(_ object: OrderedJSONObject) {
+        if case .object(let usage)? = object["usageMetadata"] {
+            let cached = usage.integer("cachedContentTokenCount") ?? 0
+            let candidates = usage.integer("candidatesTokenCount") ?? 0
+            let thoughts = usage.integer("thoughtsTokenCount") ?? 0
+            partial.usage.input = max(
+                0,
+                (usage.integer("promptTokenCount") ?? 0) - cached
+            )
+            partial.usage.output = candidates + thoughts
+            partial.usage.cacheRead = cached
+            partial.usage.reasoning = thoughts
+            partial.usage.totalTokens =
+                usage.integer("totalTokenCount")
+                ?? partial.usage.input + partial.usage.output + cached
+            return
+        }
         let usageValue = object["usage"] ?? object.path(["response", "usage"])
         guard case .object(let usage)? = usageValue else { return }
         partial.usage.input =
@@ -349,9 +512,9 @@ public struct ProviderEventReducer: Sendable {
     }
 
     private func mapStopReason(_ raw: String) -> StopReason {
-        switch raw {
+        switch raw.lowercased() {
         case "length", "max_tokens": .length
-        case "tool_calls", "tool_use", "toolUse": .toolUse
+        case "tool_calls", "tool_use", "tooluse": .toolUse
         case "deferred": .deferred
         default: .stop
         }
@@ -368,6 +531,9 @@ private extension OrderedJSONObject {
         } else {
             nil
         }
+    }
+    func boolean(_ key: String) -> Bool? {
+        if case .bool(let value)? = self[key] { value } else { nil }
     }
     func path(_ path: [String]) -> JSONValue? {
         var current: JSONValue = .object(self)

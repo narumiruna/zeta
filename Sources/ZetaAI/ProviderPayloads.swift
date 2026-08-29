@@ -7,19 +7,22 @@ public enum ProviderPayloadBuilder {
         context: Context,
         options: StreamOptions
     ) throws -> JSONValue {
+        if let temperature = options.temperature, !temperature.isFinite {
+            throw ProviderError.invalidResponse("Temperature must be finite")
+        }
         switch model.api {
         case "anthropic-messages":
-            return anthropic(model: model, context: context, options: options)
+            return try anthropic(model: model, context: context, options: options)
         case "openai-responses", "azure-openai-responses", "openai-codex-responses":
-            return openAIResponses(model: model, context: context, options: options)
+            return try openAIResponses(model: model, context: context, options: options)
         case "google-generative-ai", "google-vertex":
-            return google(model: model, context: context, options: options)
+            return try google(model: model, context: context, options: options)
         case "bedrock-converse-stream":
-            return bedrock(model: model, context: context, options: options)
+            return try bedrock(model: model, context: context, options: options)
         case "pi-messages":
             return try piMessages(model: model, context: context, options: options)
         default:
-            return openAICompletions(model: model, context: context, options: options)
+            return try openAICompletions(model: model, context: context, options: options)
         }
     }
 
@@ -27,7 +30,7 @@ public enum ProviderPayloadBuilder {
         model: Model,
         context: Context,
         options: StreamOptions
-    ) -> JSONValue {
+    ) throws -> JSONValue {
         var messages: [JSONValue] = []
         if let system = context.systemPrompt {
             let role =
@@ -47,7 +50,7 @@ public enum ProviderPayloadBuilder {
         if model.compatibilityBool("supportsStore") == true {
             object["store"] = false
         }
-        addCommonOptions(&object, model: model, options: options)
+        try addCommonOptions(&object, model: model, options: options)
         addOpenAIThinking(&object, model: model, options: options)
         addOpenAITools(&object, model: model, context: context)
         return .object(object)
@@ -57,7 +60,7 @@ public enum ProviderPayloadBuilder {
         model: Model,
         context: Context,
         options: StreamOptions
-    ) -> JSONValue {
+    ) throws -> JSONValue {
         var input: [JSONValue] = context.messages.flatMap(responseItems)
         if let system = context.systemPrompt {
             let role =
@@ -74,7 +77,7 @@ public enum ProviderPayloadBuilder {
             object["max_output_tokens"] = .number(JSONNumber(maximum))
         }
         if let temperature = options.temperature {
-            object["temperature"] = .number(try! JSONNumber(temperature))
+            object["temperature"] = .number(try JSONNumber(temperature))
         }
         if let sessionID = options.sessionID {
             object["prompt_cache_key"] = .string(sessionID)
@@ -93,7 +96,7 @@ public enum ProviderPayloadBuilder {
         model: Model,
         context: Context,
         options: StreamOptions
-    ) -> JSONValue {
+    ) throws -> JSONValue {
         var object: OrderedJSONObject = [
             "model": .string(model.id),
             "messages": .array(context.messages.map(anthropicMessage)),
@@ -106,7 +109,7 @@ public enum ProviderPayloadBuilder {
         if let temperature = options.temperature,
             model.compatibilityBool("supportsTemperature") != false
         {
-            object["temperature"] = .number(try! JSONNumber(temperature))
+            object["temperature"] = .number(try JSONNumber(temperature))
         }
         if let thinking = options.thinking, thinking != .off {
             let resolved = model.resolvedThinkingLevel(thinking)
@@ -147,7 +150,7 @@ public enum ProviderPayloadBuilder {
         model: Model,
         context: Context,
         options: StreamOptions
-    ) -> JSONValue {
+    ) throws -> JSONValue {
         var object: OrderedJSONObject = [
             "contents": .array(context.messages.map(googleMessage))
         ]
@@ -162,7 +165,7 @@ public enum ProviderPayloadBuilder {
             generation["maxOutputTokens"] = .number(JSONNumber(maximum))
         }
         if let temperature = options.temperature {
-            generation["temperature"] = .number(try! JSONNumber(temperature))
+            generation["temperature"] = .number(try JSONNumber(temperature))
         }
         if let thinking = options.thinking, model.reasoning {
             let resolved = model.resolvedThinkingLevel(thinking)
@@ -195,12 +198,12 @@ public enum ProviderPayloadBuilder {
         model: Model,
         context: Context,
         options: StreamOptions
-    ) -> JSONValue {
+    ) throws -> JSONValue {
         var inference: OrderedJSONObject = [
             "maxTokens": .number(JSONNumber(options.maximumTokens ?? model.maximumTokens))
         ]
         if let temperature = options.temperature {
-            inference["temperature"] = .number(try! JSONNumber(temperature))
+            inference["temperature"] = .number(try JSONNumber(temperature))
         }
         var object: OrderedJSONObject = [
             "messages": .array(bedrockMessages(context.messages)),
@@ -606,9 +609,9 @@ public enum ProviderPayloadBuilder {
         _ object: inout OrderedJSONObject,
         model: Model,
         options: StreamOptions
-    ) {
+    ) throws {
         if let temperature = options.temperature {
-            object["temperature"] = .number(try! JSONNumber(temperature))
+            object["temperature"] = .number(try JSONNumber(temperature))
         }
         if let maximum = options.maximumTokens {
             let field = model.compatibilityString("maxTokensField") ?? "max_completion_tokens"

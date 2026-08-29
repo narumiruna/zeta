@@ -355,7 +355,7 @@ public actor HarnessSessionStorage {
     ) -> [HarnessEntry] {
         var values = entries.values.filter { entry in
             (type == nil || entry.type == type)
-                && (afterSequence == nil || entry.sequence < afterSequence!)
+                && (afterSequence == nil || entry.sequence > afterSequence!)
         }.sorted { newestFirst ? $0.sequence > $1.sequence : $0.sequence < $1.sequence }
         if let limit { values = Array(values.prefix(limit)) }
         return values

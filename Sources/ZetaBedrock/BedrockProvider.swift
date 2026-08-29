@@ -136,7 +136,7 @@ public struct BedrockProvider: AIProvider {
         options: StreamOptions
     ) async -> AssistantEventStream {
         let result = AssistantEventStream()
-        Task {
+        let producer = Task {
             do {
                 let body = OrderedJSON.encode(
                     try ProviderPayloadBuilder.build(
@@ -223,6 +223,7 @@ public struct BedrockProvider: AIProvider {
                 )
             }
         }
+        result.attachProducer(producer)
         return result
     }
 

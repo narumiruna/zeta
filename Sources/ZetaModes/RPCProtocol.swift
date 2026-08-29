@@ -54,20 +54,99 @@ public struct StrictRPCRequest: Sendable, Equatable {
 
     public static func decode(_ data: Data) throws -> StrictRPCRequest {
         let value = try OrderedJSON.decode(data)
-        var reader = try StrictObjectReader(value)
-        let id = try reader.optional("id").map {
-            try StrictValue.string($0, nonempty: true)
-        }
-        let raw = try StrictValue.string(reader.required("type"))
+        var discriminator = try StrictObjectReader(value)
+        let raw = try StrictValue.string(discriminator.required("type"))
         guard let command = RPCCommandName(rawValue: raw) else {
             throw RPCProtocolError.unknownCommand(raw)
         }
-        var fields = OrderedJSONObject()
-        for key in reader.remainingKeys {
-            if let value = reader.optional(key) { fields[key] = value }
+        guard case .object(let object) = try schema(for: command).validate(value) else {
+            throw RPCProtocolError.invalidType
         }
-        try reader.finish()
+        let id: String?
+        if let value = object["id"] {
+            id = try StrictValue.string(value, path: "$.id", nonempty: true)
+        } else {
+            id = nil
+        }
+        var fields = OrderedJSONObject()
+        for entry in object where entry.key != "id" && entry.key != "type" {
+            try fields.append(key: entry.key, value: entry.value)
+        }
         return StrictRPCRequest(id: id, command: command, fields: fields)
+    }
+
+    private static func schema(for command: RPCCommandName) -> JSONSchema {
+        var properties = [
+            JSONSchemaProperty("id", .string(minLength: 1), required: false),
+            JSONSchemaProperty("type", .enumeration([.string(command.rawValue)])),
+        ]
+        func field(
+            _ name: String,
+            _ schema: JSONSchema,
+            required: Bool = true
+        ) -> JSONSchemaProperty {
+            JSONSchemaProperty(name, schema, required: required)
+        }
+        switch command {
+        case .prompt:
+            properties += [
+                field("message", .string()),
+                field("images", .array(items: .any), required: false),
+                field(
+                    "streamingBehavior",
+                    .enumeration(["steer", "followUp"]),
+                    required: false
+                ),
+            ]
+        case .steer, .followUp:
+            properties += [
+                field("message", .string()),
+                field("images", .array(items: .any), required: false),
+            ]
+        case .newSession:
+            properties.append(field("parentSession", .string(), required: false))
+        case .setModel:
+            properties += [field("provider", .string()), field("modelId", .string())]
+        case .setThinkingLevel:
+            properties.append(
+                field(
+                    "level",
+                    .enumeration(
+                        ["off", "minimal", "low", "medium", "high", "xhigh", "max"]
+                    )
+                )
+            )
+        case .setSteeringMode, .setFollowUpMode:
+            properties.append(
+                field("mode", .enumeration(["all", "one-at-a-time"]))
+            )
+        case .compact:
+            properties.append(field("customInstructions", .string(), required: false))
+        case .setAutoCompaction, .setAutoRetry:
+            properties.append(field("enabled", .boolean))
+        case .bash:
+            properties += [
+                field("command", .string()),
+                field("excludeFromContext", .boolean, required: false),
+            ]
+        case .exportHTML:
+            properties.append(field("outputPath", .string(), required: false))
+        case .switchSession:
+            properties.append(field("sessionPath", .string()))
+        case .fork:
+            properties.append(field("entryId", .string()))
+        case .getEntries:
+            properties.append(field("since", .string(), required: false))
+        case .setSessionName:
+            properties.append(field("name", .string()))
+        case .abort, .clearQueue, .getState, .cycleModel,
+            .getAvailableModels, .cycleThinkingLevel,
+            .getAvailableThinkingLevels, .abortRetry, .abortBash,
+            .getSessionStats, .clone, .getForkMessages, .getTree,
+            .getLastAssistantText, .getMessages, .getCommands:
+            break
+        }
+        return .object(properties: properties, additionalProperties: .forbidden)
     }
 
     public func encoded() -> Data {

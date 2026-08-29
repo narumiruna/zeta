@@ -24,6 +24,34 @@ final class ZetaModesTests: XCTestCase {
         XCTAssertEqual(roundTrip, request)
     }
 
+    func testStrictRPCRejectsCommandSpecificUnknownAndInvalidFields() throws {
+        XCTAssertThrowsError(
+            try StrictRPCRequest.decode(
+                Data(#"{"type":"prompt","mesage":"hello"}"#.utf8)
+            )
+        )
+        XCTAssertThrowsError(
+            try StrictRPCRequest.decode(
+                Data(#"{"type":"cycle_model","direction":"previous"}"#.utf8)
+            )
+        )
+        XCTAssertThrowsError(
+            try StrictRPCRequest.decode(
+                Data(#"{"type":"set_model","provider":"openai"}"#.utf8)
+            )
+        )
+        XCTAssertThrowsError(
+            try StrictRPCRequest.decode(
+                Data(#"{"type":"set_steering_mode","mode":"one"}"#.utf8)
+            )
+        )
+        XCTAssertNoThrow(
+            try StrictRPCRequest.decode(
+                Data(#"{"type":"switch_session","sessionPath":"/tmp/session.jsonl"}"#.utf8)
+            )
+        )
+    }
+
     func testConcurrentRPCResponseCarriesCorrelation() async throws {
         let sink = ResponseSink()
         let engine = RPCEngine { data in await sink.append(data) }

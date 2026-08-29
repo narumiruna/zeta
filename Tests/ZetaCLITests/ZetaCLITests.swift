@@ -1,6 +1,8 @@
 import XCTest
 import ZetaAI
 import ZetaAgent
+import ZetaAuth
+import ZetaConfig
 import ZetaCore
 import ZetaModes
 
@@ -215,8 +217,14 @@ final class ZetaCLITests: XCTestCase {
         XCTAssertEqual(data["aborted"], true)
         XCTAssertLessThan(elapsed, .seconds(2))
         let bashResponse = await running.value
-        XCTAssertFalse(bashResponse.success)
-        XCTAssertNotNil(bashResponse.error)
+        if bashResponse.success {
+            guard case .object(let data)? = bashResponse.data else {
+                return XCTFail("Expected terminated bash result")
+            }
+            XCTAssertNotEqual(data["exitCode"], 0)
+        } else {
+            XCTAssertNotNil(bashResponse.error)
+        }
     }
 
     func testNewSessionSwapsPersistentFile() async throws {
@@ -251,23 +259,299 @@ final class ZetaCLITests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: replacement.path))
     }
 
+    func testInteractiveNewSessionRotatesPersistentFile() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let cwd = root.appendingPathComponent("project")
+        try FileManager.default.createDirectory(at: cwd, withIntermediateDirectories: true)
+        let opened = try await PersistentSessionController.open(
+            arguments: CLIArguments.parse([]),
+            workingDirectory: cwd,
+            defaultRoot: root.appendingPathComponent("sessions")
+        )
+        let session = try XCTUnwrap(opened)
+        let originalFile = await session.currentFile()
+        let original = try XCTUnwrap(originalFile)
+        let provider = FauxProvider()
+        let model = await provider.models[0]
+        let agent = Agent(state: AgentState(systemPrompt: "", model: model)) {
+            model, context, options in
+            await provider.stream(model: model, context: context, options: options)
+        }
+
+        try await InteractiveSessionCommands.newSession(agent: agent, session: session)
+
+        let replacementFile = await session.currentFile()
+        let replacement = try XCTUnwrap(replacementFile)
+        XCTAssertNotEqual(original, replacement)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: replacement.path))
+    }
+
+    func testThinkingCommandsPersistToSessionTranscript() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let cwd = root.appendingPathComponent("project")
+        try FileManager.default.createDirectory(at: cwd, withIntermediateDirectories: true)
+        let opened = try await PersistentSessionController.open(
+            arguments: CLIArguments.parse([]),
+            workingDirectory: cwd,
+            defaultRoot: root.appendingPathComponent("sessions")
+        )
+        let session = try XCTUnwrap(opened)
+        let provider = FauxProvider()
+        let model = await provider.models[0]
+        let agent = Agent(state: AgentState(systemPrompt: "", model: model)) {
+            model, context, options in
+            await provider.stream(model: model, context: context, options: options)
+        }
+
+        let runtime = CLIRPCRuntime(
+            agent: agent,
+            models: [model],
+            workingDirectory: cwd,
+            session: session
+        )
+        let rpc = await runtime.handle(
+            StrictRPCRequest(
+                command: .setThinkingLevel,
+                fields: ["level": "medium"]
+            )
+        )
+        XCTAssertTrue(rpc.success)
+        let rpcRestore = try await session.restore(models: [model])
+        XCTAssertEqual(rpcRestore.thinking, .medium)
+        let cycled = await runtime.handle(
+            StrictRPCRequest(command: .cycleThinkingLevel)
+        )
+        XCTAssertTrue(cycled.success)
+        let cycleRestore = try await session.restore(models: [model])
+        XCTAssertEqual(cycleRestore.thinking, .high)
+
+        try await InteractiveSessionCommands.setThinkingLevel(
+            .xhigh,
+            agent: agent,
+            session: session
+        )
+        let interactiveRestore = try await session.restore(models: [model])
+        XCTAssertEqual(interactiveRestore.thinking, .xhigh)
+        let currentFile = await session.currentFile()
+        let file = try XCTUnwrap(currentFile)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: file.path))
+        let contents = try String(contentsOf: file, encoding: .utf8)
+        XCTAssertTrue(contents.contains(#""thinkingLevel":"xhigh""#))
+    }
+
+    func testSessionMutationsRejectBeforeChangingManagerWhileBusy() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let cwd = root.appendingPathComponent("project")
+        try FileManager.default.createDirectory(at: cwd, withIntermediateDirectories: true)
+        let opened = try await PersistentSessionController.open(
+            arguments: CLIArguments.parse([]),
+            workingDirectory: cwd,
+            defaultRoot: root.appendingPathComponent("sessions")
+        )
+        let session = try XCTUnwrap(opened)
+        _ = try await session.newSession()
+        let originalFile = await session.currentFile()
+        let original = try XCTUnwrap(originalFile)
+        let alternateOpened = try await PersistentSessionController.open(
+            arguments: CLIArguments.parse([]),
+            workingDirectory: cwd,
+            defaultRoot: root.appendingPathComponent("alternate-sessions")
+        )
+        let alternate = try XCTUnwrap(alternateOpened)
+        _ = try await alternate.newSession()
+        let alternateFile = await alternate.currentFile()
+        let alternatePath = try XCTUnwrap(alternateFile).path
+        let provider = HeldRPCProvider()
+        let model = provider.model
+        let agent = Agent(state: AgentState(systemPrompt: "", model: model)) {
+            model, context, options in
+            await provider.stream(model: model, context: context, options: options)
+        }
+        let runtime = CLIRPCRuntime(
+            agent: agent,
+            models: [model],
+            workingDirectory: cwd,
+            session: session
+        )
+        let prompt = await runtime.handle(
+            StrictRPCRequest(command: .prompt, fields: ["message": "hold"])
+        )
+        XCTAssertTrue(prompt.success)
+        await provider.waitUntilFirstCallStarts()
+
+        let switched = await runtime.handle(
+            StrictRPCRequest(
+                command: .switchSession,
+                fields: ["sessionPath": .string(alternatePath)]
+            )
+        )
+        let forked = await runtime.handle(
+            StrictRPCRequest(command: .fork, fields: ["entryId": "missing"])
+        )
+        let cloned = await runtime.handle(StrictRPCRequest(command: .clone))
+        XCTAssertFalse(switched.success)
+        XCTAssertFalse(forked.success)
+        XCTAssertFalse(cloned.success)
+        let unchangedFile = await session.currentFile()
+        XCTAssertEqual(unchangedFile, original)
+
+        await provider.finishFirstCall()
+        await runtime.waitForIdle()
+    }
+
+    func testModelDispatcherUsesEachRequestModelAndTransport() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = try AuthStore(url: directory.appendingPathComponent("auth.json"))
+        try await store.set(
+            provider: "two",
+            credential: .apiKey(key: "two-key", environment: nil)
+        )
+        let dispatcher = CLIModelStreamDispatcher(
+            authStore: store,
+            explicitAPIKeys: ["one": "one-key"],
+            transportPreference: .auto,
+            environment: { ["ZETA_FAUX_RESPONSE": "ok"] }
+        )
+        let first = Model(
+            id: "first", name: "First", api: "openai-responses", provider: "one",
+            baseURL: URL(string: "https://one.invalid")!, contextWindow: 1_000,
+            maximumTokens: 100
+        )
+        let second = Model(
+            id: "second", name: "Second", api: "anthropic-messages", provider: "two",
+            baseURL: URL(string: "https://two.invalid")!, contextWindow: 1_000,
+            maximumTokens: 100
+        )
+
+        let firstAuthentication = try await dispatcher.resolveAuthentication(
+            for: first,
+            environment: [:]
+        )
+        let secondAuthentication = try await dispatcher.resolveAuthentication(
+            for: second,
+            environment: [:]
+        )
+        XCTAssertEqual(firstAuthentication.apiKey, "one-key")
+        XCTAssertEqual(secondAuthentication.apiKey, "two-key")
+
+        for model in [first, second] {
+            let stream = await dispatcher.stream(
+                model: model,
+                context: Context(),
+                options: StreamOptions()
+            )
+            for try await _ in stream {}
+            let result = await stream.result()
+            XCTAssertEqual(result.provider, model.provider)
+            XCTAssertEqual(result.model, model.id)
+        }
+
+        var codex = first
+        codex.api = "openai-codex-responses"
+        var bedrock = first
+        bedrock.api = "bedrock-converse-stream"
+        XCTAssertEqual(CLIProviderTransport.select(for: first, preference: .auto), .http)
+        XCTAssertEqual(CLIProviderTransport.select(for: codex, preference: .auto), .codexWebSocket)
+        XCTAssertEqual(CLIProviderTransport.select(for: codex, preference: .sse), .http)
+        XCTAssertEqual(CLIProviderTransport.select(for: bedrock, preference: .auto), .bedrock)
+    }
+
+    func testVertexBearerUsesAuthorizationAndAPIKeyUsesGoogleHeader() async throws {
+        let model = Model(
+            id: "gemini", name: "Gemini", api: "google-vertex", provider: "google-vertex",
+            baseURL: URL(string: "https://aiplatform.googleapis.com")!,
+            contextWindow: 1_000, maximumTokens: 100
+        )
+        let bearer = CLIResolvedProviderAuthentication(
+            bearerToken: "adc-token",
+            headers: [:],
+            environment: [:]
+        ).applying(to: StreamOptions(), for: model)
+        let bearerHeaders = try await bearer.transformHeaders?([
+            "x-goog-api-key": "must-be-removed"
+        ])
+        XCTAssertNil(bearerHeaders?["x-goog-api-key"] ?? nil)
+        XCTAssertEqual(bearerHeaders?["Authorization"] ?? nil, "Bearer adc-token")
+
+        let apiKey = CLIResolvedProviderAuthentication(
+            apiKey: "vertex-key",
+            headers: [:],
+            environment: [:]
+        ).applying(to: StreamOptions(), for: model)
+        let apiKeyHeaders = try await apiKey.transformHeaders?([
+            "Authorization": "Bearer must-be-removed"
+        ])
+        XCTAssertNil(apiKeyHeaders?["Authorization"] ?? nil)
+        XCTAssertEqual(apiKeyHeaders?["x-goog-api-key"] ?? nil, "vertex-key")
+    }
+
+    func testAuthReadinessUsesRuntimeCredentialResolution() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = try AuthStore(url: directory.appendingPathComponent("auth.json"))
+        try await store.set(
+            provider: "openai",
+            credential: .oauth(
+                access: "expired",
+                refresh: "refresh",
+                expires: 1,
+                extras: [:]
+            )
+        )
+        let expiredReady = await CLIProviderAuthenticationResolver.isReady(
+            provider: "openai",
+            store: store,
+            environment: [:]
+        )
+        let environmentReady = await CLIProviderAuthenticationResolver.isReady(
+            provider: "openai",
+            store: store,
+            environment: ["OPENAI_API_KEY": "environment-key"]
+        )
+        XCTAssertFalse(expiredReady)
+        XCTAssertTrue(environmentReady)
+    }
+
+    func testStartupSettingsConfigureAgentQueueModes() async {
+        let provider = FauxProvider()
+        let model = await provider.models[0]
+        let agent = Agent(state: AgentState(systemPrompt: "", model: model)) {
+            model, context, options in
+            await provider.stream(model: model, context: context, options: options)
+        }
+        var settings = Settings()
+        settings.steeringMode = .all
+        settings.followUpMode = .all
+
+        await ZetaCLI.configure(agent: agent, from: settings)
+
+        let steeringMode = await agent.steeringMode
+        let followUpMode = await agent.followUpMode
+        XCTAssertEqual(steeringMode, .all)
+        XCTAssertEqual(followUpMode, .all)
+    }
+
     func testRPCAutoCompactionRunsAfterThresholdCrossing() async throws {
         var model = Model(
             id: "compact", name: "Compact", api: "faux", provider: "faux",
-            baseURL: URL(string: "https://example.invalid")!, contextWindow: 100_000,
+            baseURL: URL(string: "https://example.invalid")!, contextWindow: 50_000,
             maximumTokens: 1_000
         )
-        model.contextWindow = 100_000
+        model.contextWindow = 50_000
         let provider = FauxProvider(models: [model])
         await provider.enqueue(
             AssistantMessage(
-                content: [.text(text: "answer")], api: model.api, provider: model.provider,
+                content: [.text(text: "summary")], api: model.api, provider: model.provider,
                 model: model.id, stopReason: .stop
             )
         )
         await provider.enqueue(
             AssistantMessage(
-                content: [.text(text: "summary")], api: model.api, provider: model.provider,
+                content: [.text(text: "answer")], api: model.api, provider: model.provider,
                 model: model.id, stopReason: .stop
             )
         )

@@ -63,6 +63,67 @@ final class ZetaConfigTests: XCTestCase {
         XCTAssertEqual(stored, credential)
     }
 
+    func testCredentialResolutionRejectsExpiredAndEmptyContent() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = try AuthStore(url: directory.appendingPathComponent("auth.json"))
+        try await store.set(
+            provider: "oauth",
+            credential: .oauth(
+                access: "expired-access",
+                refresh: "refresh",
+                expires: 99,
+                extras: [:]
+            )
+        )
+        let expired = try await store.resolveCredential(
+            provider: "oauth",
+            environment: [:],
+            fallbackVariables: [],
+            nowMilliseconds: 100
+        )
+        XCTAssertNil(expired.apiKey)
+        XCTAssertNil(expired.bearerToken)
+
+        try await store.set(
+            provider: "oauth",
+            credential: .oauth(
+                access: "   \n",
+                refresh: "refresh",
+                expires: 101,
+                extras: [:]
+            )
+        )
+        let blank = try await store.resolveCredential(
+            provider: "oauth",
+            environment: [:],
+            fallbackVariables: [],
+            nowMilliseconds: 100
+        )
+        XCTAssertNil(blank.bearerToken)
+
+        let fallback = try await store.resolveCredential(
+            provider: "oauth",
+            environment: ["OAUTH_KEY": "environment-key"],
+            fallbackVariables: ["OAUTH_KEY"],
+            nowMilliseconds: 100
+        )
+        XCTAssertEqual(fallback.apiKey, "environment-key")
+        XCTAssertNil(fallback.bearerToken)
+
+        try await store.set(
+            provider: "empty",
+            credential: .apiKey(key: "", environment: ["EMPTY_KEY": ""])
+        )
+        let empty = try await store.resolveCredential(
+            provider: "empty",
+            environment: [:],
+            fallbackVariables: ["EMPTY_KEY"]
+        )
+        XCTAssertNil(empty.apiKey)
+        XCTAssertNil(empty.bearerToken)
+    }
+
     func testCredentialKindsDoNotExposeSecretsInList() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let store = try AuthStore(url: directory.appendingPathComponent("auth.json"))

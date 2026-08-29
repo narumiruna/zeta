@@ -48,6 +48,37 @@ final class ZetaUnixTransportTests: XCTestCase {
         )
     }
 
+    func testWriteAfterPeerDisconnectReturnsErrorWithoutSIGPIPE() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let path = directory.appendingPathComponent("disconnect.sock").path
+        let connectionBox = ConnectionBox()
+        let listener = try UnixServerListener(path: path) { connection in
+            Task { await connectionBox.set(connection) }
+        }
+        let client = try UnixByteTransport(
+            path: path,
+            handlers: ByteTransportHandlers(onData: { _ in }, onClose: {}, onError: { _ in }))
+        let serverConnection = await connectionBox.wait()
+
+        await client.close()
+        var writeError: Error?
+        for _ in 0..<100 {
+            do {
+                try await serverConnection.send(Data("after-close".utf8))
+                try await Task.sleep(for: .milliseconds(5))
+            } catch {
+                writeError = error
+                break
+            }
+        }
+
+        XCTAssertNotNil(writeError)
+        await serverConnection.close()
+        listener.close()
+    }
+
     func testRejectsOverlongPath() {
         XCTAssertThrowsError(try UnixServerListener(path: "/tmp/" + String(repeating: "x", count: 104)) { _ in })
     }

@@ -22,6 +22,36 @@ final class ZetaSessionsTests: XCTestCase {
         XCTAssertEqual(context.messages.count, 2)
     }
 
+    func testLoadedSessionAppendsAssistantWithoutRewritingExistingJSONL() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let file = directory.appendingPathComponent("session.jsonl")
+        let original = """
+            {"type":"session","version":3,"id":"existing","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp"}
+            not valid json
+
+            """
+        try Data(original.utf8).write(to: file)
+        let manager = try SessionManager.load(file: file)
+        let assistant = AssistantMessage(
+            content: [.text(text: "appended")], api: "faux", provider: "faux", model: "faux", stopReason: .stop,
+            timestamp: 1)
+        try await manager.append(
+            .message(
+                SessionEntryBase(id: "00000001", parentId: nil, timestamp: "2026-01-01T00:00:01Z"),
+                .assistant(assistant)
+            )
+        )
+
+        let persisted = try Data(contentsOf: file)
+        XCTAssertTrue(persisted.starts(with: Data(original.utf8)))
+        XCTAssertTrue(String(decoding: persisted, as: UTF8.self).contains("not valid json\n"))
+        let reloaded = try SessionManager.load(file: file)
+        let entries = await reloaded.allEntries()
+        XCTAssertEqual(entries.map(\.base.id), ["00000001"])
+    }
+
     func testV1MigrationForkCloneAndNewlineRepair() async throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString)
@@ -38,7 +68,14 @@ final class ZetaSessionsTests: XCTestCase {
         XCTAssertEqual(entries.count, 2)
         XCTAssertNil(entries[0].base.parentId)
         XCTAssertEqual(entries[1].base.parentId, entries[0].base.id)
-        XCTAssertEqual(try Data(contentsOf: file).last, 0x0A)
+        let migratedData = try Data(contentsOf: file)
+        XCTAssertEqual(migratedData.last, 0x0A)
+        let migratedObjects = try migratedData.split(separator: 0x0A).map {
+            try XCTUnwrap(JSONSerialization.jsonObject(with: Data($0)) as? [String: Any])
+        }
+        XCTAssertEqual(migratedObjects[0]["version"] as? Int, currentCodingSessionVersion)
+        XCTAssertEqual(migratedObjects[1]["id"] as? String, entries[0].base.id)
+        XCTAssertEqual(migratedObjects[2]["parentId"] as? String, entries[0].base.id)
 
         let fork = try await manager.fork(
             header: SessionHeader(

@@ -104,7 +104,7 @@ Initial outcome: Actionable and not yet addressed.
 
 Final outcome: Addressed by retaining the active shell task and awaiting its process-group cancellation before acknowledgement.
 
-Evidence: `testAbortBashWaitsForActiveCommandCancellation` verifies prompt cancellation, a failed original request, and no leaked test process.
+Evidence: `testAbortBashWaitsForActiveCommandCancellation` verifies prompt cancellation, nonzero or cancelled original settlement, and no leaked test process.
 
 ### `3883403848`
 
@@ -239,6 +239,210 @@ Initial outcome: Actionable and not yet addressed.
 Final outcome: Addressed by applying `MessageTransforms.forModel` immediately before every provider stream call with the current model.
 
 Evidence: `testProviderMessageTransformUsesModelChangedAfterAgentCreation` verifies a post-construction model change transforms the next request.
+
+## Second-round inline feedback
+
+### `3885424957`
+
+Concern: RPC model changes retain the startup provider and credential transport.
+
+Initial outcome: Actionable and not yet addressed.
+
+Final outcome: Addressed by model-keyed per-request transport and credential dispatch in `Sources/ZetaCLI/ProviderStream.swift`.
+
+Evidence: `testModelDispatcherUsesEachRequestModelAndTransport` verifies HTTP, Codex, and Bedrock selection after model changes.
+
+### `3885424963`
+
+Concern: Rejected switch, fork, and clone operations can mutate persistence before the agent rejects them.
+
+Initial outcome: Actionable and not yet addressed.
+
+Final outcome: Addressed by reserving a session-mutation gate and checking agent idleness before manager mutation.
+
+Evidence: `testSessionMutationsRejectBeforeChangingManagerWhileBusy` verifies the persistent file and messages remain unchanged.
+
+### `3885424969`
+
+Concern: Interactive `/new` does not rotate the persistent session.
+
+Initial outcome: Actionable and not yet addressed.
+
+Final outcome: Addressed by creating and selecting a new persistent session after the old run settles.
+
+Evidence: `testInteractiveNewSessionRotatesPersistentFile` verifies distinct durable paths.
+
+### `3885424976`
+
+Concern: Vertex ADC bearer credentials are not connected to request authorization.
+
+Initial outcome: Actionable and not yet addressed.
+
+Final outcome: Addressed by resolving Vertex API-key and bearer modes for each request and applying their distinct headers.
+
+Evidence: Vertex regressions verify API keys, pre-issued ADC tokens, authorized-user refresh exchange, and bearer request headers.
+
+### `3885424977`
+
+Concern: RPC decoding accepts fields outside each command schema.
+
+Initial outcome: Actionable and not yet addressed.
+
+Final outcome: Addressed by strict command-specific `JSONSchema` validation with forbidden additional properties.
+
+Evidence: `testStrictRPCRejectsCommandSpecificUnknownAndInvalidFields` covers misspellings, unknown fields, invalid enums, and missing required fields.
+
+### `3885424979`
+
+Concern: Gemini streamed function-call parts are ignored.
+
+Initial outcome: Actionable and not yet addressed.
+
+Final outcome: Addressed by iterating every candidate part and reducing text, thinking, and function calls independently.
+
+Evidence: `testProviderEventReducerDecodesEveryGeminiPart` verifies parallel calls, arguments, signatures, usage, and stop reasons.
+
+### `3885424982`
+
+Concern: Concurrent client lease acquisition can suspend before reserving ownership.
+
+Initial outcome: Actionable and not yet addressed.
+
+Final outcome: Addressed by reserving ownership first and coalescing in-flight attachment operations.
+
+Evidence: The concurrent shared and mixed exclusive/shared lease regressions verify one attach and stable ownership.
+
+### `3885424989`
+
+Concern: Unix transport writes can terminate the process with `SIGPIPE`.
+
+Initial outcome: Actionable and not yet addressed.
+
+Final outcome: Addressed by setting `SO_NOSIGPIPE` on created, probed, listening, and accepted sockets.
+
+Evidence: `testWriteAfterPeerDisconnectReturnsErrorWithoutSIGPIPE` verifies process survival and a surfaced transport error.
+
+### `3885424992`
+
+Concern: Coding-agent sessions should reject every malformed complete JSONL record.
+
+Initial outcome: Incorrect and conflicting with the pinned compatibility contract.
+
+Final outcome: No behavior change was made because coding-agent version 3 deliberately skips malformed records.
+
+Evidence: Pinned `packages/coding-agent/src/core/session-manager.ts` lines 303 through 310 and 503 through 509 explicitly skip malformed lines.
+
+Evidence: Pinned `packages/coding-agent/test/session-manager/file-operations.test.ts` verifies malformed-only, mixed valid and malformed, and malformed-tail behavior.
+
+### `3885424995`
+
+Concern: Any terminating tool result should stop a mixed parallel batch.
+
+Initial outcome: Incorrect and conflicting with the pinned compatibility contract.
+
+Final outcome: No behavior change was made because the pinned agent stops only when every finalized result terminates.
+
+Evidence: Pinned `packages/agent/src/agent-loop.ts` lines 580 through 581 use `every`, and `agent-loop.test.ts` verifies mixed batches continue.
+
+### `3885425000`
+
+Concern: Startup ignores configured steering and follow-up modes.
+
+Initial outcome: Actionable and not yet addressed.
+
+Final outcome: Addressed by applying both settings while configuring the agent.
+
+Evidence: `testStartupSettingsConfigureAgentQueueModes` verifies both modes become `all`.
+
+### `3885425004`
+
+Concern: Usage records do not update SQLite session aggregates.
+
+Initial outcome: Actionable and not yet addressed.
+
+Final outcome: Addressed by parsing and applying cached, uncached, total-token, and cost deltas in the record transaction.
+
+Evidence: SQLite usage regressions verify aggregates and rollback of records, sequence allocation, and statistics on malformed or missing state.
+
+### `3885425006`
+
+Concern: Existing coding-agent sessions rewrite all JSONL for each assistant entry.
+
+Initial outcome: Actionable and not yet addressed.
+
+Final outcome: Addressed by normal append after materialization while preserving first-assistant delayed creation and migration rewrites.
+
+Evidence: `testLoadedSessionAppendsAssistantWithoutRewritingExistingJSONL` verifies prior bytes remain unchanged and malformed compatibility records are preserved.
+
+### `3885425012`
+
+Concern: Server mutations do not publish snapshots to other attached clients.
+
+Initial outcome: Actionable and not yet addressed.
+
+Final outcome: Addressed by broadcasting authoritative `session_snapshot` events after every runtime mutation.
+
+Evidence: Server regressions verify all attached clients receive snapshots and one failed send does not fail the mutation or other clients.
+
+### `3885425013`
+
+Concern: Agent abort does not cancel independent provider producers.
+
+Initial outcome: Actionable and not yet addressed.
+
+Final outcome: Addressed by stream termination plumbing, producer-task attachment, and explicit provider cancellation.
+
+Evidence: `testAbortCancelsProviderProducerAndDoesNotWaitForResult` verifies prompt settlement and producer cancellation without a terminal provider event.
+
+### `3885425016`
+
+Concern: Harness `findEntries(afterSequence:)` uses the reverse comparison.
+
+Initial outcome: Actionable and not yet addressed.
+
+Final outcome: Addressed by the forward exclusive `sequence > afterSequence` predicate.
+
+Evidence: `testFindEntriesAfterSequenceUsesForwardExclusiveBound` verifies incremental retrieval.
+
+### `3885425018`
+
+Concern: Compaction sums cumulative request usage for each assistant message.
+
+Initial outcome: Actionable and not yet addressed.
+
+Final outcome: Addressed by estimating assistant output or content rather than cumulative input history.
+
+Evidence: `testAssistantEstimatesDoNotSumCumulativeRequestUsage` verifies linear per-message estimates.
+
+### `3885425021`
+
+Concern: Thinking-level changes are not persisted.
+
+Initial outcome: Actionable and not yet addressed.
+
+Final outcome: Addressed by appending thinking-level session entries before RPC and interactive acknowledgement.
+
+Evidence: `testThinkingCommandsPersistToSessionTranscript` verifies restore behavior.
+
+### `3885425025`
+
+Concern: Non-finite temperatures trap through forced `JSONNumber` creation.
+
+Initial outcome: Actionable and not yet addressed.
+
+Final outcome: Addressed by validating finiteness and propagating throwing number conversion in every provider payload branch.
+
+Evidence: `testProviderPayloadsRejectNonFiniteTemperatures` covers NaN and both infinities across provider families.
+
+### `3885425029`
+
+Concern: Auth check reports invalid OAuth credentials as ready.
+
+Initial outcome: Actionable and not yet addressed.
+
+Final outcome: Addressed by sharing runtime credential resolution and checking expiry and nonempty content.
+
+Evidence: Auth and CLI readiness regressions cover expired OAuth, blank values, environment fallback, and valid OAuth.
 
 ## Check feedback
 

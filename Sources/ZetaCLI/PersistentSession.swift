@@ -135,6 +135,19 @@ actor PersistentSessionController {
         )
     }
 
+    func recordThinkingLevel(_ level: ThinkingLevel) async throws {
+        if try await manager.context().thinkingLevel == level {
+            return
+        }
+        let base = SessionEntryBase(
+            id: String(UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(8)).lowercased(),
+            parentId: await manager.leaf()?.base.id,
+            timestamp: ISO8601DateFormatter().string(from: Date())
+        )
+        try await manager.append(.thinkingLevelChange(base, level))
+        try await manager.materialize()
+    }
+
     func setName(_ name: String?) async throws {
         let base = SessionEntryBase(
             id: String(UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(8)).lowercased(),

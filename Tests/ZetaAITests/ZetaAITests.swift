@@ -302,6 +302,38 @@ final class ZetaAITests: XCTestCase {
         XCTAssertEqual(jsonPath(payload, "tools", "0", "function", "strict"), true)
     }
 
+    func testProviderPayloadsRejectNonFiniteTemperatures() {
+        let apis = [
+            "openai-completions",
+            "openai-responses",
+            "anthropic-messages",
+            "google-generative-ai",
+            "bedrock-converse-stream",
+            "pi-messages",
+        ]
+        for api in apis {
+            let model = Model(
+                id: "model",
+                name: "Model",
+                api: api,
+                provider: "provider",
+                baseURL: URL(string: "https://example.com")!,
+                contextWindow: 100,
+                maximumTokens: 10
+            )
+            for temperature in [Double.nan, Double.infinity, -Double.infinity] {
+                XCTAssertThrowsError(
+                    try ProviderPayloadBuilder.build(
+                        model: model,
+                        context: Context(),
+                        options: StreamOptions(temperature: temperature)
+                    ),
+                    "Expected \(api) to reject \(temperature)"
+                )
+            }
+        }
+    }
+
     func testProviderEventReducerHandlesTextThinkingToolsAndUsage() throws {
         let model = Model(
             id: "model",
@@ -421,6 +453,101 @@ final class ZetaAITests: XCTestCase {
         XCTAssertEqual(second.id, "call-b")
         XCTAssertEqual(second.name, "write")
         XCTAssertEqual(second.arguments, ["path": "B"])
+    }
+
+    func testProviderEventReducerDecodesEveryGeminiPart() throws {
+        let model = Model(
+            id: "gemini",
+            name: "Gemini",
+            api: "google-generative-ai",
+            provider: "google",
+            baseURL: URL(string: "https://example.com")!,
+            contextWindow: 100,
+            maximumTokens: 10
+        )
+        var reducer = ProviderEventReducer(model: model)
+        let events = try reducer.consume([
+            "responseId": "response-1",
+            "candidates": .array([
+                [
+                    "content": [
+                        "parts": .array([
+                            [
+                                "text": "reason",
+                                "thought": true,
+                                "thoughtSignature": "thinking-signature",
+                            ],
+                            [
+                                "text": "answer",
+                                "thoughtSignature": "text-signature",
+                            ],
+                            [
+                                "functionCall": [
+                                    "id": "call-a",
+                                    "name": "read",
+                                    "args": ["path": "A"],
+                                ],
+                                "thoughtSignature": "tool-signature",
+                            ],
+                            [
+                                "functionCall": [
+                                    "name": "write",
+                                    "args": ["path": "B"],
+                                ]
+                            ],
+                        ])
+                    ],
+                    "finishReason": "STOP",
+                ]
+            ]),
+            "usageMetadata": [
+                "promptTokenCount": 10,
+                "cachedContentTokenCount": 3,
+                "candidatesTokenCount": 4,
+                "thoughtsTokenCount": 2,
+                "totalTokenCount": 16,
+            ],
+        ])
+
+        XCTAssertEqual(
+            events.filter { if case .toolCallStart = $0 { true } else { false } }.count,
+            2
+        )
+        XCTAssertEqual(
+            events.filter { if case .toolCallDelta = $0 { true } else { false } }.count,
+            2
+        )
+        XCTAssertEqual(
+            events.filter { if case .toolCallEnd = $0 { true } else { false } }.count,
+            2
+        )
+        XCTAssertEqual(reducer.partial.content.count, 4)
+        XCTAssertEqual(
+            reducer.partial.content[0],
+            .thinking(text: "reason", signature: "thinking-signature")
+        )
+        XCTAssertEqual(
+            reducer.partial.content[1],
+            .text(text: "answer", signature: "text-signature")
+        )
+        guard case .toolCall(let first) = reducer.partial.content[2],
+            case .toolCall(let second) = reducer.partial.content[3]
+        else {
+            return XCTFail("Expected parallel Gemini tool calls")
+        }
+        XCTAssertEqual(first.id, "call-a")
+        XCTAssertEqual(first.name, "read")
+        XCTAssertEqual(first.arguments, ["path": "A"])
+        XCTAssertEqual(first.thoughtSignature, "tool-signature")
+        XCTAssertEqual(second.name, "write")
+        XCTAssertEqual(second.arguments, ["path": "B"])
+        XCTAssertEqual(reducer.partial.responseId, "response-1")
+        XCTAssertEqual(reducer.partial.stopReason, .toolUse)
+        XCTAssertEqual(reducer.partial.usage.input, 7)
+        XCTAssertEqual(reducer.partial.usage.output, 6)
+        XCTAssertEqual(reducer.partial.usage.cacheRead, 3)
+        XCTAssertEqual(reducer.partial.usage.reasoning, 2)
+        XCTAssertEqual(reducer.partial.usage.totalTokens, 16)
     }
 
     func testProviderEventReducerPreservesAnthropicThinkingMetadata() throws {

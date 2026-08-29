@@ -45,11 +45,20 @@ public enum PiClientError: Error, LocalizedError, Sendable {
 }
 
 public actor PiClient {
+    private struct AttachmentOperation {
+        let token: UUID
+        let task: Task<Void, Error>
+    }
+    private struct DetachmentOperation {
+        let token: UUID
+        let task: Task<Void, Error>
+    }
     private struct LeaseBook {
         var exclusive: UUID?
         var shared: Set<UUID> = []
         var attached = false
-        var detaching = false
+        var attachment: AttachmentOperation?
+        var detachment: DetachmentOperation?
     }
     private var generation: UInt64 = 0
     private var disposed = false
@@ -178,51 +187,136 @@ public actor PiClient {
     fileprivate func release(sessionID: String, leaseID: UUID, explicit: Bool) async throws {
         guard var book = leases[sessionID] else { return }
         let wasExclusive = book.exclusive == leaseID
-        let wasShared = book.shared.remove(leaseID) != nil
+        let wasShared = book.shared.contains(leaseID)
         guard wasExclusive || wasShared else { return }
-        if wasExclusive { book.exclusive = nil }
-        let isFinal = book.exclusive == nil && book.shared.isEmpty
-        leases[sessionID] = book
+        let isFinal =
+            (wasExclusive && book.shared.isEmpty) || (wasShared && book.exclusive == nil && book.shared.count == 1)
         guard isFinal, book.attached, stateValue == .connected else {
-            if isFinal { leases[sessionID] = nil }
+            removeLease(leaseID, from: &book)
+            if book.exclusive == nil && book.shared.isEmpty && !book.attached {
+                leases[sessionID] = nil
+            } else {
+                leases[sessionID] = book
+            }
             return
         }
+
+        let operation: DetachmentOperation
+        if let existing = book.detachment {
+            operation = existing
+        } else {
+            let token = UUID()
+            let task = Task { try await self.performDetachment(sessionID: sessionID, token: token) }
+            operation = DetachmentOperation(token: token, task: task)
+            book.detachment = operation
+            leases[sessionID] = book
+        }
         do {
-            guard case .success(_, .detach) = try await request(.detach(sessionID: sessionID)) else {
-                throw PiClientError.protocolFailure("Unexpected detach result")
-            }
-            leases[sessionID] = nil
-        } catch {
-            if explicit {
-                if wasExclusive { book.exclusive = leaseID } else { book.shared.insert(leaseID) }
-                leases[sessionID] = book
-            } else {
+            try await operation.task.value
+            guard var current = leases[sessionID] else { return }
+            removeLease(leaseID, from: &current)
+            if current.exclusive == nil && current.shared.isEmpty && !current.attached && current.attachment == nil {
                 leases[sessionID] = nil
+            } else {
+                leases[sessionID] = current
+            }
+        } catch {
+            if !explicit, var current = leases[sessionID] {
+                removeLease(leaseID, from: &current)
+                leases[sessionID] = current
             }
             throw error
         }
     }
 
     private func reserveLease(sessionID: String, mode: LeaseMode, alreadyAttached: Bool) async throws -> SessionLease {
+        let id = UUID()
         var book = leases[sessionID] ?? LeaseBook()
-        guard !book.detaching else { throw PiClientError.detached }
         switch mode {
         case .exclusive: guard book.exclusive == nil, book.shared.isEmpty else { throw PiClientError.ownership }
         case .shared: guard book.exclusive == nil else { throw PiClientError.ownership }
         }
-        if !book.attached && !alreadyAttached {
+        if mode == .exclusive { book.exclusive = id } else { book.shared.insert(id) }
+        if alreadyAttached { book.attached = true }
+        leases[sessionID] = book
+
+        do {
+            if !alreadyAttached { try await ensureAttached(sessionID) }
+            return SessionLease(id: id, sessionID: sessionID, mode: mode, client: self)
+        } catch {
+            if var current = leases[sessionID] {
+                removeLease(id, from: &current)
+                if current.exclusive == nil && current.shared.isEmpty && !current.attached && current.attachment == nil
+                {
+                    leases[sessionID] = nil
+                } else {
+                    leases[sessionID] = current
+                }
+            }
+            throw error
+        }
+    }
+
+    private func ensureAttached(_ sessionID: String) async throws {
+        guard var book = leases[sessionID] else { throw PiClientError.detached }
+        if book.attached, book.detachment == nil { return }
+        let operation: AttachmentOperation
+        if let existing = book.attachment {
+            operation = existing
+        } else {
+            let token = UUID()
+            let task = Task { try await self.performAttachment(sessionID: sessionID, token: token) }
+            operation = AttachmentOperation(token: token, task: task)
+            book.attachment = operation
+            leases[sessionID] = book
+        }
+        try await operation.task.value
+    }
+
+    private func performAttachment(sessionID: String, token: UUID) async throws {
+        if let detachment = leases[sessionID]?.detachment { try? await detachment.task.value }
+        guard let operation = leases[sessionID]?.attachment, operation.token == token else {
+            throw PiClientError.detached
+        }
+        if leases[sessionID]?.attached == true {
+            leases[sessionID]?.attachment = nil
+            return
+        }
+        do {
             guard case .success(_, .attach(let snapshot)) = try await request(.attach(sessionID: sessionID)) else {
                 throw PiClientError.protocolFailure("Unexpected attach result")
             }
+            guard var book = leases[sessionID], book.attachment?.token == token else {
+                throw PiClientError.detached
+            }
             sessionSnapshots[sessionID] = snapshot
             book.attached = true
-        } else if alreadyAttached {
-            book.attached = true
+            book.attachment = nil
+            leases[sessionID] = book
+        } catch {
+            if leases[sessionID]?.attachment?.token == token { leases[sessionID]?.attachment = nil }
+            throw error
         }
-        let id = UUID()
-        if mode == .exclusive { book.exclusive = id } else { book.shared.insert(id) }
-        leases[sessionID] = book
-        return SessionLease(id: id, sessionID: sessionID, mode: mode, client: self)
+    }
+
+    private func performDetachment(sessionID: String, token: UUID) async throws {
+        do {
+            guard case .success(_, .detach) = try await request(.detach(sessionID: sessionID)) else {
+                throw PiClientError.protocolFailure("Unexpected detach result")
+            }
+            guard var book = leases[sessionID], book.detachment?.token == token else { return }
+            book.attached = false
+            book.detachment = nil
+            leases[sessionID] = book
+        } catch {
+            if leases[sessionID]?.detachment?.token == token { leases[sessionID]?.detachment = nil }
+            throw error
+        }
+    }
+
+    private func removeLease(_ id: UUID, from book: inout LeaseBook) {
+        if book.exclusive == id { book.exclusive = nil }
+        book.shared.remove(id)
     }
 
     private func leaseIsActive(_ id: String) -> Bool {

@@ -22,6 +22,7 @@ public actor AssistantEventStream: AsyncSequence {
 
     private let stream: AsyncThrowingStream<AssistantEvent, Error>
     private let continuation: AsyncThrowingStream<AssistantEvent, Error>.Continuation
+    private nonisolated let producerTermination: ProducerTermination
     private var terminal: AssistantMessage?
     private var terminalWaiters: [CheckedContinuation<AssistantMessage, Never>] = []
     private var started = false
@@ -29,11 +30,27 @@ public actor AssistantEventStream: AsyncSequence {
 
     public init(bufferingPolicy: AsyncThrowingStream<AssistantEvent, Error>.Continuation.BufferingPolicy = .unbounded) {
         let pair = AsyncThrowingStream<AssistantEvent, Error>.makeStream(bufferingPolicy: bufferingPolicy)
+        let producerTermination = ProducerTermination()
         stream = pair.stream
         continuation = pair.continuation
+        self.producerTermination = producerTermination
+        pair.continuation.onTermination = { termination in
+            switch termination {
+            case .cancelled:
+                producerTermination.cancel()
+            case .finished:
+                producerTermination.complete()
+            @unknown default:
+                producerTermination.cancel()
+            }
+        }
     }
 
     public nonisolated func makeAsyncIterator() -> AsyncIterator { stream.makeAsyncIterator() }
+
+    public nonisolated func attachProducer(_ task: Task<Void, Never>) {
+        producerTermination.attach(task)
+    }
 
     public func emit(_ event: AssistantEvent) {
         guard !finished else { return }
@@ -78,7 +95,14 @@ public actor AssistantEventStream: AsyncSequence {
     }
 
     public func cancel(api: String, provider: String, model: String) {
-        failBeforeStart(api: api, provider: provider, model: model, error: CancellationError(), aborted: true)
+        producerTermination.cancel()
+        failBeforeStart(
+            api: api,
+            provider: provider,
+            model: model,
+            error: CancellationError(),
+            aborted: true
+        )
     }
 
     private func settle(_ message: AssistantMessage, event: AssistantEvent) {
@@ -93,6 +117,39 @@ public actor AssistantEventStream: AsyncSequence {
     private func finishProtocolError(_ text: String) {
         finished = true
         continuation.finish(throwing: StreamProtocolError(text))
+    }
+}
+
+private final class ProducerTermination: @unchecked Sendable {
+    private let lock = NSLock()
+    private var producer: Task<Void, Never>?
+    private var terminated = false
+
+    func attach(_ task: Task<Void, Never>) {
+        lock.lock()
+        if terminated {
+            lock.unlock()
+            task.cancel()
+        } else {
+            producer = task
+            lock.unlock()
+        }
+    }
+
+    func cancel() {
+        lock.lock()
+        terminated = true
+        let task = producer
+        producer = nil
+        lock.unlock()
+        task?.cancel()
+    }
+
+    func complete() {
+        lock.lock()
+        terminated = true
+        producer = nil
+        lock.unlock()
     }
 }
 
@@ -239,7 +296,7 @@ public struct FauxProvider: AIProvider {
             ?? AssistantMessage(
                 api: model.api, provider: id, model: model.id, stopReason: .error,
                 errorMessage: "No more faux responses queued")
-        Task {
+        let producer = Task {
             var partial = AssistantMessage(api: model.api, provider: id, model: model.id)
             await stream.emit(.start(partial))
             for block in response.content {
@@ -286,6 +343,7 @@ public struct FauxProvider: AIProvider {
                 await stream.emit(.done(reason: response.stopReason, message: response))
             }
         }
+        stream.attachProducer(producer)
         return stream
     }
 }

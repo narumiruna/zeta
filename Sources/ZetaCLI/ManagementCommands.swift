@@ -96,16 +96,16 @@ extension ZetaCLI {
         switch command {
         case "check":
             let stored = await store.read(provider: provider)
-            let variables = BuiltinProviderFactory.environmentVariables[provider] ?? []
-            let environmentReady = variables.contains {
-                ProcessInfo.processInfo.environment[$0]?.isEmpty == false
-            }
-            let ready = stored != nil || environmentReady
+            let ready = await CLIProviderAuthenticationResolver.isReady(
+                provider: provider,
+                store: store,
+                environment: ProcessInfo.processInfo.environment
+            )
             if arguments.contains("--json") {
                 let value: [String: Any] = [
                     "provider": provider,
                     "ready": ready,
-                    "credentialType": stored?.kind as Any,
+                    "credentialType": stored.map { $0.kind as Any } ?? NSNull(),
                 ]
                 let data = try JSONSerialization.data(
                     withJSONObject: value,

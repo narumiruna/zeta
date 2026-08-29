@@ -110,6 +110,7 @@ Regenerate it with `uv run python scripts/generate-api-docs.py`.
 | `init(url:)` | Initializer |
 | `allModels()` | Instance Method |
 | `allProviders()` | Instance Method |
+| `attachProducer(_:)` | Instance Method |
 | `callCount()` | Instance Method |
 | `calls()` | Instance Method |
 | `cancel(api:provider:model:)` | Instance Method |
@@ -384,6 +385,8 @@ Regenerate it with `uv run python scripts/generate-api-docs.py`.
 | --- | --- |
 | `AWSSignatureError.invalidURL` | Case |
 | `AWSSignatureError.missingHost` | Case |
+| `CredentialResolverError.invalidTokenResponse` | Case |
+| `CredentialResolverError.unsupportedServiceAccount` | Case |
 | `DeviceTokenPollResult.authorized(_:)` | Case |
 | `DeviceTokenPollResult.denied(_:)` | Case |
 | `DeviceTokenPollResult.pending` | Case |
@@ -399,6 +402,7 @@ Regenerate it with `uv run python scripts/generate-api-docs.py`.
 | `AWSSignatureError` | Enumeration |
 | `AWSSignatureV4` | Enumeration |
 | `CredentialResolver` | Enumeration |
+| `CredentialResolverError` | Enumeration |
 | `DeviceTokenPollResult` | Enumeration |
 | `OAuthError` | Enumeration |
 | `init()` | Initializer |
@@ -454,6 +458,7 @@ Regenerate it with `uv run python scripts/generate-api-docs.py`.
 | `random()` | Type Method |
 | `sign(request:body:service:region:credential:date:)` | Type Method |
 | `vertex(explicitAPIKey:environment:)` | Type Method |
+| `vertexAccessAuthentication(explicitAPIKey:environment:session:)` | Type Method |
 
 ## ZetaBedrock
 
@@ -635,6 +640,7 @@ Regenerate it with `uv run python scripts/generate-api-docs.py`.
 | `TrustDecision` | Enumeration |
 | `withAdvisoryFileLock(url:operation:)` | Function |
 | `init()` | Initializer |
+| `init(apiKey:bearerToken:environment:)` | Initializer |
 | `init(from:)` | Initializer |
 | `init(home:workingDirectory:environment:)` | Initializer |
 | `init(paths:includeProject:)` | Initializer |
@@ -650,18 +656,22 @@ Regenerate it with `uv run python scripts/generate-api-docs.py`.
 | `modify(_:)` | Instance Method |
 | `read(provider:)` | Instance Method |
 | `resolveAPIKey(provider:environment:fallbackVariables:)` | Instance Method |
+| `resolveCredential(provider:environment:fallbackVariables:nowMilliseconds:)` | Instance Method |
 | `set(_:for:)` | Instance Method |
 | `set(provider:credential:)` | Instance Method |
 | `agentDirectory` | Instance Property |
+| `apiKey` | Instance Property |
 | `auth` | Instance Property |
 | `autocompleteMaxVisible` | Instance Property |
 | `baseDelayMs` | Instance Property |
+| `bearerToken` | Instance Property |
 | `blockImages` | Instance Property |
 | `compaction` | Instance Property |
 | `defaultProjectTrust` | Instance Property |
 | `editorPadding` | Instance Property |
 | `enableInstallTelemetry` | Instance Property |
 | `enabled` | Instance Property |
+| `environment` | Instance Property |
 | `followUpMode` | Instance Property |
 | `fullscreenCopyOnSelect` | Instance Property |
 | `fullscreenExit` | Instance Property |
@@ -688,6 +698,7 @@ Regenerate it with `uv run python scripts/generate-api-docs.py`.
 | `tuiMode` | Instance Property |
 | `workingDirectory` | Instance Property |
 | `CompactionSettings` | Structure |
+| `ResolvedStoredCredential` | Structure |
 | `RetrySettings` | Structure |
 | `Settings` | Structure |
 | `ZetaPaths` | Structure |

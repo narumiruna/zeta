@@ -19,6 +19,8 @@ public actor CLIRPCRuntime {
     private var promptRunID: UUID?
     private var queuedPrompts: [UserMessage] = []
     private var activeBash: (id: UUID, task: Task<ShellResult, Error>)?
+    private var sessionMutationInProgress = false
+    private var compactionInProgress = false
 
     init(
         agent: Agent,
@@ -54,6 +56,9 @@ public actor CLIRPCRuntime {
     private func execute(_ request: StrictRPCRequest) async throws -> JSONValue? {
         switch request.command {
         case .prompt:
+            guard !sessionMutationInProgress, !compactionInProgress else {
+                throw AgentError.blocked("An agent operation is in progress")
+            }
             let message = UserMessage(try requiredString("message", request.fields))
             if promptTask != nil {
                 queuedPrompts.append(message)
@@ -86,6 +91,9 @@ public actor CLIRPCRuntime {
             await agent.clearQueues()
             return ["cleared": true]
         case .newSession:
+            guard !compactionInProgress else {
+                throw AgentError.blocked("Agent is busy")
+            }
             queuedPrompts.removeAll()
             promptTask?.cancel()
             await agent.abort()
@@ -134,6 +142,7 @@ public actor CLIRPCRuntime {
             guard let level = ThinkingLevel(rawValue: raw) else {
                 throw RPCProtocolError.invalidType
             }
+            try await session?.recordThinkingLevel(level)
             await agent.setThinkingLevel(level)
             return ["level": .string(raw)]
         case .cycleThinkingLevel:
@@ -141,6 +150,7 @@ public actor CLIRPCRuntime {
             let values = ThinkingLevel.allCases
             let current = values.firstIndex(of: state.thinkingLevel) ?? 0
             let next = values[(current + 1) % values.count]
+            try await session?.recordThinkingLevel(next)
             await agent.setThinkingLevel(next)
             return ["level": .string(next.rawValue)]
         case .getAvailableThinkingLevels:
@@ -154,6 +164,11 @@ public actor CLIRPCRuntime {
             await agent.setFollowUpMode(mode == "all" ? .all : .oneAtATime)
             return ["mode": .string(mode)]
         case .compact:
+            guard !sessionMutationInProgress, !compactionInProgress else {
+                throw AgentError.blocked("Agent is busy")
+            }
+            compactionInProgress = true
+            defer { compactionInProgress = false }
             let state = await agent.state()
             guard let preparation = Compaction.prepare(messages: state.messages) else {
                 return ["compacted": false]
@@ -235,18 +250,26 @@ public actor CLIRPCRuntime {
             return ["html": .string(html)]
         case .switchSession:
             guard let session else { return ["switched": false, "reason": "No persistent session selected"] }
-            let path = try requiredString("path", request.fields)
+            try await beginSessionMutation()
+            defer { sessionMutationInProgress = false }
+            let path = try requiredString("sessionPath", request.fields)
             let messages = try await session.switchTo(path: path)
             try await agent.setMessages(messages)
             return ["switched": true, "path": .string(path)]
         case .fork:
             guard let session else { return ["forked": false, "reason": "No persistent session selected"] }
-            let manager = try await session.fork(at: optionalString("entryId", request.fields))
+            try await beginSessionMutation()
+            defer { sessionMutationInProgress = false }
+            let manager = try await session.fork(
+                at: try requiredString("entryId", request.fields)
+            )
             let messages = try await manager.context().messages
             try await agent.setMessages(messages)
             return ["forked": true, "entries": .number(JSONNumber((await manager.allEntries()).count))]
         case .clone:
             guard let session else { return ["cloned": false, "reason": "No persistent session selected"] }
+            try await beginSessionMutation()
+            defer { sessionMutationInProgress = false }
             let manager = try await session.clone()
             let messages = try await manager.context().messages
             try await agent.setMessages(messages)
@@ -274,7 +297,7 @@ public actor CLIRPCRuntime {
             }.first
             return ["text": value.map(JSONValue.string) ?? .null]
         case .setSessionName:
-            sessionName = optionalString("name", request.fields)
+            sessionName = try requiredString("name", request.fields)
             try await session?.setName(sessionName)
             return ["name": sessionName.map(JSONValue.string) ?? .null]
         case .getCommands:
@@ -284,6 +307,17 @@ public actor CLIRPCRuntime {
 
     func waitForIdle() async {
         if let promptTask { await promptTask.value }
+    }
+
+    private func beginSessionMutation() async throws {
+        guard !sessionMutationInProgress, !compactionInProgress, promptTask == nil else {
+            throw AgentError.blocked("Agent is busy")
+        }
+        sessionMutationInProgress = true
+        guard !(await agent.state()).isStreaming else {
+            sessionMutationInProgress = false
+            throw AgentError.blocked("Agent is busy")
+        }
     }
 
     private func runPrompt(_ message: UserMessage, id: UUID) async {

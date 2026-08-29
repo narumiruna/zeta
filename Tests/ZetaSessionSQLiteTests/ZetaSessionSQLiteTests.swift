@@ -113,7 +113,13 @@ final class ZetaSessionSQLiteTests: XCTestCase {
             type: "usage",
             operationKind: nil,
             timestamp: 5,
-            payload: ["cause": "assistant"],
+            payload: [
+                "cause": "assistant",
+                "usage": [
+                    "input": 7, "output": 2, "cacheRead": 3, "cacheWrite": 4, "totalTokens": 16,
+                    "cost": ["input": 0.1, "output": 0.2, "cacheRead": 0.05, "cacheWrite": 0.15],
+                ],
+            ],
             lease: lease,
             now: 5
         )
@@ -137,10 +143,151 @@ final class ZetaSessionSQLiteTests: XCTestCase {
         XCTAssertEqual(records.count, 1)
         XCTAssertEqual(name, "Session")
         XCTAssertEqual(label, "bookmark")
-        XCTAssertEqual(stats.messageCount, 2)
+        XCTAssertEqual(
+            stats,
+            SQLiteSessionStats(
+                messageCount: 2,
+                cachedTokens: 3,
+                uncachedTokens: 11,
+                totalTokens: 16,
+                costTotal: 0.5
+            )
+        )
         try await repository.repairBranchCache(sessionID: "s")
         let integrity = try await repository.integrityCheck()
         XCTAssertEqual(integrity, "ok")
+    }
+
+    func testUsageRecordFailuresRollBackRecordSequenceAndStats() async throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("\(UUID().uuidString).sqlite")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let repository = try SQLiteSessionRepository(url: url)
+        try await repository.createSession(
+            SQLiteSessionMetadata(id: "valid", createdAt: 1, cwd: "/tmp")
+        )
+        let validLease = try await repository.acquireLease(
+            sessionID: "valid",
+            ownerID: "owner",
+            now: 1
+        )
+        do {
+            _ = try await repository.appendRecord(
+                sessionID: "valid",
+                id: "malformed",
+                lane: "main",
+                runID: nil,
+                type: "usage",
+                operationKind: nil,
+                timestamp: 2,
+                payload: ["cause": "adjustment"],
+                lease: validLease,
+                now: 2
+            )
+            XCTFail("Expected malformed usage rejection")
+        } catch {
+            XCTAssertEqual(
+                (error as? SQLiteRepositoryError)?.errorDescription,
+                "SQLite operation failed: Invalid usage record payload"
+            )
+        }
+        let emptyRecords = try await repository.records(sessionID: "valid")
+        let emptyStats = try await repository.stats(sessionID: "valid")
+        XCTAssertEqual(emptyRecords, [])
+        XCTAssertEqual(
+            emptyStats,
+            SQLiteSessionStats(
+                messageCount: 0,
+                cachedTokens: 0,
+                uncachedTokens: 0,
+                totalTokens: 0,
+                costTotal: 0
+            )
+        )
+
+        let payload: JSONValue = [
+            "cause": "adjustment",
+            "usage": [
+                "input": 7, "output": 2, "cacheRead": 3, "cacheWrite": 4, "totalTokens": 16,
+                "cost": ["input": 0.1, "output": 0.2, "cacheRead": 0.05, "cacheWrite": 0.15, "total": 0.5],
+            ],
+        ]
+        let committed = try await repository.appendRecord(
+            sessionID: "valid",
+            id: "usage",
+            lane: "main",
+            runID: nil,
+            type: "usage",
+            operationKind: nil,
+            timestamp: 3,
+            payload: payload,
+            lease: validLease,
+            now: 3
+        )
+        XCTAssertEqual(committed.sequence, 1)
+        let aggregateStats = try await repository.stats(sessionID: "valid")
+        XCTAssertEqual(
+            aggregateStats,
+            SQLiteSessionStats(
+                messageCount: 0,
+                cachedTokens: 3,
+                uncachedTokens: 11,
+                totalTokens: 16,
+                costTotal: 0.5
+            )
+        )
+
+        try await repository.createSession(
+            SQLiteSessionMetadata(id: "corrupt", createdAt: 4, cwd: "/tmp")
+        )
+        let corruptLease = try await repository.acquireLease(
+            sessionID: "corrupt",
+            ownerID: "owner",
+            now: 4
+        )
+        try executeSQL(
+            "DELETE FROM session_stats WHERE session_id='corrupt'",
+            at: url
+        )
+        do {
+            _ = try await repository.appendRecord(
+                sessionID: "corrupt",
+                id: "rolled-back",
+                lane: "main",
+                runID: nil,
+                type: "usage",
+                operationKind: nil,
+                timestamp: 5,
+                payload: payload,
+                lease: corruptLease,
+                now: 5
+            )
+            XCTFail("Expected missing statistics rejection")
+        } catch {
+            XCTAssertEqual(
+                (error as? SQLiteRepositoryError)?.errorDescription,
+                "SQLite operation failed: Missing session statistics"
+            )
+        }
+        let corruptRecords = try await repository.records(sessionID: "corrupt")
+        XCTAssertEqual(corruptRecords, [])
+        try executeSQL(
+            "INSERT INTO session_stats VALUES('corrupt',0,0,0,0,0)",
+            at: url
+        )
+        let retried = try await repository.appendRecord(
+            sessionID: "corrupt",
+            id: "retried",
+            lane: "main",
+            runID: nil,
+            type: "usage",
+            operationKind: nil,
+            timestamp: 6,
+            payload: payload,
+            lease: corruptLease,
+            now: 6
+        )
+        XCTAssertEqual(retried.sequence, 1)
     }
 
     func testBranchAndTreeForksReassignSequencesAndDeleteExplicitly() async throws {
@@ -272,5 +419,16 @@ final class ZetaSessionSQLiteTests: XCTestCase {
             _ = try await repository.renew(old, now: 12)
             XCTFail("Expected stale lease")
         } catch {}
+    }
+
+    private func executeSQL(_ sql: String, at url: URL) throws {
+        var database: OpaquePointer?
+        guard sqlite3_open(url.path, &database) == SQLITE_OK, let database else {
+            throw SQLiteRepositoryError.open("test database")
+        }
+        defer { sqlite3_close(database) }
+        guard sqlite3_exec(database, sql, nil, nil, nil) == SQLITE_OK else {
+            throw SQLiteRepositoryError.execute(String(cString: sqlite3_errmsg(database)))
+        }
     }
 }

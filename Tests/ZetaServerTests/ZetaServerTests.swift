@@ -41,6 +41,107 @@ final class ZetaServerTests: XCTestCase {
         await server.close()
     }
 
+    func testMutationsBroadcastAuthoritativeSnapshotsToEveryAttachedClient() async throws {
+        let server = try PiServer(serverID: "server", service: TestService())
+        let first = TestConnection(id: "first")
+        let second = TestConnection(id: "second")
+        try await server.accept(first)
+        try await server.accept(second)
+        await server.receive(try encodeClientMessage(.hello(try ClientHello())), connectionID: first.id)
+        await server.receive(try encodeClientMessage(.hello(try ClientHello())), connectionID: second.id)
+        try await waitUntil {
+            let firstReady = await first.count >= 1
+            let secondReady = await second.count >= 1
+            return firstReady && secondReady
+        }
+        let firstAttach = try RequestEnvelope(id: "attach-first", request: .attach(sessionID: "shared"))
+        let secondAttach = try RequestEnvelope(id: "attach-second", request: .attach(sessionID: "shared"))
+        await server.receive(try encodeClientMessage(.request(firstAttach)), connectionID: first.id)
+        await server.receive(try encodeClientMessage(.request(secondAttach)), connectionID: second.id)
+        try await waitUntil {
+            let firstAttached = await first.count >= 2
+            let secondAttached = await second.count >= 2
+            return firstAttached && secondAttached
+        }
+
+        let commands: [Command] = [
+            .prompt(sessionID: "shared", text: "prompt"),
+            .steer(sessionID: "shared", text: "steer"),
+            .abort(sessionID: "shared"),
+            .setModel(sessionID: "shared", model: try ModelReference(provider: "test", id: "next")),
+            .setThinking(sessionID: "shared", thinkingLevel: .high),
+        ]
+        for (offset, command) in commands.enumerated() {
+            let requestID = "mutation-\(offset)"
+            let firstCount = await first.count
+            let secondCount = await second.count
+            let request = try RequestEnvelope(id: requestID, request: command)
+            await server.receive(try encodeClientMessage(.request(request)), connectionID: first.id)
+            try await waitUntil {
+                let firstReceived = await first.count >= firstCount + 2
+                let secondReceived = await second.count >= secondCount + 1
+                return firstReceived && secondReceived
+            }
+
+            let expectedRevision = Int64(offset + 1)
+            let firstMessages = try await decodedMessages(first)
+            let secondMessages = try await decodedMessages(second)
+            let firstSnapshot = firstMessages.compactMap(sessionEventSnapshot).last
+            let secondSnapshot = secondMessages.compactMap(sessionEventSnapshot).last
+            XCTAssertEqual(firstSnapshot?.revision, expectedRevision)
+            XCTAssertEqual(secondSnapshot?.revision, expectedRevision)
+            XCTAssertEqual(firstSnapshot?.attached, true)
+            XCTAssertEqual(secondSnapshot?.attached, true)
+            let mutationResponse = firstMessages.compactMap { responseSnapshot($0, id: requestID) }.last
+            XCTAssertEqual(mutationResponse?.revision, expectedRevision)
+            XCTAssertEqual(mutationResponse?.attached, true)
+        }
+        await server.close()
+    }
+
+    func testSnapshotBroadcastFailureDoesNotFailMutationOrOtherClients() async throws {
+        let server = try PiServer(serverID: "server", service: TestService())
+        let requester = TestConnection(id: "requester")
+        let failing = TestConnection(id: "failing")
+        try await server.accept(requester)
+        try await server.accept(failing)
+        await server.receive(try encodeClientMessage(.hello(try ClientHello())), connectionID: requester.id)
+        await server.receive(try encodeClientMessage(.hello(try ClientHello())), connectionID: failing.id)
+        try await waitUntil {
+            let requesterReady = await requester.count >= 1
+            let failingReady = await failing.count >= 1
+            return requesterReady && failingReady
+        }
+        await server.receive(
+            try encodeClientMessage(
+                .request(try RequestEnvelope(id: "attach-requester", request: .attach(sessionID: "shared")))),
+            connectionID: requester.id)
+        await server.receive(
+            try encodeClientMessage(
+                .request(try RequestEnvelope(id: "attach-failing", request: .attach(sessionID: "shared")))),
+            connectionID: failing.id)
+        try await waitUntil {
+            let requesterAttached = await requester.count >= 2
+            let failingAttached = await failing.count >= 2
+            return requesterAttached && failingAttached
+        }
+        await failing.setFailing(true)
+        let failingAttempts = await failing.sendAttempts
+
+        let request = try RequestEnvelope(id: "mutation", request: .abort(sessionID: "shared"))
+        await server.receive(try encodeClientMessage(.request(request)), connectionID: requester.id)
+        try await waitUntil {
+            let requesterReceived = await requester.count >= 4
+            let failingAttempted = await failing.sendAttempts > failingAttempts
+            return requesterReceived && failingAttempted
+        }
+
+        let messages = try await decodedMessages(requester)
+        XCTAssertEqual(messages.compactMap(sessionEventSnapshot).last?.revision, 1)
+        XCTAssertEqual(messages.compactMap { responseSnapshot($0, id: "mutation") }.last?.revision, 1)
+        await server.close()
+    }
+
     func testConcurrentAttachmentsShareOneRuntimeAndPreserveBothConnections() async throws {
         let tracker = RuntimeTracker()
         let service = CountingService(tracker: tracker)
@@ -79,15 +180,24 @@ final class ZetaServerTests: XCTestCase {
 }
 
 private actor TestConnection: ServerByteConnection {
+    private struct SendFailure: Error {}
+
     nonisolated let id: String
     private(set) var data: [Data] = []
     private(set) var isClosed = false
+    private(set) var sendAttempts = 0
+    private var failing = false
     var count: Int { data.count }
 
     init(id: String = "connection") { self.id = id }
 
-    func send(_ bytes: Data) async throws { data.append(bytes) }
-    func close() async { isClosed = true }
+    func send(_ bytes: Data) throws {
+        sendAttempts += 1
+        if failing { throw SendFailure() }
+        data.append(bytes)
+    }
+    func close() { isClosed = true }
+    func setFailing(_ value: Bool) { failing = value }
 }
 
 private struct TestService: PiServerService {
@@ -125,23 +235,51 @@ private actor RuntimeTracker {
 private actor TestRuntime: PiSessionRuntime {
     nonisolated let id: String
     private let tracker: RuntimeTracker?
+    private var revision: Int64 = 0
 
     init(id: String, tracker: RuntimeTracker? = nil) {
         self.id = id
         self.tracker = tracker
     }
     func snapshot(attached: Bool) throws -> SessionSnapshot { try makeSnapshot(attached: attached) }
-    func prompt(_ text: String) throws -> SessionSnapshot { try makeSnapshot(attached: true) }
-    func steer(_ text: String) throws -> SessionSnapshot { try makeSnapshot(attached: true) }
-    func abort() throws -> SessionSnapshot { try makeSnapshot(attached: true) }
-    func setModel(_ model: ModelReference) throws -> SessionSnapshot { try makeSnapshot(attached: true) }
-    func setThinking(_ level: ThinkingLevel) throws -> SessionSnapshot { try makeSnapshot(attached: true) }
+    func prompt(_ text: String) throws -> SessionSnapshot { try mutate() }
+    func steer(_ text: String) throws -> SessionSnapshot { try mutate() }
+    func abort() throws -> SessionSnapshot { try mutate() }
+    func setModel(_ model: ModelReference) throws -> SessionSnapshot { try mutate() }
+    func setThinking(_ level: ThinkingLevel) throws -> SessionSnapshot { try mutate() }
     func dispose() async { await tracker?.recordDispose() }
+    private func mutate() throws -> SessionSnapshot {
+        revision += 1
+        return try makeSnapshot(attached: false)
+    }
     private func makeSnapshot(attached: Bool) throws -> SessionSnapshot {
         try SessionSnapshot(
-            id: id, cwd: "/tmp", createdAt: 0, updatedAt: 0, phase: .idle,
+            id: id, cwd: "/tmp", createdAt: 0, updatedAt: revision, phase: .idle,
             model: ModelReference(provider: "test", id: "model"), thinkingLevel: .off, attached: attached,
-            locked: false, revision: 0, transcript: [], queuedSteer: [], queuedSteerCount: 0)
+            locked: false, revision: revision, transcript: [], queuedSteer: [], queuedSteerCount: 0)
+    }
+}
+
+private func decodedMessages(_ connection: TestConnection) async throws -> [ServerMessage] {
+    let decoder = try ServerMessageDecoder()
+    var messages: [ServerMessage] = []
+    for frame in await connection.data { messages.append(contentsOf: try decoder.push(frame)) }
+    return messages
+}
+
+private func sessionEventSnapshot(_ message: ServerMessage) -> SessionSnapshot? {
+    guard case .event(.sessionSnapshot(let snapshot)) = message else { return nil }
+    return snapshot
+}
+
+private func responseSnapshot(_ message: ServerMessage, id: String) -> SessionSnapshot? {
+    guard case .response(.success(let responseID, let result)) = message, responseID == id else { return nil }
+    switch result {
+    case .prompt(let snapshot), .steer(let snapshot), .abort(let snapshot), .setModel(let snapshot),
+        .setThinking(let snapshot):
+        return snapshot
+    default:
+        return nil
     }
 }
 

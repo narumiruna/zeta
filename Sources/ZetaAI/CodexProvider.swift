@@ -29,7 +29,7 @@ public struct CodexWebSocketProvider: AIProvider {
         options: StreamOptions
     ) async -> AssistantEventStream {
         let output = AssistantEventStream()
-        Task {
+        let producer = Task {
             do {
                 guard
                     let credential = options.apiKey
@@ -61,32 +61,36 @@ public struct CodexWebSocketProvider: AIProvider {
                     url: url,
                     headers: headers.dictionary
                 ) { connection in
-                    try await connection.send(requestData)
-                    var reducer = ProviderEventReducer(model: model)
-                    await output.emit(.start(reducer.partial))
-                    var terminal = false
-                    while !terminal {
-                        try Task.checkCancellation()
-                        let frame = try await connection.receive()
-                        let value = try OrderedJSON.decode(frame)
-                        for event in try reducer.consume(value) {
-                            await output.emit(event)
+                    try await withTaskCancellationHandler {
+                        try await connection.send(requestData)
+                        var reducer = ProviderEventReducer(model: model)
+                        await output.emit(.start(reducer.partial))
+                        var terminal = false
+                        while !terminal {
+                            try Task.checkCancellation()
+                            let frame = try await connection.receive()
+                            let value = try OrderedJSON.decode(frame)
+                            for event in try reducer.consume(value) {
+                                await output.emit(event)
+                            }
+                            if case .object(let object) = value,
+                                case .string(let type)? = object["type"],
+                                type == "response.completed"
+                            {
+                                var message = reducer.partial
+                                if message.stopReason == .pending { message.stopReason = .stop }
+                                await output.emit(.done(reason: message.stopReason, message: message))
+                                terminal = true
+                            }
+                            if case .object(let object) = value,
+                                case .string(let type)? = object["type"],
+                                type.contains("error")
+                            {
+                                throw ProviderError.invalidResponse(OrderedJSON.string(value))
+                            }
                         }
-                        if case .object(let object) = value,
-                            case .string(let type)? = object["type"],
-                            type == "response.completed"
-                        {
-                            var message = reducer.partial
-                            if message.stopReason == .pending { message.stopReason = .stop }
-                            await output.emit(.done(reason: message.stopReason, message: message))
-                            terminal = true
-                        }
-                        if case .object(let object) = value,
-                            case .string(let type)? = object["type"],
-                            type.contains("error")
-                        {
-                            throw ProviderError.invalidResponse(OrderedJSON.string(value))
-                        }
+                    } onCancel: {
+                        Task { await connection.close() }
                     }
                 }
             } catch is CancellationError {
@@ -106,6 +110,7 @@ public struct CodexWebSocketProvider: AIProvider {
                 )
             }
         }
+        output.attachProducer(producer)
         return output
     }
 

@@ -177,17 +177,19 @@ public actor PiServer {
             await detachRuntime(id, connectionID: connectionID)
             return .detach(sessionID: id)
         case .prompt(let id, let text):
-            return .prompt(try await withAttachedRuntime(id, connectionID: connectionID) { try await $0.prompt(text) })
+            return .prompt(
+                try await mutateAttachedRuntime(id, connectionID: connectionID) { try await $0.prompt(text) })
         case .steer(let id, let text):
-            return .steer(try await withAttachedRuntime(id, connectionID: connectionID) { try await $0.steer(text) })
+            return .steer(
+                try await mutateAttachedRuntime(id, connectionID: connectionID) { try await $0.steer(text) })
         case .abort(let id):
-            return .abort(try await withAttachedRuntime(id, connectionID: connectionID) { try await $0.abort() })
+            return .abort(try await mutateAttachedRuntime(id, connectionID: connectionID) { try await $0.abort() })
         case .setModel(let id, let model):
             return .setModel(
-                try await withAttachedRuntime(id, connectionID: connectionID) { try await $0.setModel(model) })
+                try await mutateAttachedRuntime(id, connectionID: connectionID) { try await $0.setModel(model) })
         case .setThinking(let id, let level):
             return .setThinking(
-                try await withAttachedRuntime(id, connectionID: connectionID) { try await $0.setThinking(level) })
+                try await mutateAttachedRuntime(id, connectionID: connectionID) { try await $0.setThinking(level) })
         }
     }
 
@@ -207,6 +209,19 @@ public actor PiServer {
             await operationFinished(id)
             throw error
         }
+    }
+
+    private func mutateAttachedRuntime(
+        _ id: String,
+        connectionID: String,
+        body: @Sendable (any PiSessionRuntime) async throws -> SessionSnapshot
+    ) async throws -> SessionSnapshot {
+        let snapshot = try await withAttachedRuntime(id, connectionID: connectionID, body: body)
+        guard snapshot.id == id else { throw PiServerFailure.invalidRequest("Runtime session id mismatch") }
+        let eventSnapshot = try snapshot.withAttachment(true)
+        await broadcastSessionSnapshot(eventSnapshot, sessionID: id)
+        let requesterIsAttached = clients[connectionID]?.attached.contains(id) == true
+        return requesterIsAttached ? eventSnapshot : try snapshot.withAttachment(false)
     }
 
     private func operationFinished(_ id: String) async {
@@ -281,6 +296,18 @@ public actor PiServer {
             models: try await service.listModels())
     }
 
+    private func broadcastSessionSnapshot(_ snapshot: SessionSnapshot, sessionID: String) async {
+        let connections = runtimes[sessionID]?.connections.compactMap { clients[$0]?.connection } ?? []
+        guard !connections.isEmpty,
+            let encoded = try? encodeServerMessage(.event(.sessionSnapshot(snapshot)), options: frameOptions)
+        else { return }
+        await withTaskGroup(of: Void.self) { group in
+            for connection in connections {
+                group.addTask { try? await connection.send(encoded) }
+            }
+        }
+    }
+
     private func broadcastServerSnapshot() async {
         let ready = clients.values.filter(\.ready)
         guard !ready.isEmpty else { return }
@@ -316,5 +343,14 @@ public actor PiServer {
             }
         }
         return try! ProtocolErrorValue(code: .internalError, message: "Internal server error")
+    }
+}
+
+private extension SessionSnapshot {
+    func withAttachment(_ attached: Bool) throws -> SessionSnapshot {
+        try SessionSnapshot(
+            id: id, name: name, cwd: cwd, createdAt: createdAt, updatedAt: updatedAt, phase: phase,
+            model: model, thinkingLevel: thinkingLevel, attached: attached, locked: locked, revision: revision,
+            transcript: transcript, queuedSteer: queuedSteer, queuedSteerCount: queuedSteerCount)
     }
 }

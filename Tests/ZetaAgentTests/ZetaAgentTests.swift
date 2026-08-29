@@ -348,6 +348,62 @@ final class ZetaAgentTests: XCTestCase {
         )
     }
 
+    func testAbortCancelsProviderProducerAndDoesNotWaitForResult() async throws {
+        let provider = FauxProvider()
+        let model = await provider.models[0]
+        let producerStarted = BooleanRecorder()
+        let producerCancelled = BooleanRecorder()
+        let agent = Agent(state: AgentState(systemPrompt: "", model: model)) {
+            model, _, _ in
+            let stream = AssistantEventStream()
+            let producer = Task {
+                await producerStarted.setTrue()
+                await stream.emit(
+                    .start(
+                        AssistantMessage(
+                            api: model.api,
+                            provider: model.provider,
+                            model: model.id
+                        )
+                    )
+                )
+                do {
+                    try await Task.sleep(for: .seconds(60))
+                } catch is CancellationError {
+                    await producerCancelled.setTrue()
+                } catch {}
+            }
+            stream.attachProducer(producer)
+            return stream
+        }
+        let completed = expectation(description: "prompt returned after abort")
+        Task {
+            defer { completed.fulfill() }
+            try? await agent.prompt(UserMessage("go"))
+        }
+        for _ in 0..<100 {
+            if await producerStarted.value() { break }
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        let didStartProducer = await producerStarted.value()
+        XCTAssertTrue(didStartProducer)
+
+        await agent.abort()
+        await fulfillment(of: [completed], timeout: 1)
+        for _ in 0..<100 {
+            if await producerCancelled.value() { break }
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        let didCancelProducer = await producerCancelled.value()
+        XCTAssertTrue(didCancelProducer)
+        let state = await agent.state()
+        XCTAssertFalse(state.isStreaming)
+        guard case .assistant(let assistant)? = state.messages.last else {
+            return XCTFail("Expected aborted assistant message")
+        }
+        XCTAssertEqual(assistant.stopReason, .aborted)
+    }
+
     func testConcurrentPromptRejected() async throws {
         let provider = FauxProvider()
         let model = await provider.models[0]
@@ -395,4 +451,10 @@ private actor IntegerCounter {
     private var stored = 0
     func increment() { stored += 1 }
     func value() -> Int { stored }
+}
+
+private actor BooleanRecorder {
+    private var stored = false
+    func setTrue() { stored = true }
+    func value() -> Bool { stored }
 }

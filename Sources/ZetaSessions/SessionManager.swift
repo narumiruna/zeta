@@ -114,7 +114,11 @@ public actor SessionManager {
                 entries.append(entry)
             }
         }
-        if needsNewlineRepair {
+        if version < currentCodingSessionVersion {
+            var migrated = try Self.line(header)
+            for entry in entries { migrated.append(try Self.line(entry)) }
+            try migrated.write(to: file, options: .atomic)
+        } else if needsNewlineRepair {
             data.append(0x0A)
             try data.write(to: file, options: .atomic)
         }
@@ -135,10 +139,10 @@ public actor SessionManager {
         entries.append(entry)
         byID[entry.base.id] = entry
         leafID = entry.base.id
-        if case .message(_, .assistant) = entry {
-            try ensureFileAndAppendPending()
-        } else if physicallyCreated {
+        if physicallyCreated {
             try appendRecord(entry)
+        } else if case .message(_, .assistant) = entry {
+            try ensureFileAndAppendPending()
         }
         return entry
     }
@@ -253,10 +257,7 @@ public actor SessionManager {
     }
 
     private func ensureFileAndAppendPending() throws {
-        guard let file, !physicallyCreated else {
-            if physicallyCreated { try rewriteAll() }
-            return
-        }
+        guard let file, !physicallyCreated else { return }
         try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
         try rewriteAll()
         physicallyCreated = true

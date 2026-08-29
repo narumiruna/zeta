@@ -111,19 +111,10 @@ public enum ZetaCLI {
                 model = restoredModel
             }
             let authStore = try AuthStore(url: paths.auth)
-            let apiKey: String?
-            if let explicit = parsed.apiKey {
-                apiKey = explicit
-            } else {
-                apiKey = try await authStore.resolveAPIKey(
-                    provider: model.provider,
-                    environment: ProcessInfo.processInfo.environment,
-                    fallbackVariables: BuiltinProviderFactory.environmentVariables[model.provider] ?? []
-                )
-            }
-            let stream = await makeStream(
-                model: model,
-                apiKey: apiKey,
+            let stream = makeStream(
+                initialModel: model,
+                explicitAPIKey: parsed.apiKey,
+                authStore: authStore,
                 transport: settings.transport
             )
             let pluginRuntime = CLIPluginRuntime()
@@ -154,10 +145,7 @@ public enum ZetaCLI {
                 ),
                 stream: stream
             )
-            await agent.configureRetry(
-                maximumRetries: settings.retry.enabled ? settings.retry.maxRetries : 0,
-                baseDelayMilliseconds: settings.retry.baseDelayMs
-            )
+            await configure(agent: agent, from: settings)
             if let persistentSession {
                 await agent.subscribe { event in await persistentSession.record(event) }
                 if let name = parsed.name { try await persistentSession.setName(name) }
@@ -353,99 +341,33 @@ public enum ZetaCLI {
     }
 
     private static func makeStream(
-        model: Model,
-        apiKey: String?,
+        initialModel: Model,
+        explicitAPIKey: String?,
+        authStore: AuthStore,
         transport: TransportPreference
-    ) async -> Agent.StreamFunction {
-        let fauxResponse = ProcessInfo.processInfo.environment["ZETA_FAUX_RESPONSE"]
-        let fauxTool = ProcessInfo.processInfo.environment["ZETA_FAUX_TOOL"]
-        if fauxResponse != nil || fauxTool != nil {
-            let provider = FauxProvider(models: [model], tokensPerSecond: 10_000)
-            if let fauxTool {
-                await provider.enqueue(
-                    AssistantMessage(
-                        content: [
-                            .toolCall(
-                                ToolCall(
-                                    id: "faux-tool-1",
-                                    name: fauxTool,
-                                    arguments: ["text": "plugin smoke"]
-                                )
-                            )
-                        ],
-                        api: model.api,
-                        provider: model.provider,
-                        model: model.id,
-                        stopReason: .toolUse
-                    )
-                )
-            }
-            await provider.enqueue(
-                AssistantMessage(
-                    content: [.text(text: fauxResponse ?? "faux-ok")],
-                    api: model.api,
-                    provider: model.provider,
-                    model: model.id,
-                    stopReason: .stop
-                )
-            )
-            return { model, context, options in
-                await provider.stream(model: model, context: context, options: options)
-            }
-        }
-        if model.api == "openai-codex-responses", transport != .sse {
-            let pool = CodexWebSocketPool(factory: CodexWebSocket.defaultFactory())
-            let provider = CodexWebSocketProvider(
-                models: [model],
-                pool: pool,
-                environment: {
-                    var values = ProcessInfo.processInfo.environment
-                    if let apiKey { values["OPENAI_CODEX_TOKEN"] = apiKey }
-                    return values
-                }
-            )
-            return { model, context, options in
-                var resolved = options
-                if resolved.apiKey == nil { resolved.apiKey = apiKey }
-                return await provider.stream(model: model, context: context, options: resolved)
-            }
-        }
-        if model.api == "bedrock-converse-stream" {
-            let environment = ProcessInfo.processInfo.environment
-            let provider = BedrockProvider(
-                models: [model],
-                region: environment["AWS_REGION"] ?? environment["AWS_DEFAULT_REGION"] ?? "us-east-1"
-            ) {
-                guard let credential = CredentialResolver.aws(environment: environment) else {
-                    throw ProviderError.missingCredential(model.provider)
-                }
-                return credential
-            }
-            return { model, context, options in
-                await provider.stream(model: model, context: context, options: options)
-            }
-        }
-        let environmentVariables =
-            BuiltinProviderFactory.environmentVariables[model.provider] ?? []
-        let provider = HTTPProvider(
-            configuration: ProviderConfiguration(
-                id: model.provider,
-                api: model.api,
-                baseURL: model.baseURL,
-                models: [model],
-                apiKeyEnvironmentVariables: environmentVariables
-            ),
-            environment: {
-                var result = ProcessInfo.processInfo.environment
-                if let apiKey, let variable = environmentVariables.first {
-                    result[variable] = apiKey
-                }
-                return result
-            }
+    ) -> Agent.StreamFunction {
+        let explicitAPIKeys = explicitAPIKey.map { [initialModel.provider: $0] } ?? [:]
+        let dispatcher = CLIModelStreamDispatcher(
+            authStore: authStore,
+            explicitAPIKeys: explicitAPIKeys,
+            transportPreference: transport
         )
         return { model, context, options in
-            await provider.stream(model: model, context: context, options: options)
+            await dispatcher.stream(model: model, context: context, options: options)
         }
+    }
+
+    static func configure(agent: Agent, from settings: Settings) async {
+        await agent.setSteeringMode(
+            settings.steeringMode == .all ? .all : .oneAtATime
+        )
+        await agent.setFollowUpMode(
+            settings.followUpMode == .all ? .all : .oneAtATime
+        )
+        await agent.configureRetry(
+            maximumRetries: settings.retry.enabled ? settings.retry.maxRetries : 0,
+            baseDelayMilliseconds: settings.retry.baseDelayMs
+        )
     }
 
     private static func builtInModels() -> [Model] {
@@ -739,6 +661,27 @@ private struct InitialPrompt {
     }
 }
 
+enum InteractiveSessionCommands {
+    static func setThinkingLevel(
+        _ level: ThinkingLevel,
+        agent: Agent,
+        session: PersistentSessionController?
+    ) async throws {
+        try await session?.recordThinkingLevel(level)
+        await agent.setThinkingLevel(level)
+    }
+
+    static func newSession(
+        agent: Agent,
+        session: PersistentSessionController?
+    ) async throws {
+        await agent.abort()
+        await agent.waitForIdle()
+        try await agent.reset()
+        _ = try await session?.newSession()
+    }
+}
+
 private actor InteractiveRunner {
     let agent: Agent
     let transcript: Container
@@ -833,9 +776,10 @@ private actor InteractiveRunner {
             return true
         }
         if text == "/new" {
-            await agent.abort()
-            await agent.waitForIdle()
-            try await agent.reset()
+            try await InteractiveSessionCommands.newSession(
+                agent: agent,
+                session: session
+            )
             transcript.clear()
             tui.requestRender()
             return true
@@ -845,7 +789,11 @@ private actor InteractiveRunner {
             guard let level = ThinkingLevel(rawValue: raw) else {
                 throw CLIArgumentError.invalidValue("/thinking")
             }
-            await agent.setThinkingLevel(level)
+            try await InteractiveSessionCommands.setThinkingLevel(
+                level,
+                agent: agent,
+                session: session
+            )
             transcript.add(Text("Thinking level: \(raw)"))
             tui.requestRender()
             return true

@@ -78,6 +78,30 @@ final class ZetaHarnessSessionsTests: XCTestCase {
         } catch {}
     }
 
+    func testFindEntriesAfterSequenceUsesForwardExclusiveBound() async throws {
+        let storage = HarnessSessionStorage(
+            header: try HarnessSessionHeader(id: "s", createdAt: 0, cwd: "/tmp")
+        )
+        for sequence in Int64(1)...3 {
+            try await storage.apply(
+                .entry(
+                    lane: "main",
+                    HarnessEntry(
+                        id: "entry-\(sequence)",
+                        sequence: sequence,
+                        parentID: sequence == 1 ? nil : "entry-\(sequence - 1)",
+                        type: "custom",
+                        timestamp: sequence,
+                        fields: ["customType": "test"]
+                    )
+                )
+            )
+        }
+
+        let entries = await storage.findEntries(afterSequence: 1)
+        XCTAssertEqual(entries.map(\.id), ["entry-3", "entry-2"])
+    }
+
     func testOneOpenOperationPerLane() async throws {
         let storage = HarnessSessionStorage(
             header: try HarnessSessionHeader(id: "s", createdAt: 0, cwd: "/tmp")

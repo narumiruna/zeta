@@ -19,6 +19,20 @@ public struct ResolvedAuthentication: Sendable, Equatable {
     }
 }
 
+public enum CredentialResolverError: Error, LocalizedError, Sendable {
+    case invalidTokenResponse
+    case unsupportedServiceAccount
+
+    public var errorDescription: String? {
+        switch self {
+        case .invalidTokenResponse:
+            "Google OAuth token exchange returned an invalid response"
+        case .unsupportedServiceAccount:
+            "Google service-account token exchange is unavailable without a pre-issued access token"
+        }
+    }
+}
+
 public enum CredentialResolver {
     public static func apiKey(
         explicit: String?,
@@ -95,6 +109,54 @@ public enum CredentialResolver {
         return nil
     }
 
+    public static func vertexAccessAuthentication(
+        explicitAPIKey: String?,
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        session: URLSession = .shared
+    ) async throws -> ResolvedAuthentication? {
+        guard
+            let authentication = try vertex(
+                explicitAPIKey: explicitAPIKey,
+                environment: environment
+            )
+        else {
+            return nil
+        }
+        if authentication.apiKey != nil || authentication.bearerToken != nil {
+            return authentication
+        }
+        guard let refreshToken = authentication.headers["x-zeta-google-refresh-token"],
+            let clientID = authentication.headers["x-zeta-google-client-id"],
+            let clientSecret = authentication.headers["x-zeta-google-client-secret"]
+        else {
+            throw CredentialResolverError.unsupportedServiceAccount
+        }
+        var request = URLRequest(url: URL(string: "https://oauth2.googleapis.com/token")!)
+        request.httpMethod = "POST"
+        request.setValue(
+            "application/x-www-form-urlencoded",
+            forHTTPHeaderField: "Content-Type"
+        )
+        request.httpBody = formEncoded([
+            "client_id": clientID,
+            "client_secret": clientSecret,
+            "refresh_token": refreshToken,
+            "grant_type": "refresh_token",
+        ])
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse,
+            200..<300 ~= http.statusCode,
+            let token = try JSONDecoder().decode(GoogleTokenResponse.self, from: data).accessToken,
+            !token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else {
+            throw CredentialResolverError.invalidTokenResponse
+        }
+        return ResolvedAuthentication(
+            bearerToken: token,
+            source: authentication.source
+        )
+    }
+
     public static func aws(
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) -> AWSCredential? {
@@ -115,6 +177,25 @@ public enum CredentialResolver {
             secretAccessKey: secret,
             sessionToken: environment["AWS_SESSION_TOKEN"]
         )
+    }
+    private static func formEncoded(_ values: [String: String]) -> Data {
+        let allowed = CharacterSet.alphanumerics.union(
+            CharacterSet(charactersIn: "-._~")
+        )
+        let body = values.keys.sorted().map { key in
+            let name = key.addingPercentEncoding(withAllowedCharacters: allowed) ?? ""
+            let value = values[key]!.addingPercentEncoding(withAllowedCharacters: allowed) ?? ""
+            return "\(name)=\(value)"
+        }.joined(separator: "&")
+        return Data(body.utf8)
+    }
+}
+
+private struct GoogleTokenResponse: Decodable {
+    var accessToken: String?
+
+    enum CodingKeys: String, CodingKey {
+        case accessToken = "access_token"
     }
 }
 

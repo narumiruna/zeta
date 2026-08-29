@@ -21,6 +21,15 @@ public enum UnixTransportError: Error, LocalizedError, Sendable {
     }
 }
 
+private func setNoSigPipe(_ descriptor: Int32) throws {
+    var enabled: Int32 = 1
+    guard
+        setsockopt(
+            descriptor, SOL_SOCKET, SO_NOSIGPIPE, &enabled,
+            socklen_t(MemoryLayout<Int32>.size)) == 0
+    else { throw UnixTransportError.system("setsockopt(SO_NOSIGPIPE)", errno) }
+}
+
 private func socketAddress(_ path: String) throws -> (sockaddr_un, socklen_t) {
     let bytes = Array(path.utf8)
     guard bytes.count <= 103 else { throw UnixTransportError.pathTooLong(bytes.count) }
@@ -50,6 +59,7 @@ public final class UnixByteTransport: ByteTransport, @unchecked Sendable {
         descriptor = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
         guard descriptor >= 0 else { throw UnixTransportError.system("socket", errno) }
         do {
+            try setNoSigPipe(descriptor)
             var (address, length) = try socketAddress(path)
             let result = withUnsafePointer(to: &address) { pointer in
                 pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.connect(descriptor, $0, length) }
@@ -220,8 +230,10 @@ public final class UnixServerConnection: ServerByteConnection, @unchecked Sendab
         }
         guard changed else { return }
         shutdown(descriptor, SHUT_RDWR)
-        readSource?.cancel()
+        let source = readSource
+        source?.cancel()
         readSource = nil
+        if source == nil { Darwin.close(descriptor) }
         if notify { closeHandler?() }
     }
 }
@@ -272,6 +284,7 @@ public final class UnixServerListener: @unchecked Sendable {
         guard fileDescriptor >= 0 else { throw UnixTransportError.system("socket", errno) }
         descriptor = fileDescriptor
         do {
+            try setNoSigPipe(fileDescriptor)
             var (address, length) = try socketAddress(privatePath)
             guard
                 withUnsafePointer(
@@ -343,6 +356,7 @@ public final class UnixServerListener: @unchecked Sendable {
         let probe = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
         guard probe >= 0 else { throw UnixTransportError.system("socket probe", errno) }
         defer { Darwin.close(probe) }
+        try setNoSigPipe(probe)
         var (address, length) = try socketAddress(path)
         let result = withUnsafePointer(to: &address) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
@@ -358,7 +372,12 @@ public final class UnixServerListener: @unchecked Sendable {
         while true {
             let client = Darwin.accept(descriptor, nil, nil)
             if client >= 0 {
-                onConnection(UnixServerConnection(descriptor: client))
+                do {
+                    try setNoSigPipe(client)
+                    onConnection(UnixServerConnection(descriptor: client))
+                } catch {
+                    Darwin.close(client)
+                }
             } else if errno == EINTR {
                 continue
             } else {

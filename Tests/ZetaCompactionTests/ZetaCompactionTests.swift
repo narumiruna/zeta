@@ -57,6 +57,32 @@ final class ZetaCompactionTests: XCTestCase {
         }
     }
 
+    func testAssistantEstimatesDoNotSumCumulativeRequestUsage() {
+        let messages: [Message] = [
+            .assistant(
+                AssistantMessage(
+                    content: [.text(text: "one")],
+                    api: "test",
+                    provider: "test",
+                    model: "test",
+                    usage: Usage(input: 1_000, output: 4, totalTokens: 1_004),
+                    stopReason: .stop
+                )
+            ),
+            .assistant(
+                AssistantMessage(
+                    content: [.text(text: "two")],
+                    api: "test",
+                    provider: "test",
+                    model: "test",
+                    usage: Usage(input: 2_000, output: 5, totalTokens: 2_005),
+                    stopReason: .stop
+                )
+            ),
+        ]
+        XCTAssertEqual(Compaction.estimateTokens(messages), 9)
+    }
+
     func testImagesAndToolResultsHaveBoundedSummaryRepresentation() {
         let tool = ToolResultMessage(
             toolCallId: "c",

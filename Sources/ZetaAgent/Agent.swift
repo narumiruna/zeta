@@ -130,6 +130,7 @@ public actor Agent {
     private var steering: [UserMessage] = []
     private var followUps: [UserMessage] = []
     private var runTask: Task<Void, Never>?
+    private var activeResponseStream: AssistantEventStream?
     private var idleWaiters: [CheckedContinuation<Void, Never>] = []
     public var toolExecutionMode: ToolExecutionMode
     public var steeringMode: QueueDeliveryMode
@@ -236,7 +237,18 @@ public actor Agent {
         retryBaseDelayMilliseconds = max(0, baseDelayMilliseconds)
     }
     public func abortRetry() { retryCancelled = true }
-    public func abort() { runTask?.cancel() }
+    public func abort() {
+        runTask?.cancel()
+        guard let activeResponseStream else { return }
+        let model = internalState.model
+        Task {
+            await activeResponseStream.cancel(
+                api: model.api,
+                provider: model.provider,
+                model: model.id
+            )
+        }
+    }
 
     public func waitForIdle() async {
         if runTask == nil { return }
@@ -334,6 +346,14 @@ public actor Agent {
                 tools: internalState.tools.map(\.definition)
             )
             let responseStream = await stream(model, context, StreamOptions(thinking: internalState.thinkingLevel))
+            activeResponseStream = responseStream
+            if Task.isCancelled {
+                await responseStream.cancel(
+                    api: model.api,
+                    provider: model.provider,
+                    model: model.id
+                )
+            }
             var assistant: AssistantMessage?
             do {
                 for try await event in responseStream {
@@ -349,13 +369,35 @@ public actor Agent {
                         }
                     }
                 }
-                if assistant == nil {
+                if assistant == nil, !Task.isCancelled {
                     assistant = await responseStream.result()
                 }
             } catch {
+                if Task.isCancelled {
+                    await responseStream.cancel(
+                        api: model.api,
+                        provider: model.provider,
+                        model: model.id
+                    )
+                } else {
+                    assistant = AssistantMessage(
+                        api: model.api,
+                        provider: model.provider,
+                        model: model.id,
+                        stopReason: .error,
+                        errorMessage: String(describing: error)
+                    )
+                }
+            }
+            activeResponseStream = nil
+            if assistant == nil, Task.isCancelled {
                 assistant = AssistantMessage(
-                    api: model.api, provider: model.provider, model: model.id, stopReason: .error,
-                    errorMessage: String(describing: error))
+                    api: model.api,
+                    provider: model.provider,
+                    model: model.id,
+                    stopReason: .aborted,
+                    errorMessage: "Operation aborted"
+                )
             }
             guard let assistant else { break }
             internalState.streamingMessage = nil
@@ -431,6 +473,7 @@ public actor Agent {
         await emit(.agentEnd(newMessages))
         internalState.isStreaming = false
         internalState.streamingMessage = nil
+        activeResponseStream = nil
         runTask = nil
         idleWaiters.forEach { $0.resume() }
         idleWaiters.removeAll()

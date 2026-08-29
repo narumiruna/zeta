@@ -88,6 +88,64 @@ final class ZetaAuthTests: XCTestCase {
         )
     }
 
+    func testVertexResolutionDistinguishesAPIKeyAndADCBearer() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let credentialFile = directory.appendingPathComponent("adc.json")
+        try Data(#"{"access_token":"adc-access"}"#.utf8).write(to: credentialFile)
+        let environment = [
+            "GOOGLE_APPLICATION_CREDENTIALS": credentialFile.path,
+            "GOOGLE_CLOUD_API_KEY": "environment-key",
+        ]
+
+        let apiKey = try CredentialResolver.vertex(
+            explicitAPIKey: "explicit-key",
+            environment: environment
+        )
+        XCTAssertEqual(apiKey?.apiKey, "explicit-key")
+        XCTAssertNil(apiKey?.bearerToken)
+
+        let bearer = try CredentialResolver.vertex(
+            explicitAPIKey: nil,
+            environment: ["GOOGLE_APPLICATION_CREDENTIALS": credentialFile.path]
+        )
+        XCTAssertNil(bearer?.apiKey)
+        XCTAssertEqual(bearer?.bearerToken, "adc-access")
+    }
+
+    func testVertexRefreshCredentialExchangesForBearerToken() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        let credentialFile = directory.appendingPathComponent("adc.json")
+        try Data(
+            #"{"refresh_token":"refresh","client_id":"client","client_secret":"secret"}"#.utf8
+        ).write(to: credentialFile)
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [VertexTokenURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+
+        let authentication = try await CredentialResolver.vertexAccessAuthentication(
+            explicitAPIKey: nil,
+            environment: ["GOOGLE_APPLICATION_CREDENTIALS": credentialFile.path],
+            session: session
+        )
+
+        XCTAssertEqual(authentication?.bearerToken, "refreshed-access")
+        XCTAssertNil(authentication?.apiKey)
+        let requestBody = String(
+            decoding: try XCTUnwrap(VertexTokenURLProtocol.requestBody),
+            as: UTF8.self
+        )
+        XCTAssertTrue(requestBody.contains("grant_type=refresh_token"))
+        XCTAssertTrue(requestBody.contains("refresh_token=refresh"))
+    }
+
     func testAWSSigningIsDeterministic() throws {
         var request = URLRequest(
             url: URL(string: "https://iam.amazonaws.com/?Action=ListUsers&Version=2010-05-08")!
@@ -109,6 +167,42 @@ final class ZetaAuthTests: XCTestCase {
         XCTAssertTrue(signed.canonicalRequest.contains("Action=ListUsers&Version=2010-05-08"))
         XCTAssertNotNil(signed.request.value(forHTTPHeaderField: "Authorization"))
     }
+}
+
+private final class VertexTokenURLProtocol: URLProtocol, @unchecked Sendable {
+    nonisolated(unsafe) static var requestBody: Data?
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+    override func startLoading() {
+        if let body = request.httpBody {
+            Self.requestBody = body
+        } else if let stream = request.httpBodyStream {
+            stream.open()
+            defer { stream.close() }
+            var body = Data()
+            var bytes = [UInt8](repeating: 0, count: 1_024)
+            while stream.hasBytesAvailable {
+                let count = stream.read(&bytes, maxLength: bytes.count)
+                if count <= 0 { break }
+                body.append(bytes, count: count)
+            }
+            Self.requestBody = body
+        }
+        let response = HTTPURLResponse(
+            url: request.url!,
+            statusCode: 200,
+            httpVersion: "HTTP/1.1",
+            headerFields: ["Content-Type": "application/json"]
+        )!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(
+            self,
+            didLoad: Data(#"{"access_token":"refreshed-access"}"#.utf8)
+        )
+        client?.urlProtocolDidFinishLoading(self)
+    }
+    override func stopLoading() {}
 }
 
 private actor Counter {

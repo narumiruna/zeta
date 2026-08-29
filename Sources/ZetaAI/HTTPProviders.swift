@@ -41,7 +41,7 @@ public struct HTTPProvider: AIProvider {
 
     public func stream(model: Model, context: Context, options: StreamOptions) async -> AssistantEventStream {
         let output = AssistantEventStream()
-        Task {
+        let producer = Task {
             do {
                 let requestEnvironment = environment().merging(options.environment) {
                     _, override in override
@@ -106,6 +106,7 @@ public struct HTTPProvider: AIProvider {
                 await output.failBeforeStart(api: model.api, provider: model.provider, model: model.id, error: error)
             }
         }
+        output.attachProducer(producer)
         return output
     }
 

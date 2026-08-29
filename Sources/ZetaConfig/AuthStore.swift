@@ -51,6 +51,22 @@ public enum StoredCredential: Codable, Sendable, Equatable {
     }
 }
 
+public struct ResolvedStoredCredential: Sendable, Equatable {
+    public var apiKey: String?
+    public var bearerToken: String?
+    public var environment: [String: String]
+
+    public init(
+        apiKey: String? = nil,
+        bearerToken: String? = nil,
+        environment: [String: String]
+    ) {
+        self.apiKey = apiKey
+        self.bearerToken = bearerToken
+        self.environment = environment
+    }
+}
+
 public actor AuthStore {
     private let url: URL
     private var credentials: [String: StoredCredential]
@@ -80,24 +96,62 @@ public actor AuthStore {
         try persist()
     }
 
-    public func resolveAPIKey(provider: String, environment: [String: String], fallbackVariables: [String]) async throws
-        -> String?
-    {
+    public func resolveCredential(
+        provider: String,
+        environment: [String: String],
+        fallbackVariables: [String],
+        nowMilliseconds: Int64 = Int64(Date().timeIntervalSince1970 * 1_000)
+    ) async throws -> ResolvedStoredCredential {
+        var resolvedEnvironment = environment
+        if case .apiKey(_, let scoped)? = credentials[provider] {
+            resolvedEnvironment.merge(scoped ?? [:]) { _, storedValue in storedValue }
+        }
+
         if let credential = credentials[provider] {
             switch credential {
-            case .apiKey(let stored, let scoped):
-                let merged = environment.merging(scoped ?? [:]) { _, storedValue in storedValue }
-                if let stored { return try await Self.expand(stored, environment: merged) }
-                for variable in fallbackVariables where merged[variable] != nil { return merged[variable] }
-                return nil
+            case .apiKey(let stored, _):
+                if let stored {
+                    let value = try await Self.expand(stored, environment: resolvedEnvironment)
+                    if Self.hasContent(value) {
+                        return ResolvedStoredCredential(
+                            apiKey: value,
+                            environment: resolvedEnvironment
+                        )
+                    }
+                }
             case .oauth(let access, _, let expires, _):
-                if expires > Int64(Date().timeIntervalSince1970 * 1_000), !access.isEmpty {
-                    return access
+                if expires > nowMilliseconds, Self.hasContent(access) {
+                    return ResolvedStoredCredential(
+                        bearerToken: access,
+                        environment: resolvedEnvironment
+                    )
                 }
             }
         }
-        for variable in fallbackVariables where environment[variable] != nil { return environment[variable] }
-        return nil
+        for variable in fallbackVariables {
+            if let value = resolvedEnvironment[variable], Self.hasContent(value) {
+                return ResolvedStoredCredential(
+                    apiKey: value,
+                    environment: resolvedEnvironment
+                )
+            }
+        }
+        return ResolvedStoredCredential(environment: resolvedEnvironment)
+    }
+
+    public func resolveAPIKey(provider: String, environment: [String: String], fallbackVariables: [String]) async throws
+        -> String?
+    {
+        let resolved = try await resolveCredential(
+            provider: provider,
+            environment: environment,
+            fallbackVariables: fallbackVariables
+        )
+        return resolved.apiKey ?? resolved.bearerToken
+    }
+
+    private static func hasContent(_ value: String) -> Bool {
+        !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     private func persist() throws {
