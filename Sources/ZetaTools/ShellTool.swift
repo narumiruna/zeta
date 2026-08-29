@@ -46,8 +46,8 @@ public struct ShellTool: Sendable {
                             onUpdate?(text)
                         }
                     }
-                    process.waitUntilExit()
-                    return .completed(data, process.terminationStatus)
+                    let status = try await Self.waitForExit(process)
+                    return .completed(data, status)
                 }
                 if let timeout {
                     group.addTask {
@@ -85,6 +85,14 @@ public struct ShellTool: Sendable {
         } onCancel: {
             Self.terminateProcessTree(process)
         }
+    }
+
+    private static func waitForExit(_ process: Process) async throws -> Int32 {
+        while process.isRunning {
+            try Task.checkCancellation()
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        return process.terminationStatus
     }
 
     private static func terminateProcessTree(_ process: Process) {

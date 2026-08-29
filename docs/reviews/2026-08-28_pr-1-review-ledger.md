@@ -104,7 +104,7 @@ Initial outcome: Actionable and not yet addressed.
 
 Final outcome: Addressed by retaining the active shell task and awaiting its process-group cancellation before acknowledgement.
 
-Evidence: `testAbortBashWaitsForActiveCommandCancellation` verifies prompt cancellation and a nonzero shell result.
+Evidence: `testAbortBashWaitsForActiveCommandCancellation` verifies prompt cancellation, a failed original request, and no leaked test process.
 
 ### `3883403848`
 

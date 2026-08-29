@@ -215,11 +215,8 @@ final class ZetaCLITests: XCTestCase {
         XCTAssertEqual(data["aborted"], true)
         XCTAssertLessThan(elapsed, .seconds(2))
         let bashResponse = await running.value
-        XCTAssertTrue(bashResponse.success)
-        guard case .object(let bashData)? = bashResponse.data else {
-            return XCTFail("Expected cancelled bash result")
-        }
-        XCTAssertNotEqual(bashData["exitCode"], 0)
+        XCTAssertFalse(bashResponse.success)
+        XCTAssertNotNil(bashResponse.error)
     }
 
     func testNewSessionSwapsPersistentFile() async throws {
