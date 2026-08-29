@@ -3,7 +3,7 @@
 - Status: Accepted and implemented
 - Date: 2026-08-29
 - Decision owners: Zeta maintainers
-- Supersedes: The zero-external-dependency decision in [ADR 0001](0001-dependencies-and-macos-platform.md)
+- Related policy: [ADR 0001](0001-dependencies-and-macos-platform.md)
 
 ## Context
 
