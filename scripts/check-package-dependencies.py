@@ -155,6 +155,12 @@ def independently_resolve(package_path: Path) -> dict[str, ResolvedPin]:
         resolution_root = Path(temporary)
         for candidate in package_path.glob("Package*.swift"):
             shutil.copy2(candidate, resolution_root / candidate.name)
+        configuration = package_path / ".swiftpm" / "configuration"
+        if configuration.is_dir():
+            shutil.copytree(
+                configuration,
+                resolution_root / ".swiftpm" / "configuration",
+            )
         subprocess.run(
             [
                 "swift",

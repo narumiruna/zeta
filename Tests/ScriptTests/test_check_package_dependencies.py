@@ -5,6 +5,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 SPEC = importlib.util.spec_from_file_location(
@@ -235,6 +236,45 @@ class PackageDependencyPolicyTests(unittest.TestCase):
                     resolved,
                     parsed_pins(resolved),
                 )
+
+    def test_independent_resolution_preserves_package_registry_configuration(
+        self,
+    ) -> None:
+        registry_configuration = {
+            "registries": {"[default]": {"url": "https://packages.example.com"}},
+            "version": 1,
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "Package.swift").write_text(
+                "// synthetic manifest\n",
+                encoding="utf-8",
+            )
+            configuration = root / ".swiftpm" / "configuration"
+            configuration.mkdir(parents=True)
+            (configuration / "registries.json").write_text(
+                json.dumps(registry_configuration),
+                encoding="utf-8",
+            )
+
+            def resolve(command: list[str], **_: object) -> None:
+                resolution_root = Path(command[command.index("--package-path") + 1])
+                copied_registry = (
+                    resolution_root
+                    / ".swiftpm"
+                    / "configuration"
+                    / "registries.json"
+                )
+                self.assertEqual(
+                    json.loads(copied_registry.read_text(encoding="utf-8")),
+                    registry_configuration,
+                )
+                write_resolved(resolution_root / "Package.resolved", [])
+
+            with mock.patch.object(CHECK.subprocess, "run", side_effect=resolve):
+                pins = CHECK.independently_resolve(root)
+
+        self.assertEqual(pins, {})
 
     def test_requires_complete_independently_resolved_graph(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
