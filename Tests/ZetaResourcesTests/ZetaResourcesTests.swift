@@ -187,6 +187,49 @@ final class ZetaResourcesTests: XCTestCase {
         XCTAssertEqual(snapshot.context, ["project context"])
     }
 
+    func testContextBudgetPrioritizesDeepestFilesAndPreservesPresentationOrder() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let agent = root.appendingPathComponent("agent")
+        let project = root.appendingPathComponent("project")
+        let first = project.appendingPathComponent("first")
+        let second = first.appendingPathComponent("second")
+        let workingDirectory = second.appendingPathComponent("working")
+        try FileManager.default.createDirectory(at: agent, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: workingDirectory, withIntermediateDirectories: true)
+
+        func writeFullContext(_ label: String, to directory: URL) throws {
+            let padding = String(
+                repeating: "x",
+                count: maximumContextFileBytes - label.utf8.count
+            )
+            try Data((label + padding).utf8).write(
+                to: directory.appendingPathComponent("AGENTS.md")
+            )
+        }
+        try writeFullContext("global", to: agent)
+        try writeFullContext("project", to: project)
+        try writeFullContext("first", to: first)
+        try writeFullContext("second", to: second)
+        try Data("working context".utf8).write(
+            to: workingDirectory.appendingPathComponent("AGENTS.md")
+        )
+
+        let snapshot = ResourceLoader(
+            home: root,
+            workingDirectory: workingDirectory,
+            agentDirectory: agent,
+            trusted: false
+        ).load()
+
+        XCTAssertEqual(snapshot.context.count, 4)
+        XCTAssertTrue(snapshot.context[0].hasPrefix("project"))
+        XCTAssertTrue(snapshot.context[1].hasPrefix("first"))
+        XCTAssertTrue(snapshot.context[2].hasPrefix("second"))
+        XCTAssertEqual(snapshot.context[3], "working context")
+        XCTAssertFalse(snapshot.context.contains { $0.hasPrefix("global") })
+    }
+
     func testContextOverrideWinsWithinDirectory() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)

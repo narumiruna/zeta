@@ -14,7 +14,7 @@ final class LatestInteractiveFeedbackTests: XCTestCase {
     func testFullscreenSettingSelectsAlternateScreenRenderer() {
         var settings = Settings()
         settings.tuiMode = "fullscreen"
-        settings.fullscreenExit = "none"
+        settings.fullscreenExitOutput = "resume-hint"
         let renderer = ZetaCLI.makeInteractiveTUI(
             settings: settings,
             terminal: CLITestTerminal(),

@@ -890,3 +890,68 @@ Evidence: `testTrustLockWaitDoesNotBlockActor` holds the advisory lock, starts a
 The complete repository gate passed 321 XCTest cases and 57 Swift Testing cases in a disposable validation checkout named `zeta` against the clean pinned oracle.
 The complete local Address Sanitizer and Thread Sanitizer suites each passed the same 378 tests without findings.
 Strict concurrency, warnings-as-errors, formatting, file-length, API compatibility, generated documentation, plugin examples, and pinned TypeScript interoperability checks passed.
+
+## Seventeenth-round inline feedback
+
+This round covers review `5057759713` on pull request 2.
+
+### `3886355633`
+
+Concern: The fullscreen renderer reads Zeta's `fullscreenExit` field instead of Pi's pinned `fullscreenExitOutput` settings key.
+
+Initial outcome: Actionable and not yet addressed.
+
+Final outcome: Already addressed by the current code after this follow-up.
+
+Resolution: `Settings` now stores and encodes `fullscreenExitOutput`, migrates Zeta's previous `fullscreenExit` spelling, and the renderer reads the pinned property.
+
+Evidence: `testPinnedFullscreenExitOutputKeyLoadsAndLegacyKeyMigrates` verifies pinned decoding and encoding plus legacy migration.
+
+### `3886355641`
+
+Concern: The 1,024-entry cancelled-request cap evicts IDs whose valid late responses can still arrive.
+
+Initial outcome: Actionable and not yet addressed.
+
+Final outcome: Already addressed by the current code after this follow-up.
+
+Resolution: Cancelled IDs remain tracked until their responses settle, and exhausting the fixed tracking budget safely retires the connection instead of evicting an unsettled ID.
+
+Evidence: The existing late-response regression verifies settled cancellation keeps the connection active, and `testCancellationTrackingBudgetRetiresConnectionWithoutEvictingIDs` verifies budget exhaustion closes the connection.
+
+### `3886355645`
+
+Concern: An SSE `[DONE]` sentinel is discarded and leaves an otherwise complete OpenAI-compatible response pending.
+
+Initial outcome: Actionable and not yet addressed.
+
+Final outcome: Already addressed by the current code after this follow-up.
+
+Resolution: The reducer now closes open OpenAI content and tool-call events at the sentinel and assigns stop or tool-use when no earlier terminal reason exists.
+
+Evidence: `testDoneSentinelTerminatesOpenAICompatibleStream` verifies partial text followed only by `[DONE]` completes successfully, while the existing clean-EOF regression remains an error.
+
+### `3886355649`
+
+Concern: Generic context can consume the aggregate budget before the working directory's most-specific instructions are considered.
+
+Initial outcome: Actionable and not yet addressed.
+
+Final outcome: Already addressed by the current code after this follow-up.
+
+Resolution: Context candidates are admitted deepest-first under the aggregate budget and then restored to global-to-local presentation order.
+
+Evidence: `testContextBudgetPrioritizesDeepestFilesAndPreservesPresentationOrder` fills the budget with ancestor files and verifies the working-directory context survives in normal presentation order.
+
+## Seventeenth-round pull request lifecycle
+
+Pull request 2 was already merged at `aaade7b1f8cd149036a1b210e11e5ee5b047623e` before this follow-up began.
+The merged pull request cannot incorporate later commits, so the original head branch is used for the follow-up commit and a new pull request is required to merge it.
+
+## Seventeenth-round verification
+
+The focused strict-concurrency suite passed 43 tests covering all four findings.
+The complete repository gate passed 325 XCTest cases and 57 Swift Testing cases against the disposable clean pinned oracle.
+The complete local Address Sanitizer and Thread Sanitizer suites each passed the same 382 tests without findings.
+The iOS device and simulator library builds passed, and both external-consumer simulator tests passed without failures or skips.
+Strict concurrency, warnings-as-errors, formatting, file-length, API compatibility, generated documentation, plugin examples, and pinned TypeScript interoperability checks passed.

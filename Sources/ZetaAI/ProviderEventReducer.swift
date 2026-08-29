@@ -220,6 +220,19 @@ public struct ProviderEventReducer: Sendable {
         return events
     }
 
+    mutating func finishAtDoneSentinel() -> [AssistantEvent] {
+        var events = finishOpenAIContentBlocks()
+        events += finishOpenAIChatToolCalls()
+        events += finishOpenAIResponseToolCalls()
+        if partial.stopReason == .pending {
+            partial.stopReason =
+                partial.content.contains { block in
+                    if case .toolCall = block { true } else { false }
+                } ? .toolUse : .stop
+        }
+        return events
+    }
+
     private func validateProviderContentIndexes(
         _ object: OrderedJSONObject
     ) throws {

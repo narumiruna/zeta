@@ -682,6 +682,7 @@ Regenerate it with `uv run python scripts/generate-api-docs.py`.
 | `followUpMode` | Instance Property |
 | `fullscreenCopyOnSelect` | Instance Property |
 | `fullscreenExit` | Instance Property |
+| `fullscreenExitOutput` | Instance Property |
 | `fullscreenScrollbar` | Instance Property |
 | `globalSettings` | Instance Property |
 | `home` | Instance Property |

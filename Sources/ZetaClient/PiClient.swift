@@ -45,6 +45,8 @@ public enum PiClientError: Error, LocalizedError, Sendable {
 }
 
 public actor PiClient {
+    private static let maximumCancelledRequestIDs = 1_024
+
     private struct ConnectionOperation {
         let token: UUID
         let task: Task<Void, Error>
@@ -78,7 +80,6 @@ public actor PiClient {
     private var decoder: ServerMessageDecoder?
     private var pending: [String: CheckedContinuation<ResponseEnvelope, Error>] = [:]
     private var cancelledRequestIDs: Set<String> = []
-    private var cancelledRequestOrder: [String] = []
     private var handshake: HandshakeOperation?
     private var leases: [String: LeaseBook] = [:]
     private var sessionSnapshots: [String: SessionSnapshot] = [:]
@@ -595,10 +596,7 @@ public actor PiClient {
         switch message {
         case .response(let response):
             guard let continuation = pending.removeValue(forKey: response.id) else {
-                if cancelledRequestIDs.remove(response.id) != nil {
-                    cancelledRequestOrder.removeAll { $0 == response.id }
-                    return
-                }
+                if cancelledRequestIDs.remove(response.id) != nil { return }
                 Task {
                     await fail(
                         PiClientError.protocolFailure("Response has no matching request: \(response.id)"),
@@ -638,18 +636,26 @@ public actor PiClient {
         await fail(error ?? PiClientError.disconnected, close: false)
     }
     private func reject(id: String, error: Error) {
-        pending.removeValue(forKey: id)?.resume(throwing: error)
+        if let continuation = pending.removeValue(forKey: id) {
+            continuation.resume(throwing: error)
+        } else {
+            cancelledRequestIDs.remove(id)
+        }
     }
 
-    private func cancelRequest(id: String) {
+    private func cancelRequest(id: String) async {
         guard let continuation = pending.removeValue(forKey: id) else { return }
         continuation.resume(throwing: CancellationError())
-        guard cancelledRequestIDs.insert(id).inserted else { return }
-        cancelledRequestOrder.append(id)
-        if cancelledRequestOrder.count > 1_024 {
-            let expired = cancelledRequestOrder.removeFirst()
-            cancelledRequestIDs.remove(expired)
+        guard cancelledRequestIDs.count < Self.maximumCancelledRequestIDs else {
+            await fail(
+                PiClientError.protocolFailure(
+                    "Cancelled request tracking limit exceeded"
+                ),
+                close: true
+            )
+            return
         }
+        cancelledRequestIDs.insert(id)
     }
 
     private func fail(_ error: Error, close: Bool) async {
@@ -670,7 +676,6 @@ public actor PiClient {
         let current = pending
         pending.removeAll()
         cancelledRequestIDs.removeAll()
-        cancelledRequestOrder.removeAll()
         current.values.forEach { $0.resume(throwing: error) }
         if close {
             let value = transport

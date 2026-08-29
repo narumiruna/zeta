@@ -21,6 +21,45 @@ final class ZetaConfigTests: XCTestCase {
         XCTAssertEqual(result.retry.maxRetries, 3)
     }
 
+    func testPinnedFullscreenExitOutputKeyLoadsAndLegacyKeyMigrates() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let global = directory.appendingPathComponent("settings.json")
+        try Data(#"{"fullscreenExitOutput":"resume-hint"}"#.utf8).write(to: global)
+
+        let pinned = try SettingsStore.loadMerged(globalURL: global, projectURL: nil)
+        XCTAssertEqual(pinned.fullscreenExitOutput, "resume-hint")
+        let encoded =
+            try JSONSerialization.jsonObject(
+                with: JSONEncoder().encode(pinned)
+            ) as? [String: Any]
+        XCTAssertEqual(encoded?["fullscreenExitOutput"] as? String, "resume-hint")
+        XCTAssertNil(encoded?["fullscreenExit"])
+
+        try Data(#"{"fullscreenExit":"none"}"#.utf8).write(to: global)
+        let legacy = try SettingsStore.loadMerged(globalURL: global, projectURL: nil)
+        XCTAssertEqual(legacy.fullscreenExitOutput, "none")
+
+        var previousZetaPayload = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(Settings()))
+                as? [String: Any]
+        )
+        previousZetaPayload["fullscreenExitOutput"] = nil
+        previousZetaPayload["fullscreenExit"] = "none"
+        let directlyDecoded = try JSONDecoder().decode(
+            Settings.self,
+            from: JSONSerialization.data(withJSONObject: previousZetaPayload)
+        )
+        XCTAssertEqual(directlyDecoded.fullscreenExitOutput, "none")
+        let directlyReencoded = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(directlyDecoded))
+                as? [String: Any]
+        )
+        XCTAssertEqual(directlyReencoded["fullscreenExitOutput"] as? String, "none")
+        XCTAssertNil(directlyReencoded["fullscreenExit"])
+    }
+
     func testLegacySettingsAndParentTrustMigrate() async throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString)

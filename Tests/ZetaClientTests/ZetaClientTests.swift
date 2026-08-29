@@ -420,6 +420,78 @@ final class ZetaClientTests: XCTestCase {
         XCTAssertEqual(disconnectedValue, .disconnected)
     }
 
+    func testCancellationTrackingBudgetRetiresConnectionWithoutEvictingIDs() async throws {
+        let box = ControlledTransportBox()
+        let client = try PiClient { handlers in
+            let transport = ControlledTransport(handlers: handlers)
+            await box.set(transport)
+            return transport
+        }
+        try await client.connect()
+        let transport = await box.wait()
+        let trackedRequests = (0..<1_024).map { _ in
+            Task { await listOutcome(from: client) }
+        }
+        try await waitUntil { await transport.listCount == trackedRequests.count }
+        for request in trackedRequests { request.cancel() }
+        for request in trackedRequests {
+            let outcome = await request.value
+            XCTAssertEqual(outcome, .cancelled)
+        }
+        let stateAtBudget = await client.connectionState()
+        XCTAssertEqual(stateAtBudget, .connected)
+
+        let overflow = Task { await listOutcome(from: client) }
+        try await waitUntil { await transport.listCount == trackedRequests.count + 1 }
+        overflow.cancel()
+
+        try await waitUntil { await client.connectionState() == .disconnected }
+        let overflowOutcome = await overflow.value
+        XCTAssertEqual(overflowOutcome, .cancelled)
+        let closeCount = await transport.closeCount
+        XCTAssertEqual(closeCount, 1)
+    }
+
+    func testCancelledRequestSendFailuresDoNotExhaustTrackingBudget() async throws {
+        let box = SendFailureTransportBox()
+        let client = try PiClient { handlers in
+            let transport = SendFailureTransport(handlers: handlers)
+            await box.set(transport)
+            return transport
+        }
+        try await client.connect()
+        let transport = await box.wait()
+
+        let failedRequest = Task { await listOutcome(from: client) }
+        try await waitUntil { await transport.sentCount == 1 }
+        failedRequest.cancel()
+        let failedOutcome = await failedRequest.value
+        XCTAssertEqual(failedOutcome, .cancelled)
+        await transport.failFirst()
+        try await waitUntil { await transport.failedCount == 1 }
+        try await Task.sleep(for: .milliseconds(10))
+
+        let trackedRequests = (0..<1_024).map { _ in
+            Task { await listOutcome(from: client) }
+        }
+        try await waitUntil { await transport.sentCount == 1_025 }
+        for request in trackedRequests { request.cancel() }
+        for request in trackedRequests {
+            let outcome = await request.value
+            XCTAssertEqual(outcome, .cancelled)
+        }
+
+        let state = await client.connectionState()
+        guard state == .connected else {
+            return XCTFail("Definitively failed sends must release cancelled request IDs")
+        }
+        await transport.enableResponses()
+        let usableRequest = Task { await listOutcome(from: client) }
+        try await waitUntil { await transport.sentCount == 1_026 }
+        let usableOutcome = await usableRequest.value
+        XCTAssertEqual(usableOutcome, .success)
+    }
+
     func testUnknownResponseIDFailsConnectionAndPendingRequest() async throws {
         let box = ControlledTransportBox()
         let client = try PiClient { handlers in
@@ -674,6 +746,81 @@ private actor ControlledTransport: ByteTransport {
     }
 }
 
+private enum RequestSendFailure: Error {
+    case expected
+}
+
+private actor SendFailureTransportBox {
+    private var value: SendFailureTransport?
+    private var waiters: [CheckedContinuation<SendFailureTransport, Never>] = []
+
+    func set(_ value: SendFailureTransport) {
+        self.value = value
+        waiters.forEach { $0.resume(returning: value) }
+        waiters.removeAll()
+    }
+
+    func wait() async -> SendFailureTransport {
+        if let value { return value }
+        return await withCheckedContinuation { waiters.append($0) }
+    }
+}
+
+private actor SendFailureTransport: ByteTransport {
+    private let handlers: ByteTransportHandlers
+    private let decoder = try! ClientMessageDecoder()
+    private var firstSend: CheckedContinuation<Void, Error>?
+    private var responds = false
+    private(set) var sentCount = 0
+    private(set) var failedCount = 0
+
+    init(handlers: ByteTransportHandlers) { self.handlers = handlers }
+
+    func send(_ bytes: Data) async throws {
+        for message in try decoder.push(bytes) {
+            switch message {
+            case .hello:
+                let snapshot = try ServerSnapshot(
+                    serverID: "server",
+                    revision: 0,
+                    sessions: [],
+                    models: []
+                )
+                handlers.onData(
+                    try encodeServerMessage(
+                        .hello(try ServerHello(connectionID: "connection", snapshot: snapshot))
+                    )
+                )
+            case .request(let request):
+                sentCount += 1
+                if sentCount == 1 {
+                    do {
+                        try await withCheckedThrowingContinuation { firstSend = $0 }
+                    } catch {
+                        failedCount += 1
+                        throw error
+                    }
+                } else if responds {
+                    handlers.onData(
+                        try encodeServerMessage(
+                            .response(.success(id: request.id, result: .list([])))
+                        )
+                    )
+                }
+            }
+        }
+    }
+
+    func failFirst() {
+        firstSend?.resume(throwing: RequestSendFailure.expected)
+        firstSend = nil
+    }
+
+    func enableResponses() { responds = true }
+
+    func close() {}
+}
+
 private actor FailureResponseTransportBox {
     private var value: FailureResponseTransport?
     private var waiters: [CheckedContinuation<FailureResponseTransport, Never>] = []
@@ -800,7 +947,7 @@ private final class ScriptedTransport: ByteTransport, @unchecked Sendable {
 }
 
 private func waitUntil(_ condition: @escaping () async -> Bool) async throws {
-    for _ in 0..<100 {
+    for _ in 0..<1_000 {
         if await condition() { return }
         try await Task.sleep(for: .milliseconds(5))
     }

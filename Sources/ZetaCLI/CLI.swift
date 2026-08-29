@@ -297,7 +297,7 @@ public enum ZetaCLI {
             return AltScreenTUI(
                 terminal: terminal,
                 root: root,
-                transcriptOnExit: settings.fullscreenExit == "transcript"
+                transcriptOnExit: settings.fullscreenExitOutput == "transcript"
             )
         }
         return TUI(terminal: terminal, root: root)

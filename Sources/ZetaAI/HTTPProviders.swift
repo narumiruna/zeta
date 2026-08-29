@@ -79,22 +79,30 @@ public struct HTTPProvider: AIProvider {
                 await output.emit(.start(reducer.partial))
                 started = true
                 var decoder = SSEDecoder()
-                for try await byte in bytes {
+                var reachedDoneSentinel = false
+                streamLoop: for try await byte in bytes {
                     try Task.checkCancellation()
                     for record in try decoder.pushValidated(byte) {
-                        try await consume(
+                        if try await consume(
                             record: record,
                             reducer: &reducer,
                             output: output
-                        )
+                        ) {
+                            reachedDoneSentinel = true
+                            break streamLoop
+                        }
                     }
                 }
-                for record in try decoder.finishValidated() {
-                    try await consume(
-                        record: record,
-                        reducer: &reducer,
-                        output: output
-                    )
+                if !reachedDoneSentinel {
+                    for record in try decoder.finishValidated() {
+                        if try await consume(
+                            record: record,
+                            reducer: &reducer,
+                            output: output
+                        ) {
+                            break
+                        }
+                    }
                 }
                 let partial = reducer.partial
                 guard partial.stopReason != .pending else {
@@ -335,12 +343,19 @@ public struct HTTPProvider: AIProvider {
         record: SSERecord,
         reducer: inout ProviderEventReducer,
         output: AssistantEventStream
-    ) async throws {
-        guard !record.data.isEmpty, record.data != "[DONE]" else { return }
+    ) async throws -> Bool {
+        guard !record.data.isEmpty else { return false }
+        if record.data == "[DONE]" {
+            for event in reducer.finishAtDoneSentinel() {
+                await output.emit(event)
+            }
+            return true
+        }
         let value = try OrderedJSON.decode(record.data)
         for event in try reducer.consume(value, eventName: record.event) {
             await output.emit(event)
         }
+        return false
     }
 }
 
