@@ -146,34 +146,137 @@ def resolved_pins(path: Path) -> dict[str, ResolvedPin]:
     return result
 
 
-def independently_resolve(package_path: Path) -> dict[str, ResolvedPin]:
+def dependency_graph_identities(graph: Any) -> set[str]:
+    if not isinstance(graph, dict):
+        raise ValueError("resolved dependency graph root is invalid")
+    root_dependencies = graph.get("dependencies")
+    if not isinstance(root_dependencies, list):
+        raise ValueError("resolved dependency graph root has no dependency list")
+
+    identities: set[str] = set()
+    pending = list(root_dependencies)
+    while pending:
+        package = pending.pop()
+        if not isinstance(package, dict):
+            raise ValueError("resolved dependency graph contains an invalid package")
+        identity = package.get("identity")
+        dependencies = package.get("dependencies")
+        if not isinstance(identity, str) or not identity:
+            raise ValueError("resolved dependency graph contains a package without identity")
+        if not isinstance(dependencies, list):
+            raise ValueError(
+                f"resolved dependency graph package {identity!r} has no dependency list"
+            )
+        identities.add(identity.lower())
+        pending.extend(dependencies)
+    return identities
+
+
+def verify_version_revision(identity: str, pin: ResolvedPin) -> None:
+    if pin.kind != "remoteSourceControl":
+        return
+    version = pin.state.get("version")
+    if version is None:
+        return
+    revision = pin.state.get("revision")
+    if not isinstance(version, str) or not version:
+        raise ValueError(f"resolved version for {identity!r} is invalid")
+    if not isinstance(revision, str) or not revision:
+        raise ValueError(
+            f"resolved revision for versioned package {identity!r} is invalid"
+        )
+
+    tag_names = (version, f"v{version}")
+    tag_refs = tuple(f"refs/tags/{tag}" for tag in tag_names)
+    expected_refs = set(tag_refs) | {f"{tag_ref}^{{}}" for tag_ref in tag_refs}
+    result = subprocess.run(
+        ["git", "ls-remote", "--tags", pin.location, *sorted(expected_refs)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    remote_refs: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        fields = line.split("\t")
+        if len(fields) != 2 or fields[1] not in expected_refs or not fields[0]:
+            raise ValueError(f"release tag response for {identity!r} is invalid")
+        remote_refs[fields[1]] = fields[0]
+
+    tag_revisions = {
+        remote_refs.get(f"{tag_ref}^{{}}", remote_refs[tag_ref])
+        for tag_ref in tag_refs
+        if tag_ref in remote_refs
+    }
+    if not tag_revisions:
+        raise ValueError(
+            f"release tag for {identity!r} version {version!r} was not found"
+        )
+    if len(tag_revisions) != 1:
+        raise ValueError(
+            f"release tags for {identity!r} version {version!r} are ambiguous"
+        )
+    tag_revision = tag_revisions.pop()
+    if revision.lower() != tag_revision.lower():
+        raise ValueError(
+            f"release tag for {identity!r} version {version!r} resolves to "
+            f"{tag_revision!r}, not committed revision {revision!r}"
+        )
+
+
+def independently_resolve(
+    package_path: Path, resolved_path: Path
+) -> dict[str, ResolvedPin]:
     manifest_path = package_path / "Package.swift"
     if not manifest_path.is_file():
         raise ValueError(f"package manifest is missing from {package_path}")
+    if not resolved_path.is_file():
+        raise ValueError("external dependencies require a committed Package.resolved")
 
     with tempfile.TemporaryDirectory(prefix="zeta-package-resolution-") as temporary:
         resolution_root = Path(temporary)
         for candidate in package_path.glob("Package*.swift"):
             shutil.copy2(candidate, resolution_root / candidate.name)
+        for directory_name in ("Sources", "Tests", "Plugins"):
+            source_directory = package_path / directory_name
+            if source_directory.is_dir():
+                (resolution_root / directory_name).symlink_to(
+                    source_directory.resolve(),
+                    target_is_directory=True,
+                )
+        shutil.copy2(resolved_path, resolution_root / "Package.resolved")
         configuration = package_path / ".swiftpm" / "configuration"
         if configuration.is_dir():
             shutil.copytree(
                 configuration,
                 resolution_root / ".swiftpm" / "configuration",
             )
-        subprocess.run(
-            [
-                "swift",
-                "package",
-                "--package-path",
-                str(resolution_root),
-                "--scratch-path",
-                str(resolution_root / ".build"),
-                "resolve",
-            ],
+        swift_package = [
+            "swift",
+            "package",
+            "--package-path",
+            str(resolution_root),
+            "--scratch-path",
+            str(resolution_root / ".build"),
+            "--force-resolved-versions",
+        ]
+        subprocess.run([*swift_package, "resolve"], check=True)
+        graph_result = subprocess.run(
+            [*swift_package, "show-dependencies", "--format", "json"],
             check=True,
+            capture_output=True,
+            text=True,
         )
-        return resolved_pins(resolution_root / "Package.resolved")
+        pins = resolved_pins(resolution_root / "Package.resolved")
+        identities = dependency_graph_identities(json.loads(graph_result.stdout))
+        unpinned = sorted(identities - pins.keys())
+        if unpinned:
+            raise ValueError(
+                f"resolved dependency graph contains unpinned packages: {unpinned}"
+            )
+        reachable_pins = {identity: pins[identity] for identity in identities}
+        for identity, pin in sorted(reachable_pins.items()):
+            verify_version_revision(identity, pin)
+        return reachable_pins
 
 
 def compare_resolution_graphs(
@@ -252,8 +355,12 @@ def main() -> None:
     try:
         manifest = load_manifest(args.manifest, args.package_path)
         requirements = direct_requirements(manifest)
-        independent_pins = independently_resolve(args.package_path) if requirements else {}
         resolved_path = args.resolved or args.package_path / "Package.resolved"
+        independent_pins = (
+            independently_resolve(args.package_path, resolved_path)
+            if requirements
+            else {}
+        )
         count = check_dependency_policy(manifest, resolved_path, independent_pins)
     except (OSError, ValueError, json.JSONDecodeError, subprocess.CalledProcessError) as error:
         raise SystemExit(f"package dependency policy failed: {error}") from error
