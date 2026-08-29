@@ -24,12 +24,19 @@ public enum SessionError: Error, LocalizedError, Sendable {
 }
 
 public actor SessionManager {
+    private static let blockingQueue = DispatchQueue(
+        label: "works.earendil.zeta.sessions.blocking",
+        attributes: .concurrent
+    )
+
     public let header: SessionHeader
     public let file: URL?
     private var entries: [SessionEntry]
     private var byID: [String: SessionEntry]
     private var leafID: String?
     private var physicallyCreated: Bool
+    private var appendActive = false
+    private var appendWaiters: [CheckedContinuation<Void, Never>] = []
 
     public init(header: SessionHeader, entries: [SessionEntry] = [], file: URL? = nil) throws {
         guard Self.validSessionID(header.id) else { throw SessionError.invalidSessionID }
@@ -136,13 +143,16 @@ public actor SessionManager {
     }
 
     @discardableResult
-    public func append(_ entry: SessionEntry) throws -> SessionEntry {
+    public func append(_ entry: SessionEntry) async throws -> SessionEntry {
+        await beginAppend()
+        defer { endAppend() }
         guard byID[entry.base.id] == nil else { throw SessionError.duplicateID(entry.base.id) }
         if let parent = entry.base.parentId, byID[parent] == nil { throw SessionError.missingParent(parent) }
 
         let materialized: Bool
-        if physicallyCreated {
-            try appendRecord(entry)
+        if physicallyCreated, let file {
+            let record = try Self.line(entry)
+            try await Self.appendRecord(record, to: file)
             materialized = false
         } else if case .message(_, .assistant) = entry {
             materialized = try ensureFileAndAppendPending(entry)
@@ -281,9 +291,44 @@ public actor SessionManager {
         try data.write(to: file, options: .atomic)
     }
 
-    private func appendRecord(_ entry: SessionEntry) throws {
-        guard let file else { return }
-        let record = try Self.line(entry)
+    private func beginAppend() async {
+        if !appendActive {
+            appendActive = true
+            return
+        }
+        await withCheckedContinuation { continuation in
+            appendWaiters.append(continuation)
+        }
+    }
+
+    private func endAppend() {
+        guard !appendWaiters.isEmpty else {
+            appendActive = false
+            return
+        }
+        appendWaiters.removeFirst().resume()
+    }
+
+    private nonisolated static func appendRecord(
+        _ record: Data,
+        to file: URL
+    ) async throws {
+        try await withCheckedThrowingContinuation { continuation in
+            blockingQueue.async {
+                do {
+                    try appendRecordSynchronously(record, to: file)
+                    continuation.resume()
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    private nonisolated static func appendRecordSynchronously(
+        _ record: Data,
+        to file: URL
+    ) throws {
         let handle = try FileHandle(forWritingTo: file)
         defer { try? handle.close() }
         guard flock(handle.fileDescriptor, LOCK_EX) == 0 else {

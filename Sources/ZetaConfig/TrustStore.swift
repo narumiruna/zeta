@@ -7,8 +7,15 @@ public enum TrustDecision: String, Codable, Sendable {
 }
 
 public actor TrustStore {
+    private static let blockingQueue = DispatchQueue(
+        label: "works.earendil.zeta.trust.blocking",
+        attributes: .concurrent
+    )
+
     private let url: URL
     private var decisions: [String: TrustDecision]
+    private var mutationActive = false
+    private var mutationWaiters: [CheckedContinuation<Void, Never>] = []
 
     public init(url: URL) throws {
         self.url = url
@@ -24,16 +31,52 @@ public actor TrustStore {
         return decisions["/"]
     }
 
-    public func set(_ decision: TrustDecision, for directory: URL) throws {
-        decisions = try persist(
-            decision,
-            for: directory.standardizedFileURL.path
-        )
+    public func set(_ decision: TrustDecision, for directory: URL) async throws {
+        await beginMutation()
+        defer { endMutation() }
+        let path = directory.standardizedFileURL.path
+        let url = url
+        decisions = try await Self.performBlocking {
+            try Self.persist(decision, for: path, to: url)
+        }
     }
 
-    private func persist(
+    private func beginMutation() async {
+        if !mutationActive {
+            mutationActive = true
+            return
+        }
+        await withCheckedContinuation { continuation in
+            mutationWaiters.append(continuation)
+        }
+    }
+
+    private func endMutation() {
+        guard !mutationWaiters.isEmpty else {
+            mutationActive = false
+            return
+        }
+        mutationWaiters.removeFirst().resume()
+    }
+
+    private nonisolated static func performBlocking<Value: Sendable>(
+        _ operation: @escaping @Sendable () throws -> Value
+    ) async throws -> Value {
+        try await withCheckedThrowingContinuation { continuation in
+            blockingQueue.async {
+                do {
+                    continuation.resume(returning: try operation())
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    private nonisolated static func persist(
         _ decision: TrustDecision,
-        for path: String
+        for path: String,
+        to url: URL
     ) throws -> [String: TrustDecision] {
         try FileManager.default.createDirectory(
             at: url.deletingLastPathComponent(),
@@ -41,7 +84,7 @@ public actor TrustStore {
             attributes: [.posixPermissions: 0o700]
         )
         return try withAdvisoryFileLock(url: url) {
-            var candidate = try Self.load(url)
+            var candidate = try load(url)
             candidate[path] = decision
             let values = candidate.mapValues { $0 == .trusted }
             let data = try JSONSerialization.data(

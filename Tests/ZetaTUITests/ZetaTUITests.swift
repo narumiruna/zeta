@@ -236,6 +236,20 @@ final class ZetaTUITests: XCTestCase {
         XCTAssertTrue(terminal.output.contains("line 4"))
     }
 
+    func testAltScreenStartupFailureDoesNotChangeTerminalModes() {
+        let terminal = FailingStartTerminal()
+        let tui = AltScreenTUI(
+            terminal: terminal,
+            root: Container([Text("never rendered")])
+        )
+
+        XCTAssertThrowsError(try tui.start())
+        tui.stop()
+
+        XCTAssertEqual(terminal.output, "")
+        XCTAssertEqual(terminal.stopCount, 0)
+    }
+
     func testOverlaysClipboardAndHyperlinks() throws {
         let terminal = VirtualTerminal(columns: 30, rows: 8)
         let tui = TUI(terminal: terminal, root: Container([Text("base")]))
@@ -293,6 +307,23 @@ final class ZetaTUITests: XCTestCase {
         XCTAssertFalse(snapshot.overlapped)
         tui.stop()
     }
+}
+
+private final class FailingStartTerminal: Terminal, @unchecked Sendable {
+    private(set) var output = ""
+    private(set) var stopCount = 0
+    var columns: Int { 80 }
+    var rows: Int { 24 }
+
+    func start(
+        onInput: @escaping @Sendable (Data) -> Void,
+        onResize: @escaping @Sendable () -> Void
+    ) throws {
+        throw POSIXError(.ENOTTY)
+    }
+
+    func stop() { stopCount += 1 }
+    func write(_ data: Data) { output += String(decoding: data, as: UTF8.self) }
 }
 
 private struct FixedAutocompleteProvider: AutocompleteProvider {

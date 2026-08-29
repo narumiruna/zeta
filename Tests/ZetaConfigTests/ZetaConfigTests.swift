@@ -88,6 +88,38 @@ final class ZetaConfigTests: XCTestCase {
         XCTAssertEqual(decisionB, .denied)
     }
 
+    func testTrustLockWaitDoesNotBlockActor() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let url = directory.appendingPathComponent("trust.json")
+        let store = try TrustStore(url: url)
+        let descriptor = open(url.appendingPathExtension("lock").path, O_CREAT | O_RDWR, 0o600)
+        XCTAssertGreaterThanOrEqual(descriptor, 0)
+        guard descriptor >= 0 else { return }
+        XCTAssertEqual(flock(descriptor, LOCK_EX), 0)
+        defer {
+            flock(descriptor, LOCK_UN)
+            close(descriptor)
+        }
+
+        let setTask = Task {
+            try await store.set(.trusted, for: directory.appendingPathComponent("project"))
+        }
+        try await Task.sleep(for: .milliseconds(50))
+        let readCompleted = ConfigLockedFlag()
+        let readTask = Task {
+            _ = await store.decision(for: directory)
+            readCompleted.set()
+        }
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertTrue(readCompleted.value)
+
+        flock(descriptor, LOCK_UN)
+        try await setTask.value
+        _ = await readTask.value
+    }
+
     func testTrustPersistenceFailureDoesNotPublishCandidate() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -434,6 +466,14 @@ private func waitForCondition(
         guard clock.now < deadline else { throw ConfigTestError.timedOut }
         try await Task.sleep(for: .milliseconds(1))
     }
+}
+
+private final class ConfigLockedFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storedValue = false
+
+    var value: Bool { lock.withLock { storedValue } }
+    func set() { lock.withLock { storedValue = true } }
 }
 
 private enum ConfigTestError: Error {

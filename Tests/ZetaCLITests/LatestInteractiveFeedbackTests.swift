@@ -63,6 +63,8 @@ final class LatestInteractiveFeedbackTests: XCTestCase {
 
         XCTAssertNotEqual(kill(pid, 0), 0)
         XCTAssertEqual(errno, ESRCH)
+        let hadFailure = await runner.hadFailure()
+        XCTAssertFalse(hadFailure)
     }
 
     private func waitUntil(

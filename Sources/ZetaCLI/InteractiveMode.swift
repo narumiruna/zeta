@@ -27,6 +27,7 @@ actor InteractiveRunner {
     private let shell: ShellTool
     private let session: PersistentSessionController?
     private var activeShell: (id: UUID, task: Task<ShellResult, Error>)?
+    private var cancelledShells: Set<UUID> = []
     private var exitRequested = false
     private var failed = false
 
@@ -199,12 +200,17 @@ actor InteractiveRunner {
             activeShell = (id, task)
             do {
                 let result = try await task.value
+                cancelledShells.remove(id)
                 if activeShell?.id == id { activeShell = nil }
                 transcript.add(Text(result.output))
                 tui.requestRender()
                 return true
             } catch {
+                let deliberatelyCancelled = cancelledShells.remove(id) != nil
                 if activeShell?.id == id { activeShell = nil }
+                if deliberatelyCancelled, error is CancellationError {
+                    return true
+                }
                 throw error
             }
         }
@@ -213,6 +219,7 @@ actor InteractiveRunner {
 
     private func cancelDirectShell() async {
         guard let activeShell else { return }
+        cancelledShells.insert(activeShell.id)
         activeShell.task.cancel()
         _ = try? await activeShell.task.value
         if self.activeShell?.id == activeShell.id {

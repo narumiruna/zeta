@@ -45,19 +45,14 @@ public final class AltScreenTUI: @unchecked Sendable {
     public func start() throws {
         try executor.sync {
             guard !started else { return }
+            try terminal.start(
+                onInput: { [weak self] data in
+                    self?.handleInput(String(decoding: data, as: UTF8.self))
+                },
+                onResize: { [weak self] in self?.requestRender(force: true) }
+            )
             started = true
             terminal.write(Data("\u{1B}[?1049h\u{1B}[?7l\u{1B}[?25l".utf8))
-            do {
-                try terminal.start(
-                    onInput: { [weak self] data in
-                        self?.handleInput(String(decoding: data, as: UTF8.self))
-                    },
-                    onResize: { [weak self] in self?.requestRender(force: true) }
-                )
-            } catch {
-                started = false
-                throw error
-            }
             scheduleRender(force: true)
         }
     }

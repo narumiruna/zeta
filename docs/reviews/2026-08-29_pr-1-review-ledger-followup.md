@@ -834,3 +834,59 @@ The complete local repository gate passed 317 XCTest cases and 57 Swift Testing 
 The complete local Address Sanitizer and Thread Sanitizer suites each passed the same 374 tests without findings.
 Strict concurrency, warnings-as-errors, formatting, file-length, API compatibility, generated documentation, and interoperability checks passed.
 GitHub CI was not used as completion evidence for this round, per maintainer direction.
+
+## Sixteenth-round inline feedback
+
+### `3886195349`
+
+Concern: Fullscreen startup writes terminal mode sequences before terminal startup can fail.
+
+Initial outcome: Actionable and not yet addressed.
+
+Resolution: Addressed by starting the terminal before entering alternate-screen, disabled-wrap, and hidden-cursor modes.
+
+Evidence: `testAltScreenStartupFailureDoesNotChangeTerminalModes` injects an `ENOTTY` startup failure and verifies no terminal output or stop call occurs.
+
+### `3886195352`
+
+Concern: Package registry lock waiting and the complete filesystem transaction execute on `ResourcePackageManager` actor isolation.
+
+Initial outcome: Actionable and not yet addressed.
+
+Resolution: Addressed by running lock acquisition, registry reload, package publication or removal, index persistence, and rollback on a nonisolated concurrent blocking queue, then publishing the returned registry on the actor.
+
+Evidence: `testRegistryLockWaitDoesNotBlockActor` holds `.packages.lock`, starts an install, and verifies actor-isolated listing remains responsive before releasing the lock.
+
+### `3886195356`
+
+Concern: Session file lock waiting, seeking, writing, synchronization, and rollback execute on `SessionManager` actor isolation.
+
+Initial outcome: Actionable and not yet addressed.
+
+Resolution: Addressed by preparing the encoded record on the actor, running the complete locked append on a nonisolated concurrent blocking queue, and updating actor state only after persistence succeeds.
+
+Evidence: `testSessionLockWaitDoesNotBlockActor` holds the session file lock, starts an append, and verifies actor-isolated reads remain responsive before releasing the lock.
+
+### `3886195357`
+
+Concern: Deliberate direct-shell cancellation is reported as an interactive failure.
+
+Initial outcome: Actionable and not yet addressed.
+
+Resolution: Addressed by tracking shell identifiers cancelled through the runner lifecycle and suppressing only their resulting `CancellationError` while preserving genuine shell failures.
+
+Evidence: `testInteractiveExitCancelsAndWaitsForDirectShell` now verifies the process exits and the runner does not record a failure.
+
+## Sixteenth-round same-pattern review
+
+The full diff review found the same actor-isolated advisory lock wait in the changed trust-store persistence path.
+
+Resolution: The trust decision merge and publication now run on a nonisolated concurrent blocking queue while same-actor mutations remain ordered.
+
+Evidence: `testTrustLockWaitDoesNotBlockActor` holds the advisory lock, starts a trust update, and verifies actor-isolated reads remain responsive before releasing the lock.
+
+## Sixteenth-round verification
+
+The complete repository gate passed 321 XCTest cases and 57 Swift Testing cases in a disposable validation checkout named `zeta` against the clean pinned oracle.
+The complete local Address Sanitizer and Thread Sanitizer suites each passed the same 378 tests without findings.
+Strict concurrency, warnings-as-errors, formatting, file-length, API compatibility, generated documentation, plugin examples, and pinned TypeScript interoperability checks passed.
