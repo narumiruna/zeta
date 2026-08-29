@@ -40,6 +40,24 @@ final class ZetaConfigTests: XCTestCase {
         try Data(#"{"fullscreenExit":"none"}"#.utf8).write(to: global)
         let legacy = try SettingsStore.loadMerged(globalURL: global, projectURL: nil)
         XCTAssertEqual(legacy.fullscreenExitOutput, "none")
+
+        var previousZetaPayload = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(Settings()))
+                as? [String: Any]
+        )
+        previousZetaPayload["fullscreenExitOutput"] = nil
+        previousZetaPayload["fullscreenExit"] = "none"
+        let directlyDecoded = try JSONDecoder().decode(
+            Settings.self,
+            from: JSONSerialization.data(withJSONObject: previousZetaPayload)
+        )
+        XCTAssertEqual(directlyDecoded.fullscreenExitOutput, "none")
+        let directlyReencoded = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(directlyDecoded))
+                as? [String: Any]
+        )
+        XCTAssertEqual(directlyReencoded["fullscreenExitOutput"] as? String, "none")
+        XCTAssertNil(directlyReencoded["fullscreenExit"])
     }
 
     func testLegacySettingsAndParentTrustMigrate() async throws {

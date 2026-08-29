@@ -146,7 +146,8 @@ private final class DoneSentinelStreamingURLProtocol: URLProtocol, @unchecked Se
             self,
             didLoad: Data(
                 ("data: {\"id\":\"response-1\",\"choices\":[{\"delta\":{\"content\":\"kept\"}}]}\n\n"
-                    + "data: [DONE]\n\n").utf8
+                    + "data: [DONE]\n\n"
+                    + "data: not-valid-json\n\n").utf8
             )
         )
         client?.urlProtocolDidFinishLoading(self)

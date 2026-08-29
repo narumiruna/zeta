@@ -54,6 +54,65 @@ public struct Settings: Codable, Sendable, Equatable {
 
     public init() {}
 
+    private enum CodingKeys: String, CodingKey {
+        case transport
+        case steeringMode
+        case followUpMode
+        case theme
+        case compaction
+        case retry
+        case httpIdleTimeoutMs
+        case showImages
+        case imageWidth
+        case imageAutoResize
+        case blockImages
+        case tuiMode
+        case fullscreenExitOutput
+        case fullscreenScrollbar
+        case fullscreenCopyOnSelect
+        case outputPadding
+        case editorPadding
+        case autocompleteMaxVisible
+        case defaultProjectTrust
+        case enableInstallTelemetry
+    }
+
+    private enum LegacyCodingKeys: String, CodingKey {
+        case fullscreenExit
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        transport = try container.decode(TransportPreference.self, forKey: .transport)
+        steeringMode = try container.decode(QueueMode.self, forKey: .steeringMode)
+        followUpMode = try container.decode(QueueMode.self, forKey: .followUpMode)
+        theme = try container.decode(String.self, forKey: .theme)
+        compaction = try container.decode(CompactionSettings.self, forKey: .compaction)
+        retry = try container.decode(RetrySettings.self, forKey: .retry)
+        httpIdleTimeoutMs = try container.decode(Int.self, forKey: .httpIdleTimeoutMs)
+        showImages = try container.decode(Bool.self, forKey: .showImages)
+        imageWidth = try container.decode(Int.self, forKey: .imageWidth)
+        imageAutoResize = try container.decode(Bool.self, forKey: .imageAutoResize)
+        blockImages = try container.decode(Bool.self, forKey: .blockImages)
+        tuiMode = try container.decode(String.self, forKey: .tuiMode)
+        fullscreenScrollbar = try container.decode(String.self, forKey: .fullscreenScrollbar)
+        fullscreenCopyOnSelect = try container.decode(Bool.self, forKey: .fullscreenCopyOnSelect)
+        outputPadding = try container.decode(Int.self, forKey: .outputPadding)
+        editorPadding = try container.decode(Int.self, forKey: .editorPadding)
+        autocompleteMaxVisible = try container.decode(Int.self, forKey: .autocompleteMaxVisible)
+        defaultProjectTrust = try container.decode(
+            ProjectTrustDefault.self,
+            forKey: .defaultProjectTrust
+        )
+        enableInstallTelemetry = try container.decode(Bool.self, forKey: .enableInstallTelemetry)
+        if container.contains(.fullscreenExitOutput) {
+            fullscreenExitOutput = try container.decode(String.self, forKey: .fullscreenExitOutput)
+        } else {
+            let legacy = try decoder.container(keyedBy: LegacyCodingKeys.self)
+            fullscreenExitOutput = try legacy.decode(String.self, forKey: .fullscreenExit)
+        }
+    }
+
     @available(*, deprecated, renamed: "fullscreenExitOutput")
     public var fullscreenExit: String {
         get { fullscreenExitOutput }

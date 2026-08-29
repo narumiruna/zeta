@@ -636,7 +636,11 @@ public actor PiClient {
         await fail(error ?? PiClientError.disconnected, close: false)
     }
     private func reject(id: String, error: Error) {
-        pending.removeValue(forKey: id)?.resume(throwing: error)
+        if let continuation = pending.removeValue(forKey: id) {
+            continuation.resume(throwing: error)
+        } else {
+            cancelledRequestIDs.remove(id)
+        }
     }
 
     private func cancelRequest(id: String) async {
