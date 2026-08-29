@@ -366,6 +366,51 @@ final class ZetaAgentTests: XCTestCase {
         XCTAssertEqual(state.messages.count, 3)
     }
 
+    func testAbortRetryWakesActiveBackoffImmediately() async throws {
+        let provider = FauxProvider(tokensPerSecond: 10_000)
+        let model = await provider.models[0]
+        await provider.enqueue(
+            AssistantMessage(
+                api: model.api,
+                provider: model.provider,
+                model: model.id,
+                stopReason: .error,
+                errorMessage: "retry"
+            )
+        )
+        await provider.enqueue(
+            AssistantMessage(
+                content: [.text(text: "should not run")],
+                api: model.api,
+                provider: model.provider,
+                model: model.id,
+                stopReason: .stop
+            )
+        )
+        let agent = Agent(state: AgentState(systemPrompt: "", model: model)) {
+            model, context, options in
+            await provider.stream(model: model, context: context, options: options)
+        }
+        await agent.configureRetry(
+            maximumRetries: 1,
+            baseDelayMilliseconds: 2_000,
+            maximumDelayMilliseconds: 2_000
+        )
+        let prompt = Task { try await agent.prompt(UserMessage("go")) }
+        while await provider.callCount() < 1 {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        try await Task.sleep(for: .milliseconds(20))
+        let start = ContinuousClock.now
+
+        await agent.abortRetry()
+        try await prompt.value
+
+        XCTAssertLessThan(start.duration(to: .now), .milliseconds(500))
+        let callCount = await provider.callCount()
+        XCTAssertEqual(callCount, 1)
+    }
+
     func testRetryDelayUsesConfiguredMaximumAndClampsOverflow() async {
         let provider = FauxProvider()
         let model = await provider.models[0]

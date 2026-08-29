@@ -346,8 +346,13 @@ public actor CLIRPCRuntime {
             try await beginSessionMutation()
             defer { sessionMutationInProgress = false }
             let path = try requiredString("sessionPath", request.fields)
-            let switched = try await session.switchTo(path: path)
+            let switched = try await session.switchTo(
+                path: path,
+                models: models
+            )
             try await agent.setMessages(switched.messages)
+            if let model = switched.model { await agent.setModel(model) }
+            await agent.setThinkingLevel(switched.thinking)
             sessionName = switched.name
             sessionNameInitialized = true
             return ["switched": true, "path": .string(path)]

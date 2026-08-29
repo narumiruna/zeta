@@ -6,6 +6,7 @@ public final class AltScreenTUI: @unchecked Sendable {
     private let root: Component
     private weak var focus: Component?
     private var previous: [String] = []
+    private var inputListeners: [@Sendable (String) -> Bool] = []
     private var offset = 0
     private var followingEnd = true
     private var started = false
@@ -26,6 +27,12 @@ public final class AltScreenTUI: @unchecked Sendable {
         self.transcriptOnExit = transcriptOnExit
     }
 
+    public func addInputListener(
+        _ listener: @escaping @Sendable (String) -> Bool
+    ) {
+        executor.sync { inputListeners.append(listener) }
+    }
+
     public func setFocus(_ component: (Component & Focusable)?) {
         executor.sync {
             if let old = focus as? Focusable { old.focused = false }
@@ -38,19 +45,14 @@ public final class AltScreenTUI: @unchecked Sendable {
     public func start() throws {
         try executor.sync {
             guard !started else { return }
+            try terminal.start(
+                onInput: { [weak self] data in
+                    self?.handleInput(String(decoding: data, as: UTF8.self))
+                },
+                onResize: { [weak self] in self?.requestRender(force: true) }
+            )
             started = true
             terminal.write(Data("\u{1B}[?1049h\u{1B}[?7l\u{1B}[?25l".utf8))
-            do {
-                try terminal.start(
-                    onInput: { [weak self] data in
-                        self?.handleInput(String(decoding: data, as: UTF8.self))
-                    },
-                    onResize: { [weak self] in self?.requestRender(force: true) }
-                )
-            } catch {
-                started = false
-                throw error
-            }
             scheduleRender(force: true)
         }
     }
@@ -102,6 +104,11 @@ public final class AltScreenTUI: @unchecked Sendable {
         executor.sync {
             guard started else { return }
             componentCallbackDepth += 1
+            if inputListeners.reversed().contains(where: { $0(data) }) {
+                componentCallbackDepth -= 1
+                scheduleRender()
+                return
+            }
             switch data {
             case "\u{1B}[A":
                 followingEnd = false

@@ -96,12 +96,11 @@ public struct HTTPProvider: AIProvider {
                         output: output
                     )
                 }
-                var partial = reducer.partial
-                if partial.stopReason == .pending {
-                    partial.stopReason =
-                        partial.content.contains(where: {
-                            if case .toolCall = $0 { true } else { false }
-                        }) ? .toolUse : .stop
+                let partial = reducer.partial
+                guard partial.stopReason != .pending else {
+                    throw ProviderError.invalidResponse(
+                        "Provider stream ended before a terminal event"
+                    )
                 }
                 await output.emit(.done(reason: partial.stopReason, message: partial))
             } catch is CancellationError {

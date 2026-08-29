@@ -49,6 +49,17 @@ import Testing
         )
     }
 
+    @Test func parsesLargeUniqueKeyObjectsWithoutQuadraticDuplicateChecks() throws {
+        let source = "{" + (0..<50_000).map { "\"key\($0)\":\($0)" }.joined(separator: ",") + "}"
+        guard case .object(let object) = try OrderedJSON.decode(source) else {
+            Issue.record("Expected object")
+            return
+        }
+        #expect(object.count == 50_000)
+        #expect(object.keys.first == "key0")
+        #expect(object.keys.last == "key49999")
+    }
+
     @Test func randomizedRoundTrips() throws {
         var generator = SeededGenerator(seed: 0x56700d42)
         for _ in 0..<500 {

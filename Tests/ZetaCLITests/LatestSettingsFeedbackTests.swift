@@ -349,11 +349,15 @@ final class LatestSettingsFeedbackTests: XCTestCase {
         let sessions = root.appendingPathComponent("sessions")
         try FileManager.default.createDirectory(at: cwd, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: sessions, withIntermediateDirectories: true)
+        let largeSession = sessions.appendingPathComponent("target-header-in-filename.jsonl")
         try await writeSession(
             id: "different-id",
-            to: sessions.appendingPathComponent("target-header-in-filename.jsonl"),
+            to: largeSession,
             cwd: cwd
         )
+        let largeHandle = try FileHandle(forWritingTo: largeSession)
+        try largeHandle.truncate(atOffset: 512 * 1_024 * 1_024)
+        try largeHandle.close()
         let expected = sessions.appendingPathComponent("opaque.jsonl")
         try await writeSession(id: "target-header-id", to: expected, cwd: cwd)
         let arguments = try CLIArguments.parse([
@@ -361,6 +365,7 @@ final class LatestSettingsFeedbackTests: XCTestCase {
             "--session-dir", sessions.path,
         ])
 
+        let start = ContinuousClock.now
         let opened = try await PersistentSessionController.open(
             arguments: arguments,
             workingDirectory: cwd,
@@ -370,6 +375,7 @@ final class LatestSettingsFeedbackTests: XCTestCase {
         let snapshot = await session.exportSnapshot()
         let currentFile = await session.currentFile()
         XCTAssertEqual(snapshot.header.id, "target-header-id")
+        XCTAssertLessThan(start.duration(to: .now), .seconds(1))
         XCTAssertEqual(
             currentFile?.resolvingSymlinksInPath(),
             expected.resolvingSymlinksInPath()

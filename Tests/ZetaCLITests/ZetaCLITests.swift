@@ -871,6 +871,23 @@ final class ZetaCLITests: XCTestCase {
         await runtime.stop()
     }
 
+    func testExplicitUnknownProviderIsRejectedInsteadOfFallingBack() throws {
+        let arguments = try CLIArguments.parse(["--provider", "misspelled"])
+        let model = Model(
+            id: "model",
+            name: "Model",
+            api: "openai-completions",
+            provider: "known",
+            baseURL: URL(string: "https://example.com")!,
+            contextWindow: 1_000,
+            maximumTokens: 100
+        )
+
+        XCTAssertThrowsError(try ZetaCLI.selectModel(arguments, from: [model])) { error in
+            XCTAssertTrue(error.localizedDescription.contains("misspelled"))
+        }
+    }
+
     func testModeResolution() throws {
         XCTAssertEqual(try CLIArguments.parse([]).effectiveMode(stdinIsTTY: true, stdoutIsTTY: true), .interactive)
         XCTAssertEqual(try CLIArguments.parse([]).effectiveMode(stdinIsTTY: false, stdoutIsTTY: true), .print)

@@ -353,6 +353,31 @@ final class ZetaClientTests: XCTestCase {
         try await lease.detach()
     }
 
+    func testDisposeFailureSchedulesOrphanDetachmentRetry() async throws {
+        let box = FailureResponseTransportBox()
+        let client = try PiClient { handlers in
+            let transport = FailureResponseTransport(handlers: handlers)
+            await box.set(transport)
+            return transport
+        }
+        try await client.connect()
+        let transport = await box.wait()
+        let expected = try ProtocolErrorValue(code: .busy, message: "Synthetic detach failure")
+        let lease = try await client.attachSession("orphan")
+        await transport.failNext(.detach, error: expected)
+
+        do {
+            try await lease.dispose()
+            XCTFail("Expected initial dispose to report the detach failure")
+        } catch PiClientError.server(let error) {
+            XCTAssertEqual(error, expected)
+        }
+
+        try await waitUntil { await transport.requestCount(for: .detach) == 2 }
+        let reacquired = try await client.acquireSession("orphan", mode: .exclusive)
+        try await reacquired.dispose()
+    }
+
     func testRequestCancellationReturnsBeforeResponseAndRacesResumeOnce() async throws {
         let box = ControlledTransportBox()
         let client = try PiClient { handlers in
@@ -374,6 +399,10 @@ final class ZetaClientTests: XCTestCase {
         XCTAssertEqual(cancelledValue, .cancelled)
 
         await cancelledRequest.value
+        await transport.completeList(at: 0)
+        try await Task.sleep(for: .milliseconds(10))
+        let stateAfterLateResponse = await client.connectionState()
+        XCTAssertEqual(stateAfterLateResponse, .connected)
 
         let completedRequest = Task { try await client.listSessions() }
         try await waitUntil { await transport.listCount == 2 }
@@ -665,6 +694,8 @@ private actor FailureResponseTransport: ByteTransport {
     private let handlers: ByteTransportHandlers
     private let decoder = try! ClientMessageDecoder()
     private var failedCommands: Set<String> = []
+    private var oneShotFailures: [String: ProtocolErrorValue] = [:]
+    private var requestCounts: [String: Int] = [:]
     private var failure = try! ProtocolErrorValue(code: .internalError, message: "Synthetic failure")
 
     init(handlers: ByteTransportHandlers) { self.handlers = handlers }
@@ -672,6 +703,14 @@ private actor FailureResponseTransport: ByteTransport {
     func setFailures(_ commands: [CommandName], error: ProtocolErrorValue) {
         failedCommands = Set(commands.map(\.rawValue))
         failure = error
+    }
+
+    func failNext(_ command: CommandName, error: ProtocolErrorValue) {
+        oneShotFailures[command.rawValue] = error
+    }
+
+    func requestCount(for command: CommandName) -> Int {
+        requestCounts[command.rawValue, default: 0]
     }
 
     func send(_ bytes: Data) throws {
@@ -683,7 +722,11 @@ private actor FailureResponseTransport: ByteTransport {
                     try encodeServerMessage(.hello(try ServerHello(connectionID: "connection", snapshot: snapshot))))
             case .request(let request):
                 let response: ResponseEnvelope
-                if failedCommands.contains(request.request.name.rawValue) {
+                let command = request.request.name.rawValue
+                requestCounts[command, default: 0] += 1
+                if let oneShot = oneShotFailures.removeValue(forKey: command) {
+                    response = .failure(id: request.id, error: oneShot)
+                } else if failedCommands.contains(command) {
                     response = .failure(id: request.id, error: failure)
                 } else {
                     response = .success(id: request.id, result: try result(for: request.request))

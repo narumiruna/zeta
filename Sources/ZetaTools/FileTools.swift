@@ -45,6 +45,7 @@ public struct EditResult: Sendable, Equatable {
 }
 
 package let maximumImageBytes = 20 * 1_024 * 1_024
+package let maximumEditableFileBytes = 20 * 1_024 * 1_024
 
 package enum FileReadContent: Sendable, Equatable {
     case text(String)
@@ -229,9 +230,11 @@ public struct FileTools: @unchecked Sendable {
         }
         let url = try resolve(path)
         return try await FileMutationCoordinator.shared.perform(at: url.path) {
-            guard let data = self.fileManager.contents(atPath: url.path) else {
-                throw FileToolError.unreadable(path)
-            }
+            let data = try self.readBoundedData(
+                from: url,
+                maximumBytes: maximumEditableFileBytes,
+                displayPath: path
+            )
             try Task.checkCancellation()
             let hasBOM = data.starts(with: [0xEF, 0xBB, 0xBF])
             let contentBytes = hasBOM ? data.dropFirst(3) : data[...]
@@ -278,6 +281,47 @@ public struct FileTools: @unchecked Sendable {
             try self.writeAtomically(Data(restored.utf8), to: url)
             return EditResult(
                 replacements: replacements.count, firstChangedLine: firstLine, original: bom + raw, updated: restored)
+        }
+    }
+
+    private func readBoundedData(
+        from url: URL,
+        maximumBytes: Int,
+        displayPath: String
+    ) throws -> Data {
+        let handle: FileHandle
+        do {
+            handle = try FileHandle(forReadingFrom: url)
+        } catch {
+            throw FileToolError.unreadable(displayPath)
+        }
+        defer { try? handle.close() }
+        do {
+            var status = stat()
+            guard fstat(handle.fileDescriptor, &status) == 0,
+                status.st_size >= 0,
+                UInt64(status.st_size) <= UInt64(maximumBytes)
+            else {
+                throw FileToolError.unreadable(displayPath)
+            }
+            var data = Data()
+            data.reserveCapacity(Int(status.st_size))
+            while data.count <= maximumBytes,
+                let chunk = try handle.read(
+                    upToCount: min(64 * 1_024, maximumBytes + 1 - data.count)
+                ),
+                !chunk.isEmpty
+            {
+                data.append(chunk)
+            }
+            guard data.count <= maximumBytes else {
+                throw FileToolError.unreadable(displayPath)
+            }
+            return data
+        } catch let error as FileToolError {
+            throw error
+        } catch {
+            throw FileToolError.unreadable(displayPath)
         }
     }
 

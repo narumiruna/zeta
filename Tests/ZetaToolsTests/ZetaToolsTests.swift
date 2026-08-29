@@ -154,6 +154,35 @@ final class ZetaToolsTests: XCTestCase {
         }
     }
 
+    func testEditRejectsOversizedSparseFileBeforeBuffering() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let file = directory.appendingPathComponent("oversized.txt")
+        XCTAssertTrue(FileManager.default.createFile(atPath: file.path, contents: Data("needle".utf8)))
+        let handle = try FileHandle(forWritingTo: file)
+        try handle.truncate(atOffset: UInt64(maximumEditableFileBytes + 1))
+        try handle.close()
+        let tools = FileTools(workingDirectory: directory)
+        let start = ContinuousClock.now
+
+        do {
+            _ = try await tools.edit(
+                path: "oversized.txt",
+                replacements: [TextReplacement(oldText: "needle", newText: "updated")]
+            )
+            XCTFail("Expected oversized edit to fail")
+        } catch {
+            XCTAssertEqual(error as? FileToolError, .unreadable("oversized.txt"))
+        }
+
+        XCTAssertLessThan(start.duration(to: .now), .seconds(1))
+        XCTAssertEqual(
+            try FileManager.default.attributesOfItem(atPath: file.path)[.size] as? NSNumber,
+            NSNumber(value: maximumEditableFileBytes + 1)
+        )
+    }
+
     func testEditMatchesOriginalAndRejectsOverlap() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)

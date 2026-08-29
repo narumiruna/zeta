@@ -3,6 +3,7 @@ import XCTest
 import ZetaAI
 import ZetaAgent
 import ZetaConfig
+import ZetaCore
 import ZetaModes
 import ZetaSessions
 
@@ -12,10 +13,16 @@ final class NewestCLITrustSessionFeedbackTests: XCTestCase {
     func testRPCLoadsAndSwitchesLatestDurableSessionNameIncludingTombstone() async throws {
         let root = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
-        let model = model(id: "session-name")
+        let initialModel = model(id: "session-name")
+        let switchedModel = model(id: "switched-model")
         let initial = try session(root: root.appendingPathComponent("initial"))
         try await initial.setName("Restored title")
-        let runtime = runtime(model: model, session: initial, workingDirectory: root)
+        let runtime = runtime(
+            model: initialModel,
+            models: [initialModel, switchedModel],
+            session: initial,
+            workingDirectory: root
+        )
 
         let restoredName = try await sessionName(from: runtime)
         XCTAssertEqual(restoredName, "Restored title")
@@ -23,6 +30,8 @@ final class NewestCLITrustSessionFeedbackTests: XCTestCase {
         XCTAssertTrue(restoredHTML.contains("<title>Restored title</title>"))
 
         let alternate = try session(root: root.appendingPathComponent("alternate"))
+        try await alternate.recordModel(switchedModel)
+        try await alternate.recordThinkingLevel(.high)
         try await alternate.setName("Switched title")
         let currentAlternateFile = await alternate.currentFile()
         let alternateFile = try XCTUnwrap(currentAlternateFile)
@@ -35,6 +44,20 @@ final class NewestCLITrustSessionFeedbackTests: XCTestCase {
         XCTAssertTrue(switched.success)
         let switchedName = try await sessionName(from: runtime)
         XCTAssertEqual(switchedName, "Switched title")
+        let switchedState = await runtime.handle(
+            StrictRPCRequest(command: .getState)
+        )
+        guard let stateData = switchedState.data,
+            case .object(let state) = stateData,
+            case .object(let selectedModel)? = state["model"]
+        else {
+            return XCTFail("Expected switched state")
+        }
+        XCTAssertEqual(selectedModel["id"], JSONValue.string(switchedModel.id))
+        XCTAssertEqual(
+            state["thinkingLevel"],
+            JSONValue.string(ThinkingLevel.high.rawValue)
+        )
 
         try await alternate.setName(nil)
         let tombstoneSwitch = await runtime.handle(
@@ -240,17 +263,19 @@ final class NewestCLITrustSessionFeedbackTests: XCTestCase {
 
     private func runtime(
         model: Model,
+        models: [Model]? = nil,
         session: PersistentSessionController,
         workingDirectory: URL
     ) -> CLIRPCRuntime {
-        let provider = FauxProvider(models: [model])
+        let availableModels = models ?? [model]
+        let provider = FauxProvider(models: availableModels)
         let agent = Agent(state: AgentState(systemPrompt: "", model: model)) {
             model, context, options in
             await provider.stream(model: model, context: context, options: options)
         }
         return CLIRPCRuntime(
             agent: agent,
-            models: [model],
+            models: availableModels,
             workingDirectory: workingDirectory,
             session: session
         )

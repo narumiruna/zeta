@@ -1,3 +1,4 @@
+import Darwin
 import XCTest
 import ZetaAI
 
@@ -20,6 +21,101 @@ final class ZetaSessionsTests: XCTestCase {
         let loaded = try SessionManager.load(file: file)
         let context = try await loaded.context()
         XCTAssertEqual(context.messages.count, 2)
+    }
+
+    func testConcurrentManagersSerializeAppendsToOneJSONLFile() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let file = directory.appendingPathComponent("session.jsonl")
+        let creator = try SessionManager(
+            header: SessionHeader(
+                id: "shared-session",
+                timestamp: "2026-01-01T00:00:00Z",
+                cwd: directory.path
+            ),
+            file: file
+        )
+        try await creator.materialize()
+        let first = try SessionManager.load(file: file)
+        let second = try SessionManager.load(file: file)
+        let timestamp = "2026-01-01T00:00:01Z"
+
+        async let firstAppend = first.append(
+            .custom(
+                SessionEntryBase(id: "first", parentId: nil, timestamp: timestamp),
+                customType: "test",
+                data: ["value": 1]
+            )
+        )
+        async let secondAppend = second.append(
+            .custom(
+                SessionEntryBase(id: "second", parentId: nil, timestamp: timestamp),
+                customType: "test",
+                data: ["value": 2]
+            )
+        )
+        _ = try await (firstAppend, secondAppend)
+
+        let records = try Data(contentsOf: file).split(separator: 0x0A).map {
+            try JSONSerialization.jsonObject(with: Data($0)) as? [String: Any]
+        }
+        XCTAssertEqual(records.count, 3)
+        XCTAssertEqual(
+            Set(records.compactMap { $0?["id"] as? String }),
+            Set(["shared-session", "first", "second"])
+        )
+    }
+
+    func testSessionLockWaitDoesNotBlockActor() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let file = directory.appendingPathComponent("session.jsonl")
+        let creator = try SessionManager(
+            header: SessionHeader(
+                id: "shared-session",
+                timestamp: "2026-01-01T00:00:00Z",
+                cwd: directory.path
+            ),
+            file: file
+        )
+        try await creator.materialize()
+        let manager = try SessionManager.load(file: file)
+        let descriptor = open(file.path, O_RDWR)
+        XCTAssertGreaterThanOrEqual(descriptor, 0)
+        guard descriptor >= 0 else { return }
+        XCTAssertEqual(flock(descriptor, LOCK_EX), 0)
+        defer {
+            flock(descriptor, LOCK_UN)
+            close(descriptor)
+        }
+
+        let appendTask = Task {
+            try await manager.append(
+                .custom(
+                    SessionEntryBase(
+                        id: "entry",
+                        parentId: nil,
+                        timestamp: "2026-01-01T00:00:01Z"
+                    ),
+                    customType: "test",
+                    data: [:]
+                )
+            )
+        }
+        try await Task.sleep(for: .milliseconds(50))
+        let readCompleted = SessionLockedFlag()
+        let readTask = Task {
+            _ = await manager.allEntries()
+            readCompleted.set()
+        }
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertTrue(readCompleted.value)
+
+        flock(descriptor, LOCK_UN)
+        _ = try await appendTask.value
+        _ = await readTask.value
     }
 
     func testLoadedSessionAppendsAssistantWithoutRewritingExistingJSONL() async throws {
@@ -234,4 +330,12 @@ final class ZetaSessionsTests: XCTestCase {
         let records = decoder.push(Data("{\"x\":\"a\u{2028}b\"}\r\nlast".utf8)) + decoder.finish()
         XCTAssertEqual(records.map { String(decoding: $0, as: UTF8.self) }, ["{\"x\":\"a\u{2028}b\"}", "last"])
     }
+}
+
+private final class SessionLockedFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storedValue = false
+
+    var value: Bool { lock.withLock { storedValue } }
+    func set() { lock.withLock { storedValue = true } }
 }
