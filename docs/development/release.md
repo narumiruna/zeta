@@ -6,7 +6,7 @@ Publishing requires a separate reviewed change.
 
 ## Local dry run
 
-Verify the pinned arm64 release environment before running any release checks.
+Verify a clean checkout and the pinned arm64 PATH, Xcode, and uv environments before running any release checks.
 
 ```sh
 scripts/check-release-environment.sh
