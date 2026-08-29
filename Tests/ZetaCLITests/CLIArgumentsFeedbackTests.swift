@@ -17,6 +17,22 @@ final class CLIArgumentsFeedbackTests: XCTestCase {
         XCTAssertEqual(thinkingLast.thinking, .high)
     }
 
+    func testOptionsAfterMessagesRemainOptionsUntilTerminator() throws {
+        let arguments = try CLIArguments.parse([
+            "summarize", "--api-key", "SECRET", "details", "--provider", "openai",
+        ])
+
+        XCTAssertEqual(arguments.apiKey, "SECRET")
+        XCTAssertEqual(arguments.provider, "openai")
+        XCTAssertEqual(arguments.messages, ["summarize", "details"])
+
+        let terminated = try CLIArguments.parse([
+            "summarize", "--", "--api-key", "SECRET",
+        ])
+        XCTAssertNil(terminated.apiKey)
+        XCTAssertEqual(terminated.messages, ["summarize", "--api-key", "SECRET"])
+    }
+
     func testApprovalAliasesRejectAttachedValues() {
         for value in ["-a=false", "-na=true"] {
             XCTAssertThrowsError(try CLIArguments.parse([value])) { error in
