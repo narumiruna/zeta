@@ -250,6 +250,8 @@ class PackageDependencyPolicyTests(unittest.TestCase):
                 "// synthetic manifest\n",
                 encoding="utf-8",
             )
+            resolved = root / "Package.resolved"
+            write_resolved(resolved, [])
             configuration = root / ".swiftpm" / "configuration"
             configuration.mkdir(parents=True)
             (configuration / "registries.json").write_text(
@@ -269,12 +271,45 @@ class PackageDependencyPolicyTests(unittest.TestCase):
                     json.loads(copied_registry.read_text(encoding="utf-8")),
                     registry_configuration,
                 )
-                write_resolved(resolution_root / "Package.resolved", [])
 
             with mock.patch.object(CHECK.subprocess, "run", side_effect=resolve):
-                pins = CHECK.independently_resolve(root)
+                pins = CHECK.independently_resolve(root, resolved)
 
         self.assertEqual(pins, {})
+
+    def test_independent_resolution_uses_committed_transitive_versions(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "Package.swift").write_text(
+                "// synthetic manifest\n",
+                encoding="utf-8",
+            )
+            resolved = root / "Package.resolved"
+            committed_pins = [
+                pin("direct", {"version": "1.0.0", "revision": "direct-hash"}),
+                pin(
+                    "transitive",
+                    {"version": "1.0.0", "revision": "transitive-hash"},
+                ),
+            ]
+            write_resolved(resolved, committed_pins)
+            expected_pins = parsed_pins(resolved)
+
+            def resolve(command: list[str], **_: object) -> None:
+                resolution_root = Path(command[command.index("--package-path") + 1])
+                self.assertEqual(
+                    parsed_pins(resolution_root / "Package.resolved"),
+                    expected_pins,
+                )
+                self.assertLess(
+                    command.index("--force-resolved-versions"),
+                    command.index("resolve"),
+                )
+
+            with mock.patch.object(CHECK.subprocess, "run", side_effect=resolve):
+                pins = CHECK.independently_resolve(root, resolved)
+
+        self.assertEqual(pins, expected_pins)
 
     def test_requires_complete_independently_resolved_graph(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

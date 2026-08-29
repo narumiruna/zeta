@@ -146,15 +146,20 @@ def resolved_pins(path: Path) -> dict[str, ResolvedPin]:
     return result
 
 
-def independently_resolve(package_path: Path) -> dict[str, ResolvedPin]:
+def independently_resolve(
+    package_path: Path, resolved_path: Path
+) -> dict[str, ResolvedPin]:
     manifest_path = package_path / "Package.swift"
     if not manifest_path.is_file():
         raise ValueError(f"package manifest is missing from {package_path}")
+    if not resolved_path.is_file():
+        raise ValueError("external dependencies require a committed Package.resolved")
 
     with tempfile.TemporaryDirectory(prefix="zeta-package-resolution-") as temporary:
         resolution_root = Path(temporary)
         for candidate in package_path.glob("Package*.swift"):
             shutil.copy2(candidate, resolution_root / candidate.name)
+        shutil.copy2(resolved_path, resolution_root / "Package.resolved")
         configuration = package_path / ".swiftpm" / "configuration"
         if configuration.is_dir():
             shutil.copytree(
@@ -169,6 +174,7 @@ def independently_resolve(package_path: Path) -> dict[str, ResolvedPin]:
                 str(resolution_root),
                 "--scratch-path",
                 str(resolution_root / ".build"),
+                "--force-resolved-versions",
                 "resolve",
             ],
             check=True,
@@ -252,8 +258,12 @@ def main() -> None:
     try:
         manifest = load_manifest(args.manifest, args.package_path)
         requirements = direct_requirements(manifest)
-        independent_pins = independently_resolve(args.package_path) if requirements else {}
         resolved_path = args.resolved or args.package_path / "Package.resolved"
+        independent_pins = (
+            independently_resolve(args.package_path, resolved_path)
+            if requirements
+            else {}
+        )
         count = check_dependency_policy(manifest, resolved_path, independent_pins)
     except (OSError, ValueError, json.JSONDecodeError, subprocess.CalledProcessError) as error:
         raise SystemExit(f"package dependency policy failed: {error}") from error
