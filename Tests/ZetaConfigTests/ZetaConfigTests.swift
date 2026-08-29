@@ -69,6 +69,25 @@ final class ZetaConfigTests: XCTestCase {
         XCTAssertEqual(try String(contentsOf: blockedAgentDirectory, encoding: .utf8), "blocker")
     }
 
+    func testConcurrentTrustStoresMergeUpdatesUnderFileLock() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("trust.json")
+        let first = try TrustStore(url: url)
+        let stale = try TrustStore(url: url)
+        let projectA = directory.appendingPathComponent("project-a")
+        let projectB = directory.appendingPathComponent("project-b")
+
+        try await first.set(.trusted, for: projectA)
+        try await stale.set(.denied, for: projectB)
+
+        let reloaded = try TrustStore(url: url)
+        let decisionA = await reloaded.decision(for: projectA)
+        let decisionB = await reloaded.decision(for: projectB)
+        XCTAssertEqual(decisionA, .trusted)
+        XCTAssertEqual(decisionB, .denied)
+    }
+
     func testTrustPersistenceFailureDoesNotPublishCandidate() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)

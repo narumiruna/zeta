@@ -264,12 +264,25 @@ actor PersistentSessionController {
         return fork
     }
 
-    func switchTo(path: String) async throws -> (messages: [Message], name: String?) {
+    func switchTo(
+        path: String,
+        models: [Model]
+    ) async throws -> (
+        messages: [Message],
+        model: Model?,
+        thinking: ThinkingLevel,
+        name: String?
+    ) {
         let loaded = try SessionManager.load(file: URL(fileURLWithPath: path))
-        let messages = try await loaded.context().messages
+        let context = try await loaded.context()
+        let model = context.model.flatMap { selected in
+            models.first {
+                $0.provider == selected.provider && $0.id == selected.modelID
+            }
+        }
         let name = Self.sessionName(in: await loaded.allEntries())
         manager = loaded
-        return (messages, name)
+        return (context.messages, model, context.thinkingLevel, name)
     }
 
     private static func sessionName(in entries: [SessionEntry]) -> String? {

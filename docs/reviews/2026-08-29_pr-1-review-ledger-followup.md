@@ -753,3 +753,84 @@ The complete local repository gate passed 311 XCTest cases and 57 Swift Testing 
 The complete local Address Sanitizer and Thread Sanitizer suites each passed the same 368 tests without findings.
 Strict concurrency, warnings-as-errors, formatting, file-length, API compatibility, generated documentation, and interoperability checks passed.
 GitHub CI was not used as completion evidence for this round, per maintainer direction.
+
+## Fifteenth-round inline feedback
+
+### `3886116489`
+
+Concern: Separate processes can overwrite trust decisions from stale in-memory snapshots.
+
+Outcome: Actionable and addressed by reloading and merging the single decision while holding the cross-process file lock before publishing actor state.
+
+Evidence: A stale-store regression writes two project decisions through independently initialized stores and verifies both survive reload.
+
+### `3886116494`
+
+Concern: Image provider responses are fully buffered before status and size validation.
+
+Outcome: Actionable and addressed by streaming successful responses under a configurable 32 MiB limit and streaming only a bounded error prefix.
+
+Evidence: An image-provider regression uses a small injected budget and verifies an oversized response terminates in-band with an error.
+
+### `3886116496`
+
+Concern: Automatically loaded context files have no per-file or aggregate memory limit.
+
+Outcome: Actionable and addressed with incremental reads, a 1 MiB per-file limit, and a 4 MiB aggregate context limit.
+
+Evidence: A sparse oversized global context regression is skipped while a bounded project context still loads in untrusted mode.
+
+### `3886116499`
+
+Concern: Concurrent processes can overlap JSONL seek and append operations.
+
+Outcome: Actionable and addressed by holding an exclusive file lock across seek, write, synchronization, and rollback.
+
+Evidence: Two independently loaded session managers append concurrently to one file and all three JSONL records remain complete and parseable.
+
+### `3886116501`
+
+Concern: RPC session switching restores messages and names but not durable model and thinking state.
+
+Outcome: Actionable and addressed by returning the complete projected session state and applying its selected model and thinking level during the switch.
+
+Evidence: The RPC switch regression restores a different model, high thinking level, and durable session name together.
+
+### `3886116503`
+
+Concern: Piped input and the first positional prompt should be separated by an inserted newline.
+
+Outcome: Incorrect for the pinned CLI contract, so concatenation without a delimiter remains intentional.
+
+Pinned source evidence: At `56700d42ed65a94a80af7376adb19a9298065164`, `packages/coding-agent/src/cli/initial-message.ts` lines 17 through 43 push stdin, file text, and the first message into `parts` and return `parts.join("")`.
+
+### `3886116508`
+
+Concern: A valid late response for a locally cancelled request is treated as an unknown response and closes the client.
+
+Outcome: Actionable and addressed with a bounded set of 1,024 locally cancelled request IDs that are ignored exactly once while genuinely unknown and duplicate IDs remain fatal.
+
+Evidence: The request cancellation regression delivers the cancelled response late, verifies the connection remains active, and completes a subsequent request.
+
+### `3886116510`
+
+Concern: Untrusted output can inject the internal cursor marker and preserve otherwise filtered terminal controls.
+
+Outcome: Actionable and addressed by removing cursor markers and ANSI controls from untrusted text, Markdown, selection, settings, and completion component content before layout.
+
+Evidence: A TUI regression injects a cursor marker followed by OSC 52 clipboard control and verifies neither control reaches rendered output while trusted editor markers remain covered.
+
+### `3886116515`
+
+Concern: Aborting retry does not wake an active retry backoff sleep.
+
+Outcome: Actionable and addressed by retaining a cancellable retry-delay task and cancelling it from both retry abort and full abort lifecycle paths.
+
+Evidence: An agent regression starts a two-second backoff, aborts retry, settles in under 500 milliseconds, and verifies no second provider request starts.
+
+## Fifteenth-round verification
+
+The complete local repository gate passed 317 XCTest cases and 57 Swift Testing cases against the clean pinned oracle.
+The complete local Address Sanitizer and Thread Sanitizer suites each passed the same 374 tests without findings.
+Strict concurrency, warnings-as-errors, formatting, file-length, API compatibility, generated documentation, and interoperability checks passed.
+GitHub CI was not used as completion evidence for this round, per maintainer direction.

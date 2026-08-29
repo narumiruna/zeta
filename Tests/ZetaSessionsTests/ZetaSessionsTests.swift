@@ -22,6 +22,50 @@ final class ZetaSessionsTests: XCTestCase {
         XCTAssertEqual(context.messages.count, 2)
     }
 
+    func testConcurrentManagersSerializeAppendsToOneJSONLFile() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let file = directory.appendingPathComponent("session.jsonl")
+        let creator = try SessionManager(
+            header: SessionHeader(
+                id: "shared-session",
+                timestamp: "2026-01-01T00:00:00Z",
+                cwd: directory.path
+            ),
+            file: file
+        )
+        try await creator.materialize()
+        let first = try SessionManager.load(file: file)
+        let second = try SessionManager.load(file: file)
+        let timestamp = "2026-01-01T00:00:01Z"
+
+        async let firstAppend = first.append(
+            .custom(
+                SessionEntryBase(id: "first", parentId: nil, timestamp: timestamp),
+                customType: "test",
+                data: ["value": 1]
+            )
+        )
+        async let secondAppend = second.append(
+            .custom(
+                SessionEntryBase(id: "second", parentId: nil, timestamp: timestamp),
+                customType: "test",
+                data: ["value": 2]
+            )
+        )
+        _ = try await (firstAppend, secondAppend)
+
+        let records = try Data(contentsOf: file).split(separator: 0x0A).map {
+            try JSONSerialization.jsonObject(with: Data($0)) as? [String: Any]
+        }
+        XCTAssertEqual(records.count, 3)
+        XCTAssertEqual(
+            Set(records.compactMap { $0?["id"] as? String }),
+            Set(["shared-session", "first", "second"])
+        )
+    }
+
     func testLoadedSessionAppendsAssistantWithoutRewritingExistingJSONL() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }

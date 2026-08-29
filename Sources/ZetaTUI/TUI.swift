@@ -34,7 +34,8 @@ public final class Text: Component, @unchecked Sendable {
     public func render(width: Int) -> [String] {
         let available = max(1, width - horizontalPadding * 2)
         let padding = String(repeating: " ", count: horizontalPadding)
-        let body = value.components(separatedBy: "\n").flatMap { ANSI.wrap($0, width: available) }
+        let safeValue = ANSI.sanitizeUntrusted(value)
+        let body = safeValue.components(separatedBy: "\n").flatMap { ANSI.wrap($0, width: available) }
             .map { padding + $0 + padding }
         let blank = String(repeating: " ", count: min(width, horizontalPadding * 2))
         return Array(repeating: blank, count: verticalPadding) + body + Array(repeating: blank, count: verticalPadding)
@@ -400,6 +401,10 @@ public final class TUI: @unchecked Sendable {
 public enum ANSI {
     private static let escape = try! NSRegularExpression(
         pattern: #"\u001B(?:\[[0-?]*[ -/]*[@-~]|\][^\u0007]*(?:\u0007|\u001B\\)|_[^\u0007]*(?:\u0007|\u001B\\))"#)
+
+    static func sanitizeUntrusted(_ value: String) -> String {
+        strip(value.replacingOccurrences(of: cursorMarker, with: ""))
+    }
 
     public static func strip(_ value: String) -> String {
         escape.stringByReplacingMatches(in: value, range: NSRange(value.startIndex..., in: value), withTemplate: "")

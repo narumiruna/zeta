@@ -4,6 +4,23 @@ import XCTest
 @testable import ZetaTerminal
 
 final class ZetaTUITests: XCTestCase {
+    func testUntrustedComponentsCannotActivateCursorMarkerControls() {
+        let malicious =
+            "safe" + cursorMarker + "\u{1B}]52;c;YXR0YWNr\u{07}"
+            + "\u{1B}[7m hidden\u{1B}[27m"
+
+        for lines in [
+            Text(malicious).render(width: 80),
+            TruncatedText(malicious).render(width: 80),
+            Markdown(malicious).render(width: 80),
+        ] {
+            let rendered = lines.joined()
+            XCTAssertFalse(rendered.contains(cursorMarker))
+            XCTAssertFalse(rendered.contains("\u{1B}]52"))
+            XCTAssertEqual(ANSI.strip(rendered), "safe hidden")
+        }
+    }
+
     func testWidthsAndWrapping() {
         XCTAssertEqual(ANSI.visibleWidth("abc"), 3)
         XCTAssertEqual(ANSI.visibleWidth("漢🙂"), 4)

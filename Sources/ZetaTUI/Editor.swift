@@ -36,7 +36,12 @@ public final class Editor: Focusable, @unchecked Sendable {
             lines = Array(lines.suffix(maximumVisibleLines))
         }
         if !completions.isEmpty {
-            lines += completions.prefix(5).map { ANSI.truncate("  \($0)", width: width) }
+            lines += completions.prefix(5).map {
+                ANSI.truncate(
+                    ANSI.sanitizeUntrusted("  \($0)"),
+                    width: width
+                )
+            }
         }
         return lines.isEmpty ? [""] : lines
     }

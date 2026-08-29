@@ -163,6 +163,30 @@ final class ZetaResourcesTests: XCTestCase {
         XCTAssertTrue(snapshot.diagnostics.isEmpty)
     }
 
+    func testContextLoadingRejectsOversizedSparseFiles() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let agent = root.appendingPathComponent("agent")
+        let project = root.appendingPathComponent("project")
+        try FileManager.default.createDirectory(at: agent, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+        let oversized = agent.appendingPathComponent("AGENTS.md")
+        XCTAssertTrue(FileManager.default.createFile(atPath: oversized.path, contents: Data("ignored".utf8)))
+        let handle = try FileHandle(forWritingTo: oversized)
+        try handle.truncate(atOffset: UInt64(maximumContextFileBytes + 1))
+        try handle.close()
+        try Data("project context".utf8).write(to: project.appendingPathComponent("AGENTS.md"))
+
+        let snapshot = ResourceLoader(
+            home: root,
+            workingDirectory: project,
+            agentDirectory: agent,
+            trusted: false
+        ).load()
+
+        XCTAssertEqual(snapshot.context, ["project context"])
+    }
+
     func testContextOverrideWinsWithinDirectory() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)

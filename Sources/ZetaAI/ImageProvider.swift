@@ -16,6 +16,7 @@ public struct OpenRouterImageProvider: ImageProvider {
     public let models: [ImageModel]
     private let session: URLSession
     private let environment: @Sendable () -> [String: String]
+    private let maximumResponseBytes: Int
 
     public init(
         models: [ImageModel],
@@ -27,6 +28,22 @@ public struct OpenRouterImageProvider: ImageProvider {
         self.models = models
         self.session = session
         self.environment = environment
+        maximumResponseBytes = 32 * 1_024 * 1_024
+    }
+
+    package init(
+        models: [ImageModel],
+        session: URLSession,
+        maximumResponseBytes: Int,
+        environment: @escaping @Sendable () -> [String: String] = {
+            ProcessInfo.processInfo.environment
+        }
+    ) {
+        precondition(maximumResponseBytes > 0)
+        self.models = models
+        self.session = session
+        self.environment = environment
+        self.maximumResponseBytes = maximumResponseBytes
     }
 
     public func generate(
@@ -80,14 +97,29 @@ public struct OpenRouterImageProvider: ImageProvider {
                 ]),
                 "modalities": .array(model.output.sorted().map(JSONValue.string)),
             ])
-            let (data, response) = try await session.data(for: request)
-            guard let http = response as? HTTPURLResponse,
-                200..<300 ~= http.statusCode
-            else {
+            let (bytes, response) = try await session.bytes(for: request)
+            guard let http = response as? HTTPURLResponse else {
+                throw ProviderError.invalidResponse("Not an HTTP response")
+            }
+            guard 200..<300 ~= http.statusCode else {
+                var body = Data()
+                for try await byte in bytes {
+                    if body.count == 64 * 1_024 { break }
+                    body.append(byte)
+                }
                 throw ProviderError.http(
-                    status: (response as? HTTPURLResponse)?.statusCode ?? 0,
-                    body: String(decoding: data.prefix(64 * 1_024), as: UTF8.self)
+                    status: http.statusCode,
+                    body: String(decoding: body, as: UTF8.self)
                 )
+            }
+            var data = Data()
+            for try await byte in bytes {
+                guard data.count < maximumResponseBytes else {
+                    throw ProviderError.invalidResponse(
+                        "Image response exceeds the configured byte limit"
+                    )
+                }
+                data.append(byte)
             }
             let value = try OrderedJSON.decode(data)
             guard case .object(let object) = value else {

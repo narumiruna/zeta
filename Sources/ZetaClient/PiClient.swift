@@ -77,6 +77,8 @@ public actor PiClient {
     private var transport: (any ByteTransport)?
     private var decoder: ServerMessageDecoder?
     private var pending: [String: CheckedContinuation<ResponseEnvelope, Error>] = [:]
+    private var cancelledRequestIDs: Set<String> = []
+    private var cancelledRequestOrder: [String] = []
     private var handshake: HandshakeOperation?
     private var leases: [String: LeaseBook] = [:]
     private var sessionSnapshots: [String: SessionSnapshot] = [:]
@@ -563,7 +565,7 @@ public actor PiClient {
                 }
             }
         } onCancel: {
-            Task { await self.reject(id: id, error: CancellationError()) }
+            Task { await self.cancelRequest(id: id) }
         }
     }
 
@@ -593,6 +595,10 @@ public actor PiClient {
         switch message {
         case .response(let response):
             guard let continuation = pending.removeValue(forKey: response.id) else {
+                if cancelledRequestIDs.remove(response.id) != nil {
+                    cancelledRequestOrder.removeAll { $0 == response.id }
+                    return
+                }
                 Task {
                     await fail(
                         PiClientError.protocolFailure("Response has no matching request: \(response.id)"),
@@ -631,7 +637,20 @@ public actor PiClient {
         guard receivedGeneration == generation else { return }
         await fail(error ?? PiClientError.disconnected, close: false)
     }
-    private func reject(id: String, error: Error) { pending.removeValue(forKey: id)?.resume(throwing: error) }
+    private func reject(id: String, error: Error) {
+        pending.removeValue(forKey: id)?.resume(throwing: error)
+    }
+
+    private func cancelRequest(id: String) {
+        guard let continuation = pending.removeValue(forKey: id) else { return }
+        continuation.resume(throwing: CancellationError())
+        guard cancelledRequestIDs.insert(id).inserted else { return }
+        cancelledRequestOrder.append(id)
+        if cancelledRequestOrder.count > 1_024 {
+            let expired = cancelledRequestOrder.removeFirst()
+            cancelledRequestIDs.remove(expired)
+        }
+    }
 
     private func fail(_ error: Error, close: Bool) async {
         generation &+= 1
@@ -650,6 +669,8 @@ public actor PiClient {
         currentHandshake?.continuation.resume(throwing: error)
         let current = pending
         pending.removeAll()
+        cancelledRequestIDs.removeAll()
+        cancelledRequestOrder.removeAll()
         current.values.forEach { $0.resume(throwing: error) }
         if close {
             let value = transport

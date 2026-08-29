@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import ZetaAI
 
@@ -285,6 +286,10 @@ public actor SessionManager {
         let record = try Self.line(entry)
         let handle = try FileHandle(forWritingTo: file)
         defer { try? handle.close() }
+        guard flock(handle.fileDescriptor, LOCK_EX) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        defer { flock(handle.fileDescriptor, LOCK_UN) }
         let originalLength = try handle.seekToEnd()
         do {
             try handle.write(contentsOf: record)

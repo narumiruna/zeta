@@ -38,6 +38,9 @@ public struct ResourceSnapshot: Sendable {
     public var diagnostics: [ResourceDiagnostic]
 }
 
+package let maximumContextFileBytes = 1 * 1_024 * 1_024
+package let maximumContextBytes = 4 * 1_024 * 1_024
+
 public struct ResourceLoader: Sendable {
     public let home: URL
     public let workingDirectory: URL
@@ -231,9 +234,11 @@ public struct ResourceLoader: Sendable {
 
     private func loadContext() -> [String] {
         var output: [String] = []
+        var loadedBytes = 0
         let global = agentDirectory.appendingPathComponent("AGENTS.md")
-        if isRegularFile(global), let text = try? String(contentsOf: global, encoding: .utf8) {
+        if let text = contextText(global, remainingBytes: maximumContextBytes - loadedBytes) {
             output.append(text)
+            loadedBytes += text.utf8.count
         }
         var directories: [URL] = []
         var current = workingDirectory
@@ -248,11 +253,48 @@ public struct ResourceLoader: Sendable {
             let selected =
                 isRegularFile(override)
                 ? override : isRegularFile(agents) ? agents : claude
-            if isRegularFile(selected), let text = try? String(contentsOf: selected, encoding: .utf8) {
+            if let text = contextText(
+                selected,
+                remainingBytes: maximumContextBytes - loadedBytes
+            ) {
                 output.append(text)
+                loadedBytes += text.utf8.count
             }
         }
         return output
+    }
+
+    private func contextText(_ url: URL, remainingBytes: Int) -> String? {
+        let limit = min(maximumContextFileBytes, remainingBytes)
+        guard limit > 0, isRegularFile(url),
+            let handle = try? FileHandle(forReadingFrom: url)
+        else {
+            return nil
+        }
+        defer { try? handle.close() }
+        do {
+            let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+            guard let size = attributes[.size] as? NSNumber,
+                size.int64Value >= 0,
+                size.int64Value <= Int64(limit)
+            else {
+                return nil
+            }
+            var data = Data()
+            data.reserveCapacity(size.intValue)
+            while data.count <= limit,
+                let chunk = try handle.read(
+                    upToCount: min(64 * 1_024, limit + 1 - data.count)
+                ),
+                !chunk.isEmpty
+            {
+                data.append(chunk)
+            }
+            guard data.count <= limit else { return nil }
+            return String(data: data, encoding: .utf8)
+        } catch {
+            return nil
+        }
     }
 
     private func loadPrompts(_ directory: URL, diagnostics: inout [ResourceDiagnostic]) -> [PromptTemplate] {

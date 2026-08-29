@@ -38,7 +38,13 @@ public final class TruncatedText: Component, @unchecked Sendable {
     }
 
     public func render(width: Int) -> [String] {
-        [ANSI.truncate(value, width: width, ellipsis: ellipsis)]
+        [
+            ANSI.truncate(
+                ANSI.sanitizeUntrusted(value),
+                width: width,
+                ellipsis: ellipsis
+            )
+        ]
     }
 }
 
@@ -89,7 +95,10 @@ public final class SelectList: Focusable, @unchecked Sendable {
                 let index = start + offset
                 let prefix = index == selected ? "> " : "  "
                 let description = item.description.map { " — \($0)" } ?? ""
-                return ANSI.truncate(prefix + item.label + description, width: width)
+                return ANSI.truncate(
+                    ANSI.sanitizeUntrusted(prefix + item.label + description),
+                    width: width
+                )
             }
     }
 
@@ -155,7 +164,9 @@ public final class SettingsList: Focusable, @unchecked Sendable {
         items.enumerated().map { index, item in
             let prefix = index == selected ? "> " : "  "
             return ANSI.truncate(
-                "\(prefix)\(item.label): \(item.currentValue)",
+                ANSI.sanitizeUntrusted(
+                    "\(prefix)\(item.label): \(item.currentValue)"
+                ),
                 width: width
             )
         }
@@ -276,7 +287,7 @@ public final class Markdown: Component, @unchecked Sendable {
     public init(_ source: String) { self.source = source }
 
     public func render(width: Int) -> [String] {
-        source.components(separatedBy: "\n").flatMap { line in
+        ANSI.sanitizeUntrusted(source).components(separatedBy: "\n").flatMap { line in
             let rendered: String
             if line.hasPrefix("# ") {
                 rendered = "\u{1B}[1m" + String(line.dropFirst(2)) + "\u{1B}[22m"

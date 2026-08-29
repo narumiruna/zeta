@@ -131,6 +131,7 @@ public actor Agent {
     private var followUps: [UserMessage] = []
     private var runTask: Task<Void, Never>?
     private var activeResponseStream: AssistantEventStream?
+    private var retryDelay: (id: UUID, task: Task<Void, Never>)?
     private var idleWaiters: [CheckedContinuation<Void, Never>] = []
     public var toolExecutionMode: ToolExecutionMode
     public var steeringMode: QueueDeliveryMode
@@ -260,9 +261,13 @@ public actor Agent {
         let exponentialDelay = product.overflow ? Int.max : product.partialValue
         return min(exponentialDelay, retryMaximumDelayMilliseconds)
     }
-    public func abortRetry() { retryCancelled = true }
+    public func abortRetry() {
+        retryCancelled = true
+        retryDelay?.task.cancel()
+    }
     public func abort() {
         runTask?.cancel()
+        retryDelay?.task.cancel()
         guard let activeResponseStream else { return }
         let model = internalState.model
         Task {
@@ -484,7 +489,13 @@ public actor Agent {
                 retryAttempt += 1
                 retrying = true
                 let delay = retryDelayMilliseconds(forAttempt: retryAttempt)
-                try? await Task.sleep(for: .milliseconds(delay))
+                let delayID = UUID()
+                let delayTask = Task {
+                    _ = try? await Task.sleep(for: .milliseconds(delay))
+                }
+                retryDelay = (delayID, delayTask)
+                await delayTask.value
+                if retryDelay?.id == delayID { retryDelay = nil }
                 continueTurns = !Task.isCancelled && !retryCancelled
                 continue
             }
@@ -532,6 +543,8 @@ public actor Agent {
         internalState.isStreaming = false
         internalState.streamingMessage = nil
         activeResponseStream = nil
+        retryDelay?.task.cancel()
+        retryDelay = nil
         runTask = nil
         idleWaiters.forEach { $0.resume() }
         idleWaiters.removeAll()

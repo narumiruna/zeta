@@ -399,6 +399,10 @@ final class ZetaClientTests: XCTestCase {
         XCTAssertEqual(cancelledValue, .cancelled)
 
         await cancelledRequest.value
+        await transport.completeList(at: 0)
+        try await Task.sleep(for: .milliseconds(10))
+        let stateAfterLateResponse = await client.connectionState()
+        XCTAssertEqual(stateAfterLateResponse, .connected)
 
         let completedRequest = Task { try await client.listSessions() }
         try await waitUntil { await transport.listCount == 2 }
