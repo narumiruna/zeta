@@ -29,6 +29,8 @@ No other current non-historical GitHub Workflow or CI policy references remain.
 
 The five focused release-environment regressions passed.
 The first complete repository-gate run encountered an unrelated timeout in `ZetaPluginAPITests.testPluginRequestTimeoutIncludesBlockedStdinWrite`; its focused rerun passed.
-The complete repository gate then passed on rerun against the clean pinned oracle, and the final post-fix run passed with 11 script tests, 326 XCTest cases, 57 Swift Testing cases, strict builds, API checks, plugin examples, and TypeScript interoperability.
-Documentation, file-length, secret, license, fixture, inventory, and generated-file checks passed.
+The complete repository gate then passed on rerun against the clean pinned oracle, and a post-fix run passed with 11 script tests, 326 XCTest cases, 57 Swift Testing cases, strict builds, API checks, plugin examples, and TypeScript interoperability.
+After `main` was merged into the pull request as `8975f05`, two complete gate attempts reached 333 XCTest cases but failed the unchanged `LatestInteractiveFeedbackTests.testInteractiveExitCancelsAndWaitsForDirectShell` assertions already recorded in the pull request description.
+The same test passed when run alone after the merge.
+Documentation, file-length, secret, license, fixture, inventory, and generated-file checks passed on the merged head.
 The final diff was checked for whitespace errors and equivalent print-only release validation.
