@@ -52,6 +52,10 @@ run_logged() {
   cd "$consumer_root"
   swift package describe --type json >"$artifacts_dir/consumer-package.json"
 )
+uv run python "$root/scripts/check-package-dependencies.py" \
+  --manifest "$artifacts_dir/package.json" \
+  --package-path "$root" \
+  --resolved "$root/Package.resolved"
 uv run python - "$artifacts_dir/package.json" "$artifacts_dir/consumer-package.json" <<'PY'
 import json
 import sys
@@ -64,9 +68,14 @@ if platforms != {"macos": "14.0", "ios": "17.0"}:
 expected_dependencies = {
     "swift-argument-parser": (
         "https://github.com/apple/swift-argument-parser.git",
+        "exact",
         "1.8.2",
     ),
-    "swift-log": ("https://github.com/apple/swift-log.git", "1.9.1"),
+    "swift-log": (
+        "https://github.com/apple/swift-log.git",
+        "exact",
+        "1.9.1",
+    ),
 }
 dependencies = {}
 for dependency in package["dependencies"]:
@@ -75,12 +84,16 @@ for dependency in package["dependencies"]:
         raise SystemExit(f"unexpected dependency declaration: {dependency}")
     declaration = source_control[0]
     remotes = declaration["location"].get("remote", [])
-    exact = declaration["requirement"].get("exact", [])
-    if len(remotes) != 1 or len(exact) != 1:
-        raise SystemExit(f"dependency is not pinned exactly: {declaration['identity']}")
+    requirement = declaration["requirement"]
+    if len(remotes) != 1 or len(requirement) != 1:
+        raise SystemExit(f"invalid dependency declaration: {declaration['identity']}")
+    requirement_kind, requirement_values = next(iter(requirement.items()))
+    if requirement_kind not in {"exact", "revision"} or len(requirement_values) != 1:
+        raise SystemExit(f"dependency is not pinned immutably: {declaration['identity']}")
     dependencies[declaration["identity"]] = (
         remotes[0]["urlString"],
-        exact[0],
+        requirement_kind,
+        requirement_values[0],
     )
 if dependencies != expected_dependencies:
     raise SystemExit(f"unexpected root dependencies: {dependencies}")

@@ -8,8 +8,9 @@ Evaluate compatibility, API fit, maintenance, security, strict concurrency, supp
 Benchmark the exact candidate revision on every release architecture affected by the dependency.
 Record direct and transitive licenses, repository URL, exact release or revision, checksums where available, maintenance evidence, concurrency behavior, and known advisories.
 Pin each direct dependency to an exact immutable release or revision and commit `Package.resolved`.
-Update the current dependency license review so `uv run python scripts/check-licenses.py` can map every resolved identity.
-Do not use branch-based dependencies or unaudited binary targets.
+Add one structured row to the current dependency license review for each resolved identity, including its repository URL, exact release, revision, license details, transitive review, and advisory review.
+Run `uv run python scripts/check-package-dependencies.py` and `uv run python scripts/check-licenses.py` to verify direct origins and requirements, independently reproduce the complete lock graph, and match each review row to its resolved pin.
+Do not use branch-based dependencies, version ranges, local package paths, or unaudited binary targets.
 Attach the dependency only to targets that use it.
 Add a protocol or adapter when replacement, deterministic testing, or compatibility isolation requires one.
 Use a separate ADR only when the dependency changes an architectural, platform, security, durable-format, or compatibility decision.
