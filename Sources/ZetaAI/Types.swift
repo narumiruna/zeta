@@ -355,6 +355,28 @@ public struct Model: Codable, Sendable, Equatable, Identifiable {
 
     public init(
         id: String, name: String, api: APIID, provider: ProviderID, baseURL: URL, reasoning: Bool = false,
+        input: Set<String> = ["text"], cost: ModelCost = ModelCost(), contextWindow: Int, maximumTokens: Int
+    ) {
+        self.init(
+            id: id,
+            name: name,
+            api: api,
+            provider: provider,
+            baseURL: baseURL,
+            reasoning: reasoning,
+            input: input,
+            cost: cost,
+            contextWindow: contextWindow,
+            maximumTokens: maximumTokens,
+            headers: nil,
+            compat: nil,
+            thinkingLevelMap: nil,
+            baseURLTemplate: nil
+        )
+    }
+
+    public init(
+        id: String, name: String, api: APIID, provider: ProviderID, baseURL: URL, reasoning: Bool = false,
         input: Set<String> = ["text"], cost: ModelCost = ModelCost(), contextWindow: Int, maximumTokens: Int,
         headers: [String: String]? = nil, compat: JSONValue? = nil, thinkingLevelMap: JSONValue? = nil,
         baseURLTemplate: String? = nil

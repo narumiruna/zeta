@@ -91,6 +91,7 @@ Regenerate it with `uv run python scripts/generate-api-docs.py`.
 | `init(id:models:pool:environment:)` | Initializer |
 | `init(id:models:tokensPerSecond:)` | Initializer |
 | `init(id:name:api:provider:baseURL:input:output:cost:)` | Initializer |
+| `init(id:name:api:provider:baseURL:reasoning:input:cost:contextWindow:maximumTokens:)` | Initializer |
 | `init(id:name:api:provider:baseURL:reasoning:input:cost:contextWindow:maximumTokens:headers:compat:thinkingLevelMap:baseURLTemplate:)` | Initializer |
 | `init(id:name:arguments:thoughtSignature:namespace:)` | Initializer |
 | `init(idleTimeout:factory:)` | Initializer |
