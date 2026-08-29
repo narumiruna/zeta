@@ -1,6 +1,6 @@
 # ADR 0001: Dependency policy and macOS platform
 
-- Status: Draft
+- Status: Draft; current command-line and logging selections are recorded in [ADR 0003](0003-command-line-and-logging-dependencies.md)
 - Date: 2026-08-28
 - Decision owners: Zeta maintainers
 
@@ -37,14 +37,13 @@ XCTest and Swift Testing both run through SwiftPM because the pinned toolchain e
 
 ## Evidence
 
-`Package.swift` currently resolves zero external dependencies.
-`scripts/check-licenses.py` verifies the project license and requires every resolved dependency to appear in the license review.
+`Package.swift` currently resolves two external dependencies reviewed in [ADR 0003](0003-command-line-and-logging-dependencies.md).
+`scripts/check-licenses.py` verifies the project license and requires every resolved dependency to appear in the current license review.
 `scripts/check-repository.sh` verifies strict concurrency, warnings as errors, formatting, tests, generated files, fixtures, secrets, and API symbols.
 The model catalog generator records its Pi source commit and SHA-256 checksum.
 Protocol and terminal tests cover fragmentation, Unicode, malformed inputs, and restoration sequences.
 SQLite tests cover required capabilities, writer fencing, branch caches, FTS, historical-schema rejection, and integrity.
 macOS arm64 measurements are recorded under `docs/performance`.
-CI runs arm64 build, test, sanitizer, and release dry-run jobs.
 The x86_64 build remains available as a local release-engineering path.
 
 ## Current selection matrix
@@ -69,10 +68,10 @@ The x86_64 build remains available as a local release-engineering path.
 ## License review
 
 The repository is MIT licensed.
-The Swift package currently resolves no external packages.
+The current external dependency license review is recorded in [ADR 0003](0003-command-line-and-logging-dependencies.md).
 Apple SDK frameworks are platform components and are not vendored.
 SQLite is public domain and is loaded from the macOS SDK.
-Each external dependency must be added to this section with its identity, repository URL, exact release or revision, direct license, transitive packages and licenses, and advisory review.
+Each external dependency must be added to the current license review with its identity, repository URL, exact release or revision, direct license, transitive packages and licenses, and advisory review.
 A separate superseding ADR is not required for an ordinary dependency update.
 
 ## Consequences

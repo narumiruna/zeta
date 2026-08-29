@@ -7,6 +7,7 @@ let package = Package(
     platforms: [.macOS(.v14), .iOS(.v17)],
     products: [
         .library(name: "ZetaCore", targets: ["ZetaCore"]),
+        .library(name: "ZetaLogging", targets: ["ZetaLogging"]),
         .library(name: "ZetaTelemetry", targets: ["ZetaTelemetry"]),
         .library(name: "ZetaAI", targets: ["ZetaAI"]),
         .library(name: "ZetaAuth", targets: ["ZetaAuth"]),
@@ -43,8 +44,22 @@ let package = Package(
         .executable(name: "zeta-interop-server", targets: ["ZetaInteropServer"]),
         .executable(name: "zeta-interop-sqlite", targets: ["ZetaInteropSQLite"]),
     ],
+    dependencies: [
+        .package(
+            url: "https://github.com/apple/swift-argument-parser.git",
+            exact: "1.8.2"
+        ),
+        .package(
+            url: "https://github.com/apple/swift-log.git",
+            exact: "1.9.1"
+        ),
+    ],
     targets: [
         .target(name: "ZetaCore"),
+        .target(
+            name: "ZetaLogging",
+            dependencies: [.product(name: "Logging", package: "swift-log")]
+        ),
         .target(name: "ZetaTelemetry", dependencies: ["ZetaCore"]),
         .target(name: "ZetaAuth"),
         .target(name: "ZetaBedrock", dependencies: ["ZetaAI", "ZetaAuth", "ZetaCore"]),
@@ -83,7 +98,8 @@ let package = Package(
                 "ZetaAI", "ZetaAgent", "ZetaCompaction", "ZetaConfig", "ZetaCore", "ZetaExport",
                 "ZetaAuth", "ZetaBedrock", "ZetaMigration", "ZetaModes", "ZetaPackages", "ZetaPluginAPI",
                 "ZetaResources", "ZetaSessions", "ZetaSessionSQLite", "ZetaTerminal", "ZetaTools", "ZetaTUI",
-                "ZetaClient", "ZetaServer", "ZetaUnixTransport",
+                "ZetaClient", "ZetaServer", "ZetaUnixTransport", "ZetaLogging",
+                .product(name: "ArgumentParser", package: "swift-argument-parser"),
             ]
         ),
         .executableTarget(name: "ZetaExecutable", dependencies: ["ZetaCLI"]),
@@ -108,6 +124,7 @@ let package = Package(
             dependencies: ["ZetaCore", "ZetaSessionSQLite"]
         ),
         .testTarget(name: "ZetaCoreTests", dependencies: ["ZetaCore"]),
+        .testTarget(name: "ZetaLoggingTests", dependencies: ["ZetaLogging"]),
         .testTarget(name: "ZetaTelemetryTests", dependencies: ["ZetaTelemetry"]),
         .testTarget(name: "ZetaProtocolTests", dependencies: ["ZetaProtocol", "ZetaCore"]),
         .testTarget(name: "ZetaClientTests", dependencies: ["ZetaClient", "ZetaServer", "ZetaProtocol"]),

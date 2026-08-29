@@ -964,6 +964,34 @@ Regenerate it with `uv run python scripts/generate-api-docs.py`.
 | `decodeJSONL(_:)` | Type Method |
 | `all` | Type Property |
 
+## ZetaLogging
+
+| Symbol | Kind |
+| --- | --- |
+| `ZetaLogLevel.critical` | Case |
+| `ZetaLogLevel.debug` | Case |
+| `ZetaLogLevel.error` | Case |
+| `ZetaLogLevel.info` | Case |
+| `ZetaLogLevel.notice` | Case |
+| `ZetaLogLevel.trace` | Case |
+| `ZetaLogLevel.warning` | Case |
+| `ZetaLogLevel` | Enumeration |
+| `ZetaLoggingConfiguration` | Enumeration |
+| `init(label:minimumLevel:)` | Initializer |
+| `init(rawValue:)` | Initializer |
+| `init(sink:)` | Initializer |
+| `critical(_:metadata:)` | Instance Method |
+| `debug(_:metadata:)` | Instance Method |
+| `error(_:metadata:)` | Instance Method |
+| `info(_:metadata:)` | Instance Method |
+| `log(level:message:metadata:)` | Instance Method |
+| `notice(_:metadata:)` | Instance Method |
+| `trace(_:metadata:)` | Instance Method |
+| `warning(_:metadata:)` | Instance Method |
+| `ZetaLogSink` | Protocol |
+| `ZetaLogger` | Structure |
+| `minimumLevel(environment:)` | Type Method |
+
 ## ZetaMigration
 
 | Symbol | Kind |

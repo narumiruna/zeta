@@ -44,5 +44,5 @@ Zeta propagates cancellation, but the host application remains responsible for b
 The package manifest advertises iOS even though only the named module closure is supported there.
 Documentation and CI must keep that narrower product contract explicit.
 The external consumer fixture validates resource embedding and public imports without compiling unrelated macOS-only targets.
-No external dependency or binary framework is required.
+The supported iOS library closure does not link an external dependency or binary framework.
 This decision extends the non-macOS portability consequence in [ADR 0001](0001-dependencies-and-macos-platform.md) only for the named iOS libraries.
