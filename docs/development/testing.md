@@ -8,11 +8,22 @@ Run all currently available checks with a pinned clean Pi checkout.
 PI_SOURCE_ROOT=/path/to/pi scripts/check-repository.sh
 ```
 
-The gate checks inventory mappings, fixture checksums and reproducibility, generated declarations, documentation, file length, secrets, and licenses.
-`scripts/check-swift-gates.sh` runs bundled Swift formatting, package validation, warning and strict-concurrency builds, tests, and API breakage comparison when a package exists.
+The gate checks inventory mappings, fixture checksums and reproducibility, generated declarations, documentation, file length, secrets, licenses, and focused repository-script regressions.
+`scripts/check-swift-gates.sh` runs bundled Swift formatting, package validation, warning and strict-concurrency macOS builds, tests, and API breakage comparison when a package exists.
 A checkout without `Package.swift` reports an explicit skip that is not a passing Swift result.
 
 ## Focused checks
+
+Run the iOS 17 library boundary on a Mac with the iPhoneOS and iOS Simulator SDKs installed.
+The gate selects any available iOS Simulator, fails if one is unavailable, and restores a simulator that it booted.
+
+```sh
+scripts/check-ios-libraries.sh
+```
+
+The iOS gate validates the manifest, warning and strict-concurrency builds for both supported products and SDKs, the external consumer build, and two synthetic simulator tests with zero allowed skips.
+Its default diagnostics directory is `/tmp/zeta-ios-libraries` and CI overrides it with an uploaded artifact path.
+The gate marks directories that it creates and refuses to clear an existing unmarked directory.
 
 ```sh
 uv run python scripts/check-inventory.py --source /path/to/pi

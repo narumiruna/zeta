@@ -2,6 +2,8 @@
 import argparse
 import json
 import pathlib
+import re
+import shutil
 import subprocess
 import sys
 
@@ -9,7 +11,9 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 parser = argparse.ArgumentParser()
 parser.add_argument("--check", action="store_true")
 args = parser.parse_args()
-subprocess.run(
+for symbol_directory in (ROOT / ".build").glob("*-apple-macosx/symbolgraph"):
+    shutil.rmtree(symbol_directory)
+result = subprocess.run(
     [
         "swift",
         "package",
@@ -19,10 +23,47 @@ subprocess.run(
         "public",
     ],
     cwd=ROOT,
-    check=True,
     stdout=subprocess.DEVNULL,
+    stderr=subprocess.PIPE,
+    text=True,
 )
 paths = sorted((ROOT / ".build").glob("*-apple-macosx/symbolgraph/Zeta*.symbols.json"))
+package = json.loads(
+    subprocess.run(
+        ["swift", "package", "dump-package"],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+)
+expected_modules = {
+    product["name"]
+    for product in package["products"]
+    if "library" in product["type"]
+}
+emitted_modules = {path.stem.split(".")[0] for path in paths}
+missing_modules = expected_modules - emitted_modules
+failure_modules = re.findall(
+    r"Failed to emit symbol graph for '([^']+)'", result.stderr
+)
+known_aggregate_failure = (
+    result.returncode != 0
+    and failure_modules == ["ZetaPackageTests"]
+    and not missing_modules
+)
+if result.returncode != 0 and not known_aggregate_failure:
+    sys.stderr.write(result.stderr)
+    if missing_modules:
+        print(
+            f"missing public library symbol graphs: {sorted(missing_modules)}",
+            file=sys.stderr,
+        )
+    raise SystemExit(result.returncode)
+if known_aggregate_failure:
+    print(
+        "SwiftPM skipped its unloadable ZetaPackageTests aggregate after emitting every library symbol graph"
+    )
 modules: dict[str, list[tuple[str, str]]] = {}
 for path in paths:
     module = path.stem.split(".")[0]

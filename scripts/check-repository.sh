@@ -5,6 +5,8 @@ if [[ -z "${DEVELOPER_DIR:-}" && -z "${ZETA_SWIFT_TOOLCHAIN_CONFIGURED:-}" && -d
   export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
 fi
 
+PYTHONDONTWRITEBYTECODE=1 uv run python -m unittest discover -s Tests/ScriptTests -p 'test_*.py'
+
 source_root="${PI_SOURCE_ROOT:-}"
 source_args=()
 if [[ -n "$source_root" ]]; then

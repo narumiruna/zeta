@@ -6,7 +6,7 @@ let package = Package(
     name: "AllCapabilitiesPlugin",
     platforms: [.macOS(.v14)],
     dependencies: [
-        .package(path: "../../..")
+        .package(name: "Zeta", path: "../../..")
     ],
     targets: [
         .executableTarget(
