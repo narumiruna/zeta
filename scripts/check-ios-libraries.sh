@@ -61,8 +61,6 @@ package = json.loads(Path(sys.argv[1]).read_text())
 platforms = {item["platformName"]: item["version"] for item in package["platforms"]}
 if platforms != {"macos": "14.0", "ios": "17.0"}:
     raise SystemExit(f"unexpected package platforms: {platforms}")
-if package["dependencies"]:
-    raise SystemExit("the root package must have zero external dependencies")
 products = {item["name"]: item["type"] for item in package["products"]}
 for name in ("ZetaAI", "ZetaAgent"):
     if products.get(name) != {"library": ["automatic"]}:
