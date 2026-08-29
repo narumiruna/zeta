@@ -261,20 +261,28 @@ public actor PiServer {
             }
         case .attach(let id):
             let claim = try await openRuntime(id)
-            guard clients[connectionID]?.token == token, clients[connectionID]?.ready == true else {
+            do {
+                let snapshot = try await claim.runtime.snapshot(attached: true)
+                guard snapshot.id == id else {
+                    throw PiServerFailure.invalidRequest("Runtime session id mismatch")
+                }
+                guard var client = clients[connectionID], client.token == token, client.ready else {
+                    throw PiServerFailure.invalidRequest("Connection closed while attaching session")
+                }
+                guard var state = runtimes[id], state.token == claim.runtimeToken,
+                    state.openingClaims.remove(claim.claimToken) != nil
+                else {
+                    throw PiServerFailure.busy
+                }
+                state.connections.insert(connectionID)
+                client.attached.insert(id)
+                runtimes[id] = state
+                clients[connectionID] = client
+                return .attach(snapshot)
+            } catch {
                 await releaseRuntimeClaim(claim)
-                throw PiServerFailure.invalidRequest("Connection closed while attaching session")
+                throw error
             }
-            guard var state = runtimes[id], state.token == claim.runtimeToken,
-                state.openingClaims.remove(claim.claimToken) != nil
-            else {
-                await releaseRuntimeClaim(claim)
-                throw PiServerFailure.busy
-            }
-            state.connections.insert(connectionID)
-            runtimes[id] = state
-            clients[connectionID]?.attached.insert(id)
-            return .attach(try await claim.runtime.snapshot(attached: true))
         case .detach(let id):
             await detachRuntime(id, connectionID: connectionID)
             return .detach(sessionID: id)

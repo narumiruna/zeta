@@ -117,6 +117,11 @@ public struct PluginRegistration: Codable, Sendable, Equatable {
 }
 
 public actor PluginHost {
+    private struct RequestWaiter {
+        let id: UUID
+        let continuation: CheckedContinuation<Void, Error>
+    }
+
     private static let activeLock = NSLock()
     private nonisolated(unsafe) static var activeProcesses: [Int32: Process] = [:]
 
@@ -138,7 +143,8 @@ public actor PluginHost {
     private var input: FileHandle?
     private var output: FileHandle?
     private var requestActive = false
-    private var requestWaiters: [CheckedContinuation<Void, Never>] = []
+    private var requestWaiters: [RequestWaiter] = []
+    var queuedRequestCount: Int { requestWaiters.count }
 
     public init(configuration: Configuration = Configuration()) {
         self.configuration = configuration
@@ -189,8 +195,9 @@ public actor PluginHost {
     public func currentRegistrations() -> [PluginRegistration] { registrations }
 
     public func request(method: String, payload: Data? = nil) async throws -> Data {
-        await acquireRequestSlot()
+        try await acquireRequestSlot()
         defer { releaseRequestSlot() }
+        try Task.checkCancellation()
         guard let process, process.isRunning, let input, let output else {
             throw PluginError.crashed(process?.terminationStatus ?? -1)
         }
@@ -240,19 +247,32 @@ public actor PluginHost {
         }
     }
 
-    private func acquireRequestSlot() async {
+    private func acquireRequestSlot() async throws {
+        try Task.checkCancellation()
         if !requestActive {
             requestActive = true
             return
         }
-        await withCheckedContinuation { requestWaiters.append($0) }
+        let id = UUID()
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                requestWaiters.append(RequestWaiter(id: id, continuation: continuation))
+            }
+        } onCancel: {
+            Task { await self.cancelRequestWaiter(id) }
+        }
+    }
+
+    private func cancelRequestWaiter(_ id: UUID) {
+        guard let index = requestWaiters.firstIndex(where: { $0.id == id }) else { return }
+        requestWaiters.remove(at: index).continuation.resume(throwing: CancellationError())
     }
 
     private func releaseRequestSlot() {
         if requestWaiters.isEmpty {
             requestActive = false
         } else {
-            requestWaiters.removeFirst().resume()
+            requestWaiters.removeFirst().continuation.resume()
         }
     }
 

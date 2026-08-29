@@ -1,4 +1,5 @@
 import CryptoKit
+import Darwin
 import Foundation
 import XCTest
 
@@ -131,6 +132,62 @@ final class ZetaAuthTests: XCTestCase {
         XCTAssertEqual((validResponse as? HTTPURLResponse)?.statusCode, 200)
         let value = try await callback.value
         XCTAssertEqual(value, OAuthCallback(code: "valid-code", state: "valid-state"))
+    }
+
+    func testFragmentedOAuthRequestLineWaitsForLineEnding() async throws {
+        let server = OAuthCallbackServer(expectedState: "fragment-state")
+        let callbackURL = try await server.start()
+        let callback = Task { try await server.waitForCallback() }
+        defer {
+            callback.cancel()
+            server.stop()
+        }
+        try await waitUntil { server.isWaitingForCallback }
+        let port = try XCTUnwrap(callbackURL.port)
+
+        let response = try await fragmentedHTTPRequest(
+            port: UInt16(port),
+            fragments: [
+                Data("GET /callback?code=frag".utf8),
+                Data("mented&state=fragment-state HTTP/1.1\r".utf8),
+                Data("\nHost: 127.0.0.1\r\n\r\n".utf8),
+            ]
+        )
+
+        XCTAssertTrue(String(decoding: response, as: UTF8.self).hasPrefix("HTTP/1.1 200 OK"))
+        let value = try await callback.value
+        XCTAssertEqual(value, OAuthCallback(code: "fragmented", state: "fragment-state"))
+    }
+
+    func testOAuthCallbackRejectsRequestLineAtBufferLimit() async throws {
+        let server = OAuthCallbackServer(expectedState: "limit-state")
+        let callbackURL = try await server.start()
+        let callback = Task { try await server.waitForCallback() }
+        defer {
+            callback.cancel()
+            server.stop()
+        }
+        try await waitUntil { server.isWaitingForCallback }
+        let port = try XCTUnwrap(callbackURL.port)
+        let prefix = Data("GET /callback?code=oversized&state=limit-state&padding=".utf8)
+        let suffix = Data(" HTTP/1.1\n".utf8)
+        var oversized = prefix
+        oversized.append(Data(repeating: 0x61, count: 16 * 1_024 - prefix.count - suffix.count))
+        oversized.append(suffix)
+
+        let rejected = try await fragmentedHTTPRequest(port: UInt16(port), fragments: [oversized])
+        XCTAssertTrue(String(decoding: rejected, as: UTF8.self).hasPrefix("HTTP/1.1 400 Bad Request"))
+        XCTAssertTrue(server.isWaitingForCallback)
+
+        var valid = URLComponents(url: callbackURL, resolvingAgainstBaseURL: false)!
+        valid.queryItems = [
+            URLQueryItem(name: "code", value: "within-limit"),
+            URLQueryItem(name: "state", value: "limit-state"),
+        ]
+        let (_, response) = try await URLSession.shared.data(from: valid.url!)
+        XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 200)
+        let value = try await callback.value
+        XCTAssertEqual(value, OAuthCallback(code: "within-limit", state: "limit-state"))
     }
 
     func testOAuthCallbackCompletedBeforeWaiterIsPreserved() async throws {
@@ -290,6 +347,71 @@ final class ZetaAuthTests: XCTestCase {
         XCTAssertEqual(signed.signature.count, 64)
         XCTAssertTrue(signed.canonicalRequest.contains("Action=ListUsers&Version=2010-05-08"))
         XCTAssertNotNil(signed.request.value(forHTTPHeaderField: "Authorization"))
+    }
+}
+
+private enum OAuthSocketError: Error {
+    case systemCall(String, Int32)
+}
+
+private func fragmentedHTTPRequest(port: UInt16, fragments: [Data]) async throws -> Data {
+    try await Task.detached {
+        let descriptor = Darwin.socket(AF_INET, SOCK_STREAM, 0)
+        guard descriptor >= 0 else { throw OAuthSocketError.systemCall("socket", errno) }
+        defer { Darwin.close(descriptor) }
+        var noSignal: Int32 = 1
+        guard
+            setsockopt(descriptor, SOL_SOCKET, SO_NOSIGPIPE, &noSignal, socklen_t(MemoryLayout.size(ofValue: noSignal)))
+                == 0
+        else {
+            throw OAuthSocketError.systemCall("setsockopt", errno)
+        }
+        var address = sockaddr_in()
+        address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        address.sin_family = sa_family_t(AF_INET)
+        address.sin_port = port.bigEndian
+        guard inet_pton(AF_INET, "127.0.0.1", &address.sin_addr) == 1 else {
+            throw OAuthSocketError.systemCall("inet_pton", errno)
+        }
+        let connected = withUnsafePointer(to: &address) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.connect(descriptor, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        guard connected == 0 else { throw OAuthSocketError.systemCall("connect", errno) }
+
+        for (index, fragment) in fragments.enumerated() {
+            guard try writeAll(fragment, to: descriptor) else { break }
+            if index < fragments.count - 1 { usleep(50_000) }
+        }
+        _ = shutdown(descriptor, SHUT_WR)
+        var response = Data()
+        var buffer = [UInt8](repeating: 0, count: 4_096)
+        while true {
+            let count = Darwin.read(descriptor, &buffer, buffer.count)
+            if count == 0 { return response }
+            if count < 0 {
+                if errno == EINTR { continue }
+                throw OAuthSocketError.systemCall("read", errno)
+            }
+            response.append(buffer, count: count)
+        }
+    }.value
+}
+
+private func writeAll(_ data: Data, to descriptor: Int32) throws -> Bool {
+    try data.withUnsafeBytes { bytes in
+        var offset = 0
+        while offset < bytes.count {
+            let count = Darwin.write(descriptor, bytes.baseAddress!.advanced(by: offset), bytes.count - offset)
+            if count < 0 {
+                if errno == EINTR { continue }
+                if errno == EPIPE || errno == ECONNRESET { return false }
+                throw OAuthSocketError.systemCall("write", errno)
+            }
+            offset += count
+        }
+        return true
     }
 }
 

@@ -18,4 +18,43 @@ final class ZetaSessionFormatTests: XCTestCase {
         )
         XCTAssertEqual(coding, before)
     }
+
+    func testDetectFileReadsLongJSONLHeadersThroughFirstNewline() throws {
+        let padding = String(repeating: "a", count: 5_000)
+        let cases: [([String: Any], SessionFileFormat)] = [
+            (["type": "session", "version": 3, "cwd": padding], .codingAgent(version: 3)),
+            (["kind": "header", "version": 4, "metadata": ["note": padding]], .harness(version: 4)),
+        ]
+
+        for (object, expected) in cases {
+            var data = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+            XCTAssertGreaterThan(data.count, 4_096)
+            data.append(0x0A)
+            data.append(Data("not part of the header".utf8))
+            let file = try temporaryFile(containing: data)
+
+            XCTAssertEqual(try SessionFormatDetector.detect(file: file), expected)
+        }
+    }
+
+    func testDetectFileRejectsUnterminatedOversizedHeader() throws {
+        var data = Data(#"{"type":"session","cwd":""#.utf8)
+        data.append(
+            Data(
+                repeating: 0x61,
+                count: SessionFormatDetector.maximumHeaderBytes
+            )
+        )
+        let file = try temporaryFile(containing: data)
+
+        XCTAssertEqual(try SessionFormatDetector.detect(file: file), .unknown)
+    }
+
+    private func temporaryFile(containing data: Data) throws -> URL {
+        let file = FileManager.default.temporaryDirectory
+            .appendingPathComponent("zeta-session-format-\(UUID().uuidString)")
+        try data.write(to: file)
+        addTeardownBlock { try? FileManager.default.removeItem(at: file) }
+        return file
+    }
 }

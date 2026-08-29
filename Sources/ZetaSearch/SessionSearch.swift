@@ -71,6 +71,7 @@ public enum SessionSearch {
                     let needle = query.trimmingCharacters(in: .whitespacesAndNewlines)
                     guard !needle.isEmpty,
                         options.limit > 0,
+                        options.snippetCharacters >= 0,
                         options.entryTypes?.isEmpty != true
                     else {
                         continuation.finish()
@@ -98,11 +99,17 @@ public enum SessionSearch {
                                 from: haystack.startIndex,
                                 to: range.lowerBound
                             )
-                            let lower = max(0, offset - options.snippetCharacters / 2)
-                            let upper = min(
-                                haystack.count,
-                                lower + options.snippetCharacters
+                            let leadingCharacters = min(
+                                offset,
+                                options.snippetCharacters / 2
                             )
+                            let lower = offset - leadingCharacters
+                            let availableCharacters = haystack.count - lower
+                            let snippetLength = min(
+                                availableCharacters,
+                                options.snippetCharacters
+                            )
+                            let upper = lower + snippetLength
                             let start = haystack.index(haystack.startIndex, offsetBy: lower)
                             let end = haystack.index(haystack.startIndex, offsetBy: upper)
                             continuation.yield(

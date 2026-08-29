@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 public enum FileToolError: Error, LocalizedError, Equatable {
@@ -199,7 +200,7 @@ public struct FileTools: @unchecked Sendable {
     public func write(path: String, content: String) throws {
         let url = try resolve(path)
         try fileManager.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try Data(content.utf8).write(to: url, options: .atomic)
+        try writeAtomically(Data(content.utf8), to: url)
     }
 
     public func edit(path: String, replacements: [TextReplacement]) async throws -> EditResult {
@@ -254,9 +255,37 @@ public struct FileTools: @unchecked Sendable {
             let firstLine = firstIndex.map { normalized[..<$0].reduce(1) { $1 == "\n" ? $0 + 1 : $0 } }
             let restored = bom + String(decoding: updatedBytes, as: UTF8.self)
             try Task.checkCancellation()
-            try Data(restored.utf8).write(to: url, options: .atomic)
+            try self.writeAtomically(Data(restored.utf8), to: url)
             return EditResult(
                 replacements: replacements.count, firstChangedLine: firstLine, original: bom + raw, updated: restored)
+        }
+    }
+
+    private func writeAtomically(_ data: Data, to destination: URL) throws {
+        let existingPermissions: NSNumber?
+        if fileManager.fileExists(atPath: destination.path) {
+            let attributes = try fileManager.attributesOfItem(atPath: destination.path)
+            guard let permissions = attributes[.posixPermissions] as? NSNumber else {
+                throw CocoaError(.fileWriteUnknown)
+            }
+            existingPermissions = permissions
+        } else {
+            existingPermissions = nil
+        }
+
+        let temporary = destination.deletingLastPathComponent().appendingPathComponent(
+            ".\(destination.lastPathComponent).zeta-write-\(UUID().uuidString)"
+        )
+        defer { try? fileManager.removeItem(at: temporary) }
+        try data.write(to: temporary, options: .withoutOverwriting)
+        if let existingPermissions {
+            try fileManager.setAttributes(
+                [.posixPermissions: existingPermissions],
+                ofItemAtPath: temporary.path
+            )
+        }
+        guard Darwin.rename(temporary.path, destination.path) == 0 else {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
         }
     }
 

@@ -149,6 +149,68 @@ final class ZetaPluginAPITests: XCTestCase {
         await host.stop()
     }
 
+    func testCancellingQueuedRequestRemovesWaiterWithoutStoppingHost() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let script = directory.appendingPathComponent("queued.py")
+        let source = #"""
+            #!/usr/bin/env python3
+            import base64,json,os,sys,time
+            for line in sys.stdin:
+                request=json.loads(line)
+                method=request.get("method")
+                if method == "slow":
+                    open("slow-started", "w").close()
+                    while not os.path.exists("release-slow"):
+                        time.sleep(0.001)
+                elif method != "initialize":
+                    open(method + "-received", "w").close()
+                value = b"[]" if method == "initialize" else method.encode()
+                response={"id":request.get("id"),"type":"response","generation":request["generation"],"payload":base64.b64encode(value).decode()}
+                print(json.dumps(response,separators=(',',':')),flush=True)
+            """#
+        try Data(source.utf8).write(to: script)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: script.path)
+        var configuration = PluginHost.Configuration()
+        configuration.requestTimeout = .seconds(2)
+        let host = PluginHost(configuration: configuration)
+        try await host.start(
+            manifest: PluginManifest(
+                name: "queued",
+                version: "1",
+                executable: script.lastPathComponent,
+                capabilities: []
+            ),
+            baseDirectory: directory,
+            trusted: true
+        )
+
+        let active = Task { try await host.request(method: "slow") }
+        try await waitUntil {
+            FileManager.default.fileExists(atPath: directory.appendingPathComponent("slow-started").path)
+        }
+        let cancelled = Task { try await host.request(method: "cancelled") }
+        try await waitUntilAsync { await host.queuedRequestCount == 1 }
+
+        cancelled.cancel()
+        do {
+            _ = try await cancelled.value
+            XCTFail("Expected queued request cancellation")
+        } catch is CancellationError {}
+        let queuedCount = await host.queuedRequestCount
+        XCTAssertEqual(queuedCount, 0)
+
+        try Data().write(to: directory.appendingPathComponent("release-slow"))
+        let activeResponse = try await active.value
+        XCTAssertEqual(activeResponse, Data("slow".utf8))
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: directory.appendingPathComponent("cancelled-received").path))
+        let fastResponse = try await host.request(method: "fast")
+        XCTAssertEqual(fastResponse, Data("fast".utf8))
+        await host.stop()
+    }
+
     func testPluginRequestTimeoutIncludesBlockedStdinWrite() async throws {
         let fixture = try makeBackpressuredPluginFixture()
         defer { try? FileManager.default.removeItem(at: fixture.directory) }
@@ -285,6 +347,20 @@ private func waitUntil(
     let clock = ContinuousClock()
     let deadline = clock.now.advanced(by: timeout)
     while !condition() {
+        guard clock.now < deadline else {
+            throw PluginTestError.timedOutWaitingForCondition
+        }
+        try await Task.sleep(for: .milliseconds(1))
+    }
+}
+
+private func waitUntilAsync(
+    timeout: Duration = .seconds(2),
+    _ condition: () async -> Bool
+) async throws {
+    let clock = ContinuousClock()
+    let deadline = clock.now.advanced(by: timeout)
+    while !(await condition()) {
         guard clock.now < deadline else {
             throw PluginTestError.timedOutWaitingForCondition
         }

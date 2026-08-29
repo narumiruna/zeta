@@ -7,6 +7,8 @@ public struct OAuthCallback: Sendable, Equatable {
 }
 
 public final class OAuthCallbackServer: @unchecked Sendable {
+    private static let maximumRequestLineBytes = 16 * 1_024
+
     private let expectedState: String
     private let queue = DispatchQueue(label: "zeta.oauth.callback")
     private var listener: NWListener?
@@ -90,30 +92,53 @@ public final class OAuthCallbackServer: @unchecked Sendable {
 
     private func accept(_ connection: NWConnection) {
         connection.start(queue: queue)
+        receiveRequestLine(from: connection, buffer: Data())
+    }
+
+    private func receiveRequestLine(from connection: NWConnection, buffer: Data) {
         connection.receive(
             minimumIncompleteLength: 1,
-            maximumLength: 16 * 1_024
-        ) { [weak self] data, _, _, error in
+            maximumLength: Self.maximumRequestLineBytes - buffer.count
+        ) { [weak self] data, _, isComplete, error in
             guard let self else { return }
-            if error != nil {
+            guard error == nil else {
                 self.respond(connection, status: "400 Bad Request", message: "Authorization failed")
                 return
             }
-            guard let data,
-                let request = String(data: data, encoding: .utf8),
-                let firstLine = request.split(separator: "\n").first,
-                let target = firstLine.split(separator: " ").dropFirst().first,
-                let components = URLComponents(string: String(target)),
-                let code = components.queryItems?.first(where: { $0.name == "code" })?.value,
-                let state = components.queryItems?.first(where: { $0.name == "state" })?.value,
-                state == self.expectedState
-            else {
+            var received = buffer
+            if let data { received.append(data) }
+            if let lineFeed = received.firstIndex(of: 0x0A) {
+                let lineLength = received.distance(from: received.startIndex, to: received.index(after: lineFeed))
+                guard lineLength < Self.maximumRequestLineBytes else {
+                    self.respond(connection, status: "400 Bad Request", message: "Invalid authorization callback")
+                    return
+                }
+                self.handleRequestLine(received[..<lineFeed], from: connection)
+                return
+            }
+            guard !isComplete, received.count < Self.maximumRequestLineBytes else {
                 self.respond(connection, status: "400 Bad Request", message: "Invalid authorization callback")
                 return
             }
-            self.respond(connection, status: "200 OK", message: "Authorization complete. You may close this window.")
-            self.finish(.success(OAuthCallback(code: code, state: state)))
+            self.receiveRequestLine(from: connection, buffer: received)
         }
+    }
+
+    private func handleRequestLine(_ bytes: Data.SubSequence, from connection: NWConnection) {
+        var line = bytes
+        if line.last == 0x0D { line.removeLast() }
+        guard let requestLine = String(data: line, encoding: .utf8),
+            let target = requestLine.split(separator: " ").dropFirst().first,
+            let components = URLComponents(string: String(target)),
+            let code = components.queryItems?.first(where: { $0.name == "code" })?.value,
+            let state = components.queryItems?.first(where: { $0.name == "state" })?.value,
+            state == expectedState
+        else {
+            respond(connection, status: "400 Bad Request", message: "Invalid authorization callback")
+            return
+        }
+        respond(connection, status: "200 OK", message: "Authorization complete. You may close this window.")
+        finish(.success(OAuthCallback(code: code, state: state)))
     }
 
     private func respond(

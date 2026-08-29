@@ -482,6 +482,93 @@ final class ZetaPackagesTests: XCTestCase {
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: installed.path), [])
     }
 
+    func testNPMArchiveWithinExpandedLimitsInstallsFromValidatedMetadata() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let archive = try makeNPMArchive(
+            at: root,
+            files: [("resource file.md", Data("safe".utf8))]
+        )
+        NPMArchiveURLProtocol.configure(
+            archiveStatus: 200,
+            archiveChunks: [try Data(contentsOf: archive)]
+        )
+        let installedRoot = root.appendingPathComponent("installed")
+        let manager = try ResourcePackageManager(
+            root: installedRoot,
+            session: npmTestSession(),
+            maximumCompressedArchiveBytes: 1_000_000,
+            maximumExpandedArchiveBytes: 1_000_000,
+            maximumArchiveFileBytes: 1_000_000,
+            maximumArchiveMembers: 100
+        )
+
+        try await manager.install(.npm(name: "test", version: nil))
+
+        let packages = await manager.list()
+        let package = try XCTUnwrap(packages.first)
+        XCTAssertEqual(packages.count, 1)
+        XCTAssertEqual(
+            try Data(
+                contentsOf: installedRoot.appendingPathComponent(package.directory)
+                    .appendingPathComponent("resource file.md")
+            ),
+            Data("safe".utf8)
+        )
+    }
+
+    func testNPMArchiveRejectsHighlyCompressibleFileByExpandedPerFileMetadata() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let archive = try makeNPMArchive(
+            at: root,
+            files: [("bomb.bin", Data(repeating: 0, count: 1_024 * 1_024))]
+        )
+
+        try await assertNPMArchiveRejected(
+            archive,
+            installedRoot: root.appendingPathComponent("installed"),
+            maximumExpandedArchiveBytes: 2 * 1_024 * 1_024,
+            maximumArchiveFileBytes: 512 * 1_024,
+            maximumArchiveMembers: 100
+        )
+    }
+
+    func testNPMArchiveRejectsExpandedTotalMetadataBeforeExtraction() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let archive = try makeNPMArchive(
+            at: root,
+            files: [
+                ("first.bin", Data(repeating: 0x61, count: 384 * 1_024)),
+                ("second.bin", Data(repeating: 0x62, count: 384 * 1_024)),
+            ]
+        )
+
+        try await assertNPMArchiveRejected(
+            archive,
+            installedRoot: root.appendingPathComponent("installed"),
+            maximumExpandedArchiveBytes: 700 * 1_024,
+            maximumArchiveFileBytes: 512 * 1_024,
+            maximumArchiveMembers: 100
+        )
+    }
+
+    func testNPMArchiveRejectsMemberCountMetadataBeforeExtraction() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let files = (0..<8).map { ("file-\($0).txt", Data()) }
+        let archive = try makeNPMArchive(at: root, files: files)
+
+        try await assertNPMArchiveRejected(
+            archive,
+            installedRoot: root.appendingPathComponent("installed"),
+            maximumExpandedArchiveBytes: 1_024,
+            maximumArchiveFileBytes: 1_024,
+            maximumArchiveMembers: 5
+        )
+    }
+
     func testNPMArchiveDownloadRejectsCompressedSizeLimitWithoutPublication() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -685,6 +772,54 @@ private final class NPMArchiveURLProtocol: URLProtocol, @unchecked Sendable {
         #"{"versions":{"1.0.0":{"dist":{"tarball":"https://packages.test/archive.tgz"}}},"dist-tags":{"latest":"1.0.0"}}"#
             .utf8
     )
+}
+
+private func makeNPMArchive(at root: URL, files: [(String, Data)]) throws -> URL {
+    let source = root.appendingPathComponent("archive-source")
+    let package = source.appendingPathComponent("package")
+    let archive = root.appendingPathComponent("archive.tgz")
+    try FileManager.default.createDirectory(at: package, withIntermediateDirectories: true)
+    try Data(#"{"name":"test","pi":{"skills":[]}}"#.utf8).write(
+        to: package.appendingPathComponent("package.json")
+    )
+    for (name, data) in files {
+        try data.write(to: package.appendingPathComponent(name))
+    }
+    try runProcess("/usr/bin/tar", ["-czf", archive.path, "package"], at: source)
+    return archive
+}
+
+private func assertNPMArchiveRejected(
+    _ archive: URL,
+    installedRoot: URL,
+    maximumExpandedArchiveBytes: Int64,
+    maximumArchiveFileBytes: Int64,
+    maximumArchiveMembers: Int
+) async throws {
+    NPMArchiveURLProtocol.configure(
+        archiveStatus: 200,
+        archiveChunks: [try Data(contentsOf: archive)]
+    )
+    let manager = try ResourcePackageManager(
+        root: installedRoot,
+        session: npmTestSession(),
+        maximumCompressedArchiveBytes: 1_000_000,
+        maximumExpandedArchiveBytes: maximumExpandedArchiveBytes,
+        maximumArchiveFileBytes: maximumArchiveFileBytes,
+        maximumArchiveMembers: maximumArchiveMembers
+    )
+
+    do {
+        try await manager.install(.npm(name: "test", version: nil))
+        XCTFail("Expected archive metadata limit rejection")
+    } catch PackageManagerError.unsafeArchive {
+    } catch {
+        XCTFail("Expected unsafe archive error, got \(error)")
+    }
+
+    let packages = await manager.list()
+    XCTAssertTrue(packages.isEmpty)
+    XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: installedRoot.path), [])
 }
 
 private func createGitPackage(at directory: URL, marker: String) throws {

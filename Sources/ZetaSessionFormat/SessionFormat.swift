@@ -9,6 +9,8 @@ public enum SessionFileFormat: Sendable, Equatable {
 }
 
 public enum SessionFormatDetector {
+    static let maximumHeaderBytes = JSONLimits.default.maximumByteCount
+    private static let readChunkBytes = 4_096
     private static let sqliteHeader = Data("SQLite format 3\0".utf8)
 
     public static func detect(data: Data) -> SessionFileFormat {
@@ -32,7 +34,30 @@ public enum SessionFormatDetector {
     public static func detect(file: URL) throws -> SessionFileFormat {
         let handle = try FileHandle(forReadingFrom: file)
         defer { try? handle.close() }
-        return detect(data: try handle.read(upToCount: 4_096) ?? Data())
+
+        var header = Data()
+        while true {
+            let bytesToRead = min(readChunkBytes, maximumHeaderBytes - header.count + 1)
+            guard let chunk = try handle.read(upToCount: bytesToRead), !chunk.isEmpty else {
+                return detect(data: header)
+            }
+            if let newline = chunk.firstIndex(of: 0x0A) {
+                let bytesBeforeNewline = chunk.distance(from: chunk.startIndex, to: newline)
+                guard header.count <= maximumHeaderBytes - bytesBeforeNewline else {
+                    return .unknown
+                }
+                header.append(chunk[..<newline])
+                return detect(data: header)
+            }
+
+            header.append(chunk)
+            if header.count >= sqliteHeader.count, header.starts(with: sqliteHeader) {
+                return .sqlite
+            }
+            guard header.count <= maximumHeaderBytes else {
+                return .unknown
+            }
+        }
     }
 
     public static func require(

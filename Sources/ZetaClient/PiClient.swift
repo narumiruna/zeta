@@ -57,7 +57,8 @@ public actor PiClient {
     }
     private struct AttachmentOperation {
         let token: UUID
-        let task: Task<Void, Error>
+        let task: Task<SessionSnapshot, Error>
+        var waiters: [UUID: CheckedContinuation<Void, Error>] = [:]
     }
     private struct DetachmentOperation {
         let token: UUID
@@ -361,6 +362,7 @@ public actor PiClient {
     }
 
     private func reserveLease(sessionID: String, mode: LeaseMode, alreadyAttached: Bool) async throws -> SessionLease {
+        try Task.checkCancellation()
         let id = UUID()
         var book = leases[sessionID] ?? LeaseBook()
         switch mode {
@@ -372,62 +374,135 @@ public actor PiClient {
         leases[sessionID] = book
 
         do {
-            if !alreadyAttached { try await ensureAttached(sessionID) }
+            if !alreadyAttached { try await ensureAttached(sessionID, leaseID: id) }
+            try Task.checkCancellation()
             return SessionLease(id: id, sessionID: sessionID, mode: mode, client: self)
         } catch {
             if var current = leases[sessionID] {
                 removeLease(id, from: &current)
+                let needsOrphanDetachment =
+                    current.exclusive == nil && current.shared.isEmpty && current.attached && current.attachment == nil
                 if current.exclusive == nil && current.shared.isEmpty && !current.attached && current.attachment == nil
                 {
                     leases[sessionID] = nil
                 } else {
                     leases[sessionID] = current
                 }
+                if needsOrphanDetachment { detachOrphanedAttachment(sessionID) }
             }
             throw error
         }
     }
 
-    private func ensureAttached(_ sessionID: String) async throws {
+    private func ensureAttached(_ sessionID: String, leaseID: UUID) async throws {
         guard var book = leases[sessionID] else { throw PiClientError.detached }
         if book.attached, book.detachment == nil { return }
-        let operation: AttachmentOperation
+        let operationToken: UUID
         if let existing = book.attachment {
-            operation = existing
+            operationToken = existing.token
         } else {
             let token = UUID()
             let task = Task { try await self.performAttachment(sessionID: sessionID, token: token) }
-            operation = AttachmentOperation(token: token, task: task)
+            let operation = AttachmentOperation(token: token, task: task)
+            operationToken = token
             book.attachment = operation
             leases[sessionID] = book
+            Task { await self.observeAttachment(sessionID: sessionID, operation: operation) }
         }
-        try await operation.task.value
+        try await waitForAttachment(sessionID: sessionID, operationToken: operationToken, leaseID: leaseID)
     }
 
-    private func performAttachment(sessionID: String, token: UUID) async throws {
+    private func waitForAttachment(sessionID: String, operationToken: UUID, leaseID: UUID) async throws {
+        try await withTaskCancellationHandler {
+            try Task.checkCancellation()
+            try await withCheckedThrowingContinuation { continuation in
+                guard var book = leases[sessionID], var operation = book.attachment,
+                    operation.token == operationToken
+                else {
+                    if leases[sessionID]?.attached == true {
+                        continuation.resume()
+                    } else {
+                        continuation.resume(throwing: PiClientError.detached)
+                    }
+                    return
+                }
+                operation.waiters[leaseID] = continuation
+                book.attachment = operation
+                leases[sessionID] = book
+            }
+        } onCancel: {
+            Task { await self.cancelAttachmentWaiter(sessionID, operationToken: operationToken, leaseID: leaseID) }
+        }
+    }
+
+    private func cancelAttachmentWaiter(_ sessionID: String, operationToken: UUID, leaseID: UUID) {
+        guard var book = leases[sessionID], var operation = book.attachment,
+            operation.token == operationToken,
+            let waiter = operation.waiters.removeValue(forKey: leaseID)
+        else { return }
+        removeLease(leaseID, from: &book)
+        book.attachment = operation
+        leases[sessionID] = book
+        waiter.resume(throwing: CancellationError())
+    }
+
+    private func observeAttachment(sessionID: String, operation: AttachmentOperation) async {
+        do {
+            completeAttachment(sessionID, token: operation.token, result: .success(try await operation.task.value))
+        } catch {
+            completeAttachment(sessionID, token: operation.token, result: .failure(error))
+        }
+    }
+
+    private func completeAttachment(
+        _ sessionID: String,
+        token: UUID,
+        result: Result<SessionSnapshot, Error>
+    ) {
+        guard var book = leases[sessionID], let operation = book.attachment, operation.token == token else { return }
+        book.attachment = nil
+        switch result {
+        case .success(let snapshot):
+            sessionSnapshots[sessionID] = snapshot
+            book.attached = true
+            leases[sessionID] = book
+        case .failure:
+            if book.exclusive == nil && book.shared.isEmpty && !book.attached {
+                leases[sessionID] = nil
+            } else {
+                leases[sessionID] = book
+            }
+        }
+        operation.waiters.values.forEach { $0.resume(with: result.map { _ in () }) }
+        if case .success = result, book.exclusive == nil, book.shared.isEmpty {
+            detachOrphanedAttachment(sessionID)
+        }
+    }
+
+    private func performAttachment(sessionID: String, token: UUID) async throws -> SessionSnapshot {
         if let detachment = leases[sessionID]?.detachment { try? await detachment.task.value }
         guard let operation = leases[sessionID]?.attachment, operation.token == token else {
             throw PiClientError.detached
         }
         if leases[sessionID]?.attached == true {
-            leases[sessionID]?.attachment = nil
-            return
+            guard let snapshot = sessionSnapshots[sessionID] else { throw PiClientError.detached }
+            return snapshot
         }
-        do {
-            guard case .attach(let snapshot) = try await requestResult(.attach(sessionID: sessionID)) else {
-                throw PiClientError.protocolFailure("Unexpected attach result")
-            }
-            guard var book = leases[sessionID], book.attachment?.token == token else {
-                throw PiClientError.detached
-            }
-            sessionSnapshots[sessionID] = snapshot
-            book.attached = true
-            book.attachment = nil
-            leases[sessionID] = book
-        } catch {
-            if leases[sessionID]?.attachment?.token == token { leases[sessionID]?.attachment = nil }
-            throw error
+        guard case .attach(let snapshot) = try await requestResult(.attach(sessionID: sessionID)) else {
+            throw PiClientError.protocolFailure("Unexpected attach result")
         }
+        guard leases[sessionID]?.attachment?.token == token else { throw PiClientError.detached }
+        return snapshot
+    }
+
+    private func detachOrphanedAttachment(_ sessionID: String) {
+        guard var book = leases[sessionID], book.exclusive == nil, book.shared.isEmpty, book.attached,
+            book.detachment == nil
+        else { return }
+        let token = UUID()
+        let task = Task { try await self.performDetachment(sessionID: sessionID, token: token) }
+        book.detachment = DetachmentOperation(token: token, task: task)
+        leases[sessionID] = book
     }
 
     private func performDetachment(sessionID: String, token: UUID) async throws {
@@ -438,7 +513,11 @@ public actor PiClient {
             guard var book = leases[sessionID], book.detachment?.token == token else { return }
             book.attached = false
             book.detachment = nil
-            leases[sessionID] = book
+            if book.exclusive == nil && book.shared.isEmpty && book.attachment == nil {
+                leases[sessionID] = nil
+            } else {
+                leases[sessionID] = book
+            }
         } catch {
             if leases[sessionID]?.detachment?.token == token { leases[sessionID]?.detachment = nil }
             throw error
@@ -558,7 +637,12 @@ public actor PiClient {
         stateValue = .disconnected
         snapshotValue = nil
         sessionSnapshots.removeAll()
+        let attachmentWaiters = leases.values.flatMap { book -> [CheckedContinuation<Void, Error>] in
+            guard let attachment = book.attachment else { return [] }
+            return Array(attachment.waiters.values)
+        }
         leases.removeAll()
+        attachmentWaiters.forEach { $0.resume(throwing: error) }
         let currentHandshake = handshake
         handshake = nil
         currentHandshake?.timeoutTask.cancel()

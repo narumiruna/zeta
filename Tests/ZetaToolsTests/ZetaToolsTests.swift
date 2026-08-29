@@ -85,6 +85,51 @@ final class ZetaToolsTests: XCTestCase {
         XCTAssertEqual(mimeType, "image/png")
     }
 
+    func testOverwriteWritePreservesPOSIXModesAndNewFilesUseSafeDefaults() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let tools = FileTools(workingDirectory: directory)
+
+        for (name, mode) in [("executable.sh", 0o755), ("restricted.txt", 0o600)] {
+            let file = directory.appendingPathComponent(name)
+            try Data("old".utf8).write(to: file)
+            try FileManager.default.setAttributes([.posixPermissions: mode], ofItemAtPath: file.path)
+
+            try tools.write(path: name, content: "replacement")
+
+            XCTAssertEqual(try Data(contentsOf: file), Data("replacement".utf8))
+            XCTAssertEqual(try posixMode(at: file), mode)
+        }
+
+        let created = directory.appendingPathComponent("created.txt")
+        try tools.write(path: "created.txt", content: "new")
+        let createdMode = try posixMode(at: created)
+        XCTAssertEqual(createdMode & 0o600, 0o600)
+        XCTAssertEqual(createdMode & 0o133, 0)
+    }
+
+    func testEditPreservesExecutableAndRestrictedPOSIXModes() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let tools = FileTools(workingDirectory: directory)
+
+        for (name, mode) in [("executable.sh", 0o755), ("restricted.txt", 0o600)] {
+            let file = directory.appendingPathComponent(name)
+            try Data("old bytes\n".utf8).write(to: file)
+            try FileManager.default.setAttributes([.posixPermissions: mode], ofItemAtPath: file.path)
+
+            _ = try await tools.edit(
+                path: name,
+                replacements: [TextReplacement(oldText: "old", newText: "new")]
+            )
+
+            XCTAssertEqual(try Data(contentsOf: file), Data("new bytes\n".utf8))
+            XCTAssertEqual(try posixMode(at: file), mode)
+        }
+    }
+
     func testEditMatchesOriginalAndRejectsOverlap() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -435,6 +480,11 @@ final class ZetaToolsTests: XCTestCase {
 
         XCTAssertEqual(try Data(contentsOf: file), original)
     }
+}
+
+private func posixMode(at url: URL) throws -> Int {
+    let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+    return try XCTUnwrap((attributes[.posixPermissions] as? NSNumber)?.intValue) & 0o7777
 }
 
 private final class ShellUpdateRecorder: @unchecked Sendable {

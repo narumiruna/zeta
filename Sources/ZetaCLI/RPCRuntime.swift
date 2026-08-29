@@ -28,6 +28,7 @@ public actor CLIRPCRuntime {
     private var autoRetry: Bool
     private var retryPolicyInitialized = false
     private var sessionName: String?
+    private var sessionNameInitialized = false
     private let session: PersistentSessionController?
     private var promptTask: Task<Void, Never>?
     private var promptRunID: UUID?
@@ -126,6 +127,7 @@ public actor CLIRPCRuntime {
     private func execute(_ request: StrictRPCRequest) async throws -> JSONValue? {
         try surfaceDeferredErrors()
         try await session?.drainPersistenceErrors()
+        await initializeSessionName()
         await initializeRetryPolicy()
         switch request.command {
         case .prompt:
@@ -182,6 +184,7 @@ public actor CLIRPCRuntime {
                 await session?.publishNewSession(replacement)
             }
             sessionName = nil
+            sessionNameInitialized = true
             return [
                 "created": true,
                 "path": replacement?.file.map { .string($0.path) } ?? .null,
@@ -343,8 +346,10 @@ public actor CLIRPCRuntime {
             try await beginSessionMutation()
             defer { sessionMutationInProgress = false }
             let path = try requiredString("sessionPath", request.fields)
-            let messages = try await session.switchTo(path: path)
-            try await agent.setMessages(messages)
+            let switched = try await session.switchTo(path: path)
+            try await agent.setMessages(switched.messages)
+            sessionName = switched.name
+            sessionNameInitialized = true
             return ["switched": true, "path": .string(path)]
         case .fork:
             guard let session else { return ["forked": false, "reason": "No persistent session selected"] }
@@ -410,6 +415,7 @@ public actor CLIRPCRuntime {
             let name = try requiredString("name", request.fields)
             try await session?.setName(name)
             sessionName = name
+            sessionNameInitialized = true
             return ["name": .string(name)]
         case .getCommands:
             return .array(RPCCommandName.allCases.map { .string($0.rawValue) })
@@ -452,6 +458,12 @@ public actor CLIRPCRuntime {
                 error: String(describing: error)
             )
         }
+    }
+
+    private func initializeSessionName() async {
+        guard !sessionNameInitialized else { return }
+        sessionName = await session?.currentName()
+        sessionNameInitialized = true
     }
 
     private func beginSessionMutation() async throws {

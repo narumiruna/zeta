@@ -119,6 +119,7 @@ actor PersistentSessionController {
     func currentLeafID() async -> String? { await manager.leaf()?.base.id }
     func currentMessages() async throws -> [Message] { try await manager.context().messages }
     func currentFile() async -> URL? { await manager.file }
+    func currentName() async -> String? { Self.sessionName(in: await manager.allEntries()) }
     func exportSnapshot() async -> (header: SessionHeader, entries: [SessionEntry], leafID: String?) {
         await (manager.header, manager.allEntries(), manager.leaf()?.base.id)
     }
@@ -263,10 +264,21 @@ actor PersistentSessionController {
         return fork
     }
 
-    func switchTo(path: String) async throws -> [Message] {
+    func switchTo(path: String) async throws -> (messages: [Message], name: String?) {
         let loaded = try SessionManager.load(file: URL(fileURLWithPath: path))
+        let messages = try await loaded.context().messages
+        let name = Self.sessionName(in: await loaded.allEntries())
         manager = loaded
-        return try await loaded.context().messages
+        return (messages, name)
+    }
+
+    private static func sessionName(in entries: [SessionEntry]) -> String? {
+        for entry in entries.reversed() {
+            guard case .sessionInfo(_, let name) = entry else { continue }
+            let normalized = name?.trimmingCharacters(in: .whitespacesAndNewlines)
+            return normalized?.isEmpty == false ? normalized : nil
+        }
+        return nil
     }
 
     private static func projectedContextEntries(_ branch: [SessionEntry]) -> [SessionEntry] {

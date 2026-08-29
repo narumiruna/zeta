@@ -66,6 +66,61 @@ final class ZetaSearchTests: XCTestCase {
         XCTAssertTrue(text.contains(hits[0].snippet))
     }
 
+    func testNegativeSnippetCharactersReturnNoHits() async throws {
+        let sources = ArraySearchSources([
+            (
+                "negative",
+                [
+                    SearchDocument(
+                        sessionID: "negative",
+                        entryID: "entry",
+                        entryType: "message",
+                        text: "needle at the beginning"
+                    )
+                ]
+            )
+        ])
+        var hits: [SessionSearchHit] = []
+
+        for try await hit in SessionSearch.scan(
+            sources,
+            query: "needle",
+            options: SessionSearchOptions(snippetCharacters: -1)
+        ) {
+            hits.append(hit)
+        }
+
+        XCTAssertTrue(hits.isEmpty)
+    }
+
+    func testMaximumSnippetCharactersHandlesUnicodeWithoutOverflow() async throws {
+        let text = "👩🏽‍💻 café e\u{301} before NEEDLE 後ろ 🧑‍🚀"
+        let sources = ArraySearchSources([
+            (
+                "maximum",
+                [
+                    SearchDocument(
+                        sessionID: "maximum",
+                        entryID: "entry",
+                        entryType: "message",
+                        text: text
+                    )
+                ]
+            )
+        ])
+        var hits: [SessionSearchHit] = []
+
+        for try await hit in SessionSearch.scan(
+            sources,
+            query: "needle",
+            options: SessionSearchOptions(limit: 1, snippetCharacters: .max)
+        ) {
+            hits.append(hit)
+        }
+
+        XCTAssertEqual(hits.map(\.snippet), [text + "\n"])
+    }
+
     func testDuplicateSessionsFailFast() async {
         let sources = ArraySearchSources([
             ("s", []),

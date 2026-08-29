@@ -62,17 +62,30 @@ public enum ZetaCLI {
                 fileURLWithPath: FileManager.default.currentDirectoryPath
             ).standardizedFileURL
             let paths = ZetaPaths(workingDirectory: workingDirectory)
+            let stdinIsTTY = isatty(STDIN_FILENO) == 1
+            let stdoutIsTTY = isatty(STDOUT_FILENO) == 1
+            let mode = parsed.effectiveMode(
+                stdinIsTTY: stdinIsTTY,
+                stdoutIsTTY: stdoutIsTTY
+            )
             let globalSettingsStore = try SettingsStore(paths: paths, includeProject: false)
             let globalSettings = await globalSettingsStore.current()
             let trustStore = try TrustStore(url: paths.trust)
-            if let approved = parsed.approve {
-                try await trustStore.set(approved ? .trusted : .denied, for: workingDirectory)
+            let trust = try await CLIProjectTrust.resolve(
+                directory: workingDirectory,
+                store: trustStore,
+                override: parsed.approve,
+                default: globalSettings.defaultProjectTrust,
+                projectResourcesPresent: CLIProjectTrust.hasTrustRequiringResources(
+                    in: workingDirectory
+                ),
+                supportsInteractiveSelection: mode == .interactive && stdinIsTTY && stdoutIsTTY,
+                selector: { CLITrustPrompt.select(directory: $0) }
+            )
+            if let diagnostic = trust.diagnostic {
+                FileHandle.standardError.write(Data("warning: \(diagnostic)\n".utf8))
             }
-            let trustDecision = await trustStore.decision(for: workingDirectory)
-            let trusted =
-                parsed.approve
-                ?? trustDecision.map { $0 == .trusted }
-                ?? (globalSettings.defaultProjectTrust == .always)
+            let trusted = trust.trusted
             let settingsStore =
                 trusted
                 ? try SettingsStore(paths: paths, includeProject: true)
@@ -88,14 +101,12 @@ public enum ZetaCLI {
                     Data("\(diagnostic.severity.rawValue): \(diagnostic.path): \(diagnostic.message)\n".utf8)
                 )
             }
-            let mode = parsed.effectiveMode(
-                stdinIsTTY: isatty(STDIN_FILENO) == 1, stdoutIsTTY: isatty(STDOUT_FILENO) == 1)
             let initial =
                 mode == .rpc
                 ? nil
                 : try buildInitialPrompt(
                     parsed: parsed,
-                    includeStdin: isatty(STDIN_FILENO) != 1
+                    includeStdin: !stdinIsTTY
                 )
             guard initial?.isEmpty == false || mode == .interactive || mode == .rpc else {
                 throw CLIArgumentError.missingValue("prompt")
@@ -161,11 +172,14 @@ public enum ZetaCLI {
                     session: persistentSession
                 )
             case .json:
-                result = await runJSON(
+                result = await runJSONMode(
                     agent: agent,
                     prompt: initial!.message,
                     remaining: Array(parsed.messages.dropFirst()),
-                    session: persistentSession
+                    session: persistentSession,
+                    writeEvent: { data in
+                        try? FileHandle.standardOutput.write(contentsOf: data)
+                    }
                 )
             case .interactive:
                 result = await runInteractive(
@@ -210,32 +224,6 @@ public enum ZetaCLI {
             if [.error, .aborted].contains(assistant.stopReason) {
                 if let error = assistant.errorMessage { FileHandle.standardError.write(Data("\(error)\n".utf8)) }
                 return 1
-            }
-            return 0
-        } catch {
-            FileHandle.standardError.write(Data("\(error.localizedDescription)\n".utf8))
-            return 1
-        }
-    }
-
-    private static func runJSON(
-        agent: Agent,
-        prompt: UserMessage,
-        remaining: [String],
-        session: PersistentSessionController?
-    ) async -> Int32 {
-        await agent.subscribe { event in
-            if let data = try? JSONEncoder().encode(JSONAgentEvent(event)), var line = Optional(data) {
-                line.append(0x0A)
-                try? FileHandle.standardOutput.write(contentsOf: line)
-            }
-        }
-        do {
-            try await CLISessionBoundary.prompt(prompt, agent: agent, session: session)
-            for message in remaining {
-                try await CLISessionBoundary.prompt(
-                    UserMessage(message), agent: agent, session: session
-                )
             }
             return 0
         } catch {

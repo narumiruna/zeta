@@ -480,6 +480,96 @@ Outcome: Addressed with two-phase replacement that materializes first, resets th
 
 Evidence: Interactive and RPC failure regressions verify old messages and session ownership remain unchanged.
 
+## Twelfth-round inline feedback
+
+### `3885929304`
+
+Concern: Fragmented OAuth redirects are parsed before the request line is complete.
+
+Outcome: Addressed by buffering through LF or CRLF under the existing 16 KiB request limit.
+
+Evidence: OAuth regressions fragment valid and oversized request lines.
+
+### `3885929306`
+
+Concern: Cancelled attachment waiters leak reserved client leases.
+
+Outcome: Addressed with per-lease waiters that remove only the cancelled reservation and detach orphaned completed attachments.
+
+Evidence: Client regressions cancel one shared attachment waiter while preserving another.
+
+### `3885929308`
+
+Concern: Compressed package limits do not bound expanded archive size.
+
+Outcome: Addressed by validating member count, per-file size, and total expanded bytes before extraction.
+
+Evidence: Tar metadata regressions reject compressed bombs and accept bounded archives.
+
+### `3885929311`
+
+Concern: Failed initial attach snapshots leave unreachable server ownership.
+
+Outcome: Addressed by obtaining and validating the snapshot before publishing both attachment sets.
+
+Evidence: Server regression injects snapshot failure and verifies disposal and clean ownership.
+
+### `3885929314`
+
+Concern: Cancelled queued plugin requests later acquire the slot and kill the host.
+
+Outcome: Addressed with cancellable waiter removal before slot acquisition.
+
+Evidence: Plugin regression cancels a queued request while later calls continue on the same host.
+
+### `3885929318`
+
+Concern: Atomic file writes and edits lose existing POSIX permissions.
+
+Outcome: Addressed by capturing and restoring existing file modes across replacements while new files retain safe defaults.
+
+Evidence: File-tool regressions preserve `0755` and `0600` modes byte-for-byte.
+
+### `3885929322`
+
+Concern: RPC does not restore durable session names.
+
+Outcome: Addressed by deriving the latest name or tombstone on startup and switch.
+
+Evidence: Stats and export-title regressions reflect restored names.
+
+### `3885929325`
+
+Concern: JSON mode exits zero for terminal assistant errors.
+
+Outcome: Addressed by inspecting final assistant state after emitting all events and returning nonzero for error or aborted results.
+
+Evidence: JSON-mode regressions cover single and multiple prompts.
+
+### `3885929327`
+
+Concern: Session format detection truncates long headers at 4,096 bytes.
+
+Outcome: Addressed by incrementally reading the first record up to the 16 MiB JSON limit.
+
+Evidence: Format regressions detect long valid headers and reject oversized unterminated headers.
+
+### `3885929330`
+
+Concern: Negative or overflowing snippet lengths can trap search.
+
+Outcome: Addressed by validating nonnegative lengths and using overflow-safe Unicode bounds.
+
+Evidence: Search regressions cover negative, `Int.max`, and grapheme-rich snippets.
+
+### `3885929331`
+
+Concern: Project trust treats `ask` exactly like `never`.
+
+Outcome: Addressed with interactive trust selection and durable decisions while noninteractive mode safely denies with guidance.
+
+Evidence: Trust regressions preserve approval overrides and distinguish ask and never.
+
 ## Ninth-round inline feedback
 
 ### `3885868033`

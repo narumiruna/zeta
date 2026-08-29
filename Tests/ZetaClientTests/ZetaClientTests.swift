@@ -216,6 +216,54 @@ final class ZetaClientTests: XCTestCase {
         XCTAssertEqual(finalDetachCount, 1)
     }
 
+    func testCancelledSharedAcquireReleasesOnlyItsLeaseWhileAttachmentContinues() async throws {
+        let box = ControlledTransportBox()
+        let client = try PiClient { handlers in
+            let transport = ControlledTransport(handlers: handlers)
+            await box.set(transport)
+            return transport
+        }
+        try await client.connect()
+        let transport = await box.wait()
+        let cancelledOutcome = RequestOutcomeBox()
+
+        let cancelled = Task {
+            do {
+                let lease = try await client.attachSession("cancelled-shared")
+                try? await lease.dispose()
+                await cancelledOutcome.set(.success)
+            } catch is CancellationError {
+                await cancelledOutcome.set(.cancelled)
+            } catch {
+                await cancelledOutcome.set(.otherFailure)
+            }
+        }
+        let surviving = Task { try await client.attachSession("cancelled-shared") }
+        try await waitUntil { await transport.attachCount == 1 }
+
+        cancelled.cancel()
+        try await waitUntil { await cancelledOutcome.value != nil }
+        let outcome = await cancelledOutcome.value
+        XCTAssertEqual(outcome, .cancelled)
+        let pendingAttachCount = await transport.attachCount
+        XCTAssertEqual(pendingAttachCount, 1)
+
+        await transport.completeAttachments()
+        await cancelled.value
+        let survivingLease = try await surviving.value
+        try await survivingLease.dispose()
+        let firstDetachCount = await transport.detachCount
+        XCTAssertEqual(firstDetachCount, 1)
+
+        let exclusive = Task { try await client.acquireSession("cancelled-shared", mode: .exclusive) }
+        try await waitUntil { await transport.attachCount == 1 }
+        await transport.completeAttachments()
+        let exclusiveLease = try await exclusive.value
+        try await exclusiveLease.dispose()
+        let finalDetachCount = await transport.detachCount
+        XCTAssertEqual(finalDetachCount, 2)
+    }
+
     func testInFlightExclusiveAcquireRejectsConcurrentSharedAcquire() async throws {
         let box = ControlledTransportBox()
         let client = try PiClient { handlers in
@@ -567,6 +615,7 @@ private actor ControlledTransport: ByteTransport {
 
     func completeAttachments() {
         let pending = attachments
+        attachments.removeAll()
         for request in pending {
             guard case .attach(let id) = request.request else { continue }
             handlers.onData(

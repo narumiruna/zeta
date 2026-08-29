@@ -227,6 +227,53 @@ final class ZetaServerTests: XCTestCase {
         await server.close()
     }
 
+    func testAttachSnapshotFailureReleasesClaimBeforePublishingAttachment() async throws {
+        let tracker = RuntimeTracker()
+        let service = SnapshotFailingOpenService(tracker: tracker)
+        let server = try PiServer(serverID: "server", service: service)
+        let connection = TestConnection()
+        try await server.accept(connection)
+        await server.receive(try encodeClientMessage(.hello(try ClientHello())), connectionID: connection.id)
+        try await waitUntil { await connection.count == 1 }
+
+        let failedAttach = try RequestEnvelope(id: "attach-failure", request: .attach(sessionID: "snapshot"))
+        await server.receive(try encodeClientMessage(.request(failedAttach)), connectionID: connection.id)
+        try await waitUntil { await connection.count >= 2 }
+        var messages = try await decodedMessages(connection)
+        XCTAssertTrue(
+            messages.contains {
+                guard case .response(.failure(id: "attach-failure", error: _)) = $0 else { return false }
+                return true
+            })
+        let disposeCountAfterFailure = await tracker.disposeCount
+        XCTAssertEqual(disposeCountAfterFailure, 1)
+
+        let abort = try RequestEnvelope(id: "abort-after-failure", request: .abort(sessionID: "snapshot"))
+        await server.receive(try encodeClientMessage(.request(abort)), connectionID: connection.id)
+        try await waitUntil { await connection.count >= 3 }
+        messages = try await decodedMessages(connection)
+        XCTAssertTrue(
+            messages.contains {
+                guard case .response(.failure(id: "abort-after-failure", error: _)) = $0 else { return false }
+                return true
+            })
+
+        let retry = try RequestEnvelope(id: "attach-retry", request: .attach(sessionID: "snapshot"))
+        await server.receive(try encodeClientMessage(.request(retry)), connectionID: connection.id)
+        try await waitUntil { await connection.count >= 4 }
+        messages = try await decodedMessages(connection)
+        XCTAssertTrue(
+            messages.contains {
+                guard case .response(.success(id: "attach-retry", result: .attach)) = $0 else { return false }
+                return true
+            })
+        let openCount = await service.openCount
+        XCTAssertEqual(openCount, 2)
+        await server.close()
+        let finalDisposeCount = await tracker.disposeCount
+        XCTAssertEqual(finalDisposeCount, 2)
+    }
+
     func testConcurrentCreateDoesNotPublishRuntimeBeforeItsInitialSnapshot() async throws {
         let gate = SnapshotGate()
         let firstTracker = RuntimeTracker()
@@ -441,6 +488,23 @@ private actor FailingCreateService: PiServerService {
     func openSession(_ id: String) async throws -> any PiSessionRuntime {
         openCount += 1
         return TestRuntime(id: id)
+    }
+}
+
+private actor SnapshotFailingOpenService: PiServerService {
+    private(set) var openCount = 0
+    let tracker: RuntimeTracker
+
+    init(tracker: RuntimeTracker) { self.tracker = tracker }
+
+    func listSessions() async throws -> [SessionMetadata] { [] }
+    func listModels() async throws -> [ModelMetadata] { [] }
+    func createSession(_ options: CreateCommandOptions) async throws -> any PiSessionRuntime {
+        TestRuntime(id: "created")
+    }
+    func openSession(_ id: String) async throws -> any PiSessionRuntime {
+        openCount += 1
+        return TestRuntime(id: id, tracker: tracker, snapshotFailure: openCount == 1)
     }
 }
 

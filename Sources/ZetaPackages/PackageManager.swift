@@ -110,7 +110,7 @@ public enum PackageManagerError: Error, LocalizedError, Sendable {
         case .invalidSource(let value): "Invalid package source: \(value)"
         case .untrusted: "Project-local package operations require trust"
         case .processFailed(let value): value
-        case .unsafeArchive: "Package archive contains an unsafe path"
+        case .unsafeArchive: "Package archive contains unsafe paths or metadata"
         case .missingManifest: "Package does not contain a package.json manifest"
         case .unsupportedExtensionPackage:
             "TypeScript extension packages are unsupported; migrate extensions to ZetaPluginSDK"
@@ -140,29 +140,49 @@ enum PackageInternalError: Error, LocalizedError, Sendable {
 
 public actor ResourcePackageManager {
     private static let defaultMaximumCompressedArchiveBytes: Int64 = 100 * 1_024 * 1_024
+    private static let defaultMaximumExpandedArchiveBytes: Int64 = 1_024 * 1_024 * 1_024
+    private static let defaultMaximumArchiveFileBytes: Int64 = 256 * 1_024 * 1_024
+    private static let defaultMaximumArchiveMembers = 10_000
+    private static let maximumArchiveMetadataBytes = 16 * 1_024 * 1_024
 
     private let root: URL
     private let session: URLSession
     private let maximumCompressedArchiveBytes: Int64
+    private let maximumExpandedArchiveBytes: Int64
+    private let maximumArchiveFileBytes: Int64
+    private let maximumArchiveMembers: Int
     private var installed: [String: InstalledPackage] = [:]
 
     public init(root: URL, session: URLSession = .shared) throws {
         try self.init(
             root: root,
             session: session,
-            maximumCompressedArchiveBytes: Self.defaultMaximumCompressedArchiveBytes
+            maximumCompressedArchiveBytes: Self.defaultMaximumCompressedArchiveBytes,
+            maximumExpandedArchiveBytes: Self.defaultMaximumExpandedArchiveBytes,
+            maximumArchiveFileBytes: Self.defaultMaximumArchiveFileBytes,
+            maximumArchiveMembers: Self.defaultMaximumArchiveMembers
         )
     }
 
     init(
         root: URL,
         session: URLSession,
-        maximumCompressedArchiveBytes: Int64
+        maximumCompressedArchiveBytes: Int64,
+        maximumExpandedArchiveBytes: Int64 = 1_024 * 1_024 * 1_024,
+        maximumArchiveFileBytes: Int64 = 256 * 1_024 * 1_024,
+        maximumArchiveMembers: Int = 10_000
     ) throws {
+        precondition(
+            maximumCompressedArchiveBytes > 0 && maximumExpandedArchiveBytes > 0
+                && maximumArchiveFileBytes > 0 && maximumArchiveMembers > 0
+        )
         let standardizedRoot = root.standardizedFileURL
         self.root = standardizedRoot
         self.session = session
         self.maximumCompressedArchiveBytes = maximumCompressedArchiveBytes
+        self.maximumExpandedArchiveBytes = maximumExpandedArchiveBytes
+        self.maximumArchiveFileBytes = maximumArchiveFileBytes
+        self.maximumArchiveMembers = maximumArchiveMembers
         try FileManager.default.createDirectory(
             at: standardizedRoot,
             withIntermediateDirectories: true,
@@ -322,33 +342,146 @@ public actor ResourcePackageManager {
         let temporary = root.appendingPathComponent(".archive-\(UUID().uuidString).tgz")
         defer { try? FileManager.default.removeItem(at: temporary) }
         try await downloadArchive(from: tarballURL, to: temporary, packageName: name)
-        let listing = String(
-            decoding: try await Self.run("/usr/bin/tar", ["-tzf", temporary.path]),
-            as: UTF8.self
-        )
-        for raw in listing.split(separator: "\n") {
-            let path = String(raw)
-            let components = path.split(separator: "/", omittingEmptySubsequences: false)
-            guard !path.hasPrefix("/"), !components.contains(".."), !path.contains("\\") else {
-                throw PackageManagerError.unsafeArchive
-            }
-        }
-        let verbose = String(
-            decoding: try await Self.run("/usr/bin/tar", ["-tvzf", temporary.path]),
-            as: UTF8.self
-        )
-        guard
-            verbose.split(separator: "\n").allSatisfy({ line in
-                line.first == "-" || line.first == "d"
-            })
-        else {
-            throw PackageManagerError.unsafeArchive
-        }
+        try await validateArchiveMetadata(temporary)
         try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
         try await Self.run(
             "/usr/bin/tar",
-            ["-xzf", temporary.path, "--strip-components", "1", "-C", staging.path]
+            [
+                "-xzf", temporary.path, "--strip-components", "1",
+                "--no-xattrs", "--no-acls", "--no-fflags", "--no-same-owner", "--safe-writes",
+                "-C", staging.path,
+            ]
         )
+    }
+
+    private func validateArchiveMetadata(_ archive: URL) async throws {
+        // Mtree exposes escaped paths, types, and declared sizes without materializing members.
+        let metadataData = try await Self.run(
+            "/usr/bin/tar",
+            ["-cf", "-", "--format=mtree", "@\(archive.path)"],
+            maximumOutputBytes: Self.maximumArchiveMetadataBytes
+        )
+        let listingData = try await Self.run(
+            "/usr/bin/tar",
+            ["-tzf", archive.path],
+            maximumOutputBytes: Self.maximumArchiveMetadataBytes
+        )
+        let verboseData = try await Self.run(
+            "/usr/bin/tar",
+            ["-tvzf", archive.path],
+            maximumOutputBytes: Self.maximumArchiveMetadataBytes
+        )
+        guard let metadata = String(data: metadataData, encoding: .utf8),
+            let listing = String(data: listingData, encoding: .utf8),
+            let verbose = String(data: verboseData, encoding: .utf8)
+        else {
+            throw PackageManagerError.unsafeArchive
+        }
+        let metadataLines = Self.nonemptyLines(metadata)
+        let listingLines = Self.nonemptyLines(listing)
+        let verboseLines = Self.nonemptyLines(verbose)
+        guard metadataLines.first == "#mtree" else {
+            throw PackageManagerError.unsafeArchive
+        }
+        let records = Array(metadataLines.dropFirst())
+        guard records.count == listingLines.count, records.count == verboseLines.count,
+            records.count <= maximumArchiveMembers
+        else {
+            throw PackageManagerError.unsafeArchive
+        }
+
+        for rawPath in listingLines {
+            let path = rawPath.hasSuffix("/") ? String(rawPath.dropLast()) : String(rawPath)
+            guard Self.isSafeArchivePath(path) else {
+                throw PackageManagerError.unsafeArchive
+            }
+        }
+        guard verboseLines.allSatisfy({ $0.first == "-" || $0.first == "d" }) else {
+            throw PackageManagerError.unsafeArchive
+        }
+
+        var expandedBytes: Int64 = 0
+        for record in records {
+            let fields = record.split(separator: " ", omittingEmptySubsequences: true)
+            guard fields.count >= 2,
+                let path = Self.decodeMTreePath(fields[0]),
+                Self.isSafeArchivePath(path)
+            else {
+                throw PackageManagerError.unsafeArchive
+            }
+            var attributes: [Substring: Substring] = [:]
+            for field in fields.dropFirst() {
+                guard let separator = field.firstIndex(of: "="), separator != field.startIndex else {
+                    throw PackageManagerError.unsafeArchive
+                }
+                let key = field[..<separator]
+                let value = field[field.index(after: separator)...]
+                guard attributes.updateValue(value, forKey: key) == nil else {
+                    throw PackageManagerError.unsafeArchive
+                }
+            }
+            guard let type = attributes["type"] else {
+                throw PackageManagerError.unsafeArchive
+            }
+            switch type {
+            case "dir":
+                if let size = attributes["size"], size != "0" {
+                    throw PackageManagerError.unsafeArchive
+                }
+            case "file":
+                guard let rawSize = attributes["size"],
+                    rawSize.allSatisfy({ $0.isASCII && $0.isNumber }),
+                    let size = Int64(rawSize),
+                    size <= maximumArchiveFileBytes
+                else {
+                    throw PackageManagerError.unsafeArchive
+                }
+                let (nextTotal, overflow) = expandedBytes.addingReportingOverflow(size)
+                guard !overflow, nextTotal <= maximumExpandedArchiveBytes else {
+                    throw PackageManagerError.unsafeArchive
+                }
+                expandedBytes = nextTotal
+            default:
+                throw PackageManagerError.unsafeArchive
+            }
+        }
+    }
+
+    private nonisolated static func nonemptyLines(_ value: String) -> [Substring] {
+        value.split(separator: "\n", omittingEmptySubsequences: true)
+    }
+
+    private nonisolated static func decodeMTreePath(_ encoded: Substring) -> String? {
+        let source = Array(encoded.utf8)
+        var decoded: [UInt8] = []
+        var index = 0
+        while index < source.count {
+            guard source[index] == 0x5C else {
+                decoded.append(source[index])
+                index += 1
+                continue
+            }
+            guard index + 3 < source.count else { return nil }
+            let digits = source[(index + 1)...(index + 3)]
+            guard digits.allSatisfy({ (0x30...0x37).contains($0) }) else { return nil }
+            let byte =
+                (digits[digits.startIndex] - 0x30) * 64
+                + (digits[digits.index(after: digits.startIndex)] - 0x30) * 8
+                + (digits[digits.index(digits.startIndex, offsetBy: 2)] - 0x30)
+            decoded.append(byte)
+            index += 4
+        }
+        guard let rendered = String(bytes: decoded, encoding: .utf8), rendered.hasPrefix("./") else {
+            return nil
+        }
+        return String(rendered.dropFirst(2))
+    }
+
+    private nonisolated static func isSafeArchivePath(_ path: String) -> Bool {
+        let components = path.split(separator: "/", omittingEmptySubsequences: false)
+        return !path.isEmpty && !path.hasPrefix("/") && !path.contains("\\")
+            && path.unicodeScalars.allSatisfy { $0.value >= 0x20 && $0.value != 0x7F }
+            && components.allSatisfy { !$0.isEmpty && $0 != "." && $0 != ".." }
     }
 
     private func downloadArchive(
@@ -428,7 +561,11 @@ public actor ResourcePackageManager {
     }
 
     @discardableResult
-    private nonisolated static func run(_ executable: String, _ arguments: [String]) async throws -> Data {
+    private nonisolated static func run(
+        _ executable: String,
+        _ arguments: [String],
+        maximumOutputBytes: Int? = nil
+    ) async throws -> Data {
         let process = Process()
         process.executableURL =
             executable.hasPrefix("/")
@@ -450,6 +587,10 @@ public actor ResourcePackageManager {
                 try Task.checkCancellation()
                 var data = Data()
                 for try await byte in pipe.fileHandleForReading.bytes {
+                    if let maximumOutputBytes, data.count >= maximumOutputBytes {
+                        terminateProcessTree(process)
+                        throw PackageManagerError.unsafeArchive
+                    }
                     data.append(byte)
                 }
                 let status = try await waitForExit(process)
