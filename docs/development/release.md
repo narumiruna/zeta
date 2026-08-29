@@ -6,13 +6,10 @@ Publishing requires a separate reviewed change.
 
 ## Local dry run
 
-Record the local environment and verify it matches the pinned toolchain and intended architecture.
+Verify the pinned arm64 release environment before running any release checks.
 
 ```sh
-sw_vers
-uname -m
-swift --version
-uv --version
+scripts/check-release-environment.sh
 ```
 
 Run the repository gate and focused platform checks.
