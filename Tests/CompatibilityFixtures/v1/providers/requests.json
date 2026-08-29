@@ -1,0 +1,1 @@
+{"openai-chat-completions":{"model":"fixture-model","messages":[{"role":"user","content":"hello"}],"stream":true},"anthropic-messages":{"model":"fixture-model","max_tokens":16,"messages":[{"role":"user","content":"hello"}]},"google-generative-ai":{"contents":[{"role":"user","parts":[{"text":"hello"}]}]}}

@@ -1,0 +1,42 @@
+[
+  {
+    "iterations" : 1000,
+    "milliseconds" : 45.308959,
+    "name" : "ordered-json"
+  },
+  {
+    "iterations" : 1000,
+    "milliseconds" : 3.267667,
+    "name" : "cbor"
+  },
+  {
+    "iterations" : 1000,
+    "milliseconds" : 136.663,
+    "name" : "tui-render"
+  },
+  {
+    "iterations" : 10,
+    "milliseconds" : 102.705792,
+    "name" : "model-catalog"
+  },
+  {
+    "iterations" : 10000,
+    "milliseconds" : 47.81225,
+    "name" : "plugin-envelope"
+  },
+  {
+    "iterations" : 1000,
+    "milliseconds" : 2.290833,
+    "name" : "provider-events"
+  },
+  {
+    "iterations" : 10,
+    "milliseconds" : 4.887459,
+    "name" : "session-search"
+  },
+  {
+    "iterations" : 100,
+    "milliseconds" : 37.346958,
+    "name" : "sqlite-append"
+  }
+]

@@ -1,0 +1,4 @@
+{"provider":"openai","event":"start"}
+{"provider":"openai","event":"text_delta","delta":"hel"}
+{"provider":"openai","event":"text_delta","delta":"lo"}
+{"provider":"openai","event":"done","stopReason":"stop"}

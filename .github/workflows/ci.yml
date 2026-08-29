@@ -1,0 +1,94 @@
+name: macOS CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  repository-gates:
+    name: Repository gates
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Set up Swift
+        uses: swift-actions/setup-swift@7ca6abe6b3b0e8b5421b88be48feee39cbf52c6a # v2.4.0
+        with:
+          swift-version: "6.2.0"
+      - name: Set up uv
+        uses: astral-sh/setup-uv@5a095e7a2014a4212f075830d4f7277575a9d098 # v7.3.1
+        with:
+          version: "0.9.26"
+          checksum: fcf0a9ea6599c6ae28a4c854ac6da76f2c889354d7c36ce136ef071f7ab9721f
+      - name: Record tool versions
+        run: |
+          sw_vers
+          test "$(uname -m)" = "arm64"
+          swift --version | tee /tmp/swift-version.txt
+          grep -Eq 'Swift version 6\.2(\.0)?([[:space:]]|$)' /tmp/swift-version.txt
+          uv --version
+          test "$(uv --version | awk '{print $2}')" = "0.9.26"
+      - name: Run repository checks
+        env:
+          DEVELOPER_DIR: /Applications/Xcode.app/Contents/Developer
+          ZETA_SWIFT_TOOLCHAIN_CONFIGURED: "1"
+          ZETA_SKIP_SWIFT_TESTS: "1"
+        run: scripts/check-repository.sh
+
+  swift:
+    name: Swift arm64
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Set up Swift
+        uses: swift-actions/setup-swift@7ca6abe6b3b0e8b5421b88be48feee39cbf52c6a # v2.4.0
+        with:
+          swift-version: "6.2.0"
+      - name: Set up uv
+        uses: astral-sh/setup-uv@5a095e7a2014a4212f075830d4f7277575a9d098 # v7.3.1
+        with:
+          version: "0.9.26"
+          checksum: fcf0a9ea6599c6ae28a4c854ac6da76f2c889354d7c36ce136ef071f7ab9721f
+      - name: Record environment
+        run: |
+          mkdir -p artifacts
+          sw_vers | tee artifacts/environment.txt
+          uname -m | tee -a artifacts/environment.txt
+          swift --version | tee -a artifacts/environment.txt
+          uv --version | tee -a artifacts/environment.txt
+          test "$(uname -m)" = "arm64"
+          grep -Eq 'Swift version 6\.2(\.0)?([[:space:]]|$)' artifacts/environment.txt
+          test "$(uv --version | awk '{print $2}')" = "0.9.26"
+      - name: Build and test
+        run: |
+          if [[ ! -f Package.swift ]]; then
+            echo "SKIP: Package.swift is outside the baseline checkpoint." | tee artifacts/swift-skip.txt
+            exit 0
+          fi
+          swift package dump-package > artifacts/package.json
+          swift build -Xswiftc -strict-concurrency=complete -Xswiftc -warnings-as-errors
+          swift test -Xswiftc -strict-concurrency=complete -Xswiftc -warnings-as-errors | tee artifacts/tests.txt
+      - name: Sanitizers
+        run: |
+          swift test --sanitize=address | tee artifacts/address-sanitizer.txt
+          swift test --sanitize=thread | tee artifacts/thread-sanitizer.txt
+      - name: Retain reports
+        if: always()
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08
+        with:
+          name: macos-arm64-reports
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 14

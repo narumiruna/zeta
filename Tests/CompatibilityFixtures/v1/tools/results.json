@@ -1,0 +1,1 @@
+{"read":{"content":"alpha\nbeta\n","lines":2},"edit":{"replacements":1},"bash":{"output":"ok\n","exitCode":0},"grep":{"matches":[{"path":"fixture.txt","line":2,"text":"beta"}]},"find":["fixture.txt"],"ls":["fixture.txt"]}

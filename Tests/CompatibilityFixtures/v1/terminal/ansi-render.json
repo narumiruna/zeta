@@ -1,0 +1,1 @@
+{"columns":12,"input":"\u001b[31mred\u001b[0m 雪 👩🏽‍💻","plainText":"red 雪 👩🏽‍💻","expectedRows":["red 雪 👩🏽‍💻"]}
