@@ -68,6 +68,17 @@ def dependency_graph(*dependencies: dict[str, object]) -> dict[str, object]:
     return {"identity": "root", "dependencies": list(dependencies)}
 
 
+def lightweight_tag(version: str, revision: str) -> str:
+    return f"{revision}\trefs/tags/{version}\n"
+
+
+def annotated_tag(version: str, revision: str) -> str:
+    return (
+        f"tag-object\trefs/tags/v{version}\n"
+        f"{revision}\trefs/tags/v{version}^{{}}\n"
+    )
+
+
 class PackageDependencyPolicyTests(unittest.TestCase):
     def test_accepts_no_dependencies_without_resolved_file(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -310,6 +321,16 @@ class PackageDependencyPolicyTests(unittest.TestCase):
             )
 
             def resolve(command: list[str], **_: object) -> object:
+                if command[:3] == ["git", "ls-remote", "--tags"]:
+                    if command[3].endswith("direct.git"):
+                        return mock.Mock(
+                            stdout=lightweight_tag("1.0.0", "direct-hash")
+                        )
+                    if command[3].endswith("transitive.git"):
+                        return mock.Mock(
+                            stdout=annotated_tag("1.0.0", "transitive-hash")
+                        )
+                    self.fail(f"unexpected tag query: {command}")
                 resolution_root = Path(command[command.index("--package-path") + 1])
                 self.assertEqual(
                     parsed_pins(resolution_root / "Package.resolved"),
@@ -323,6 +344,33 @@ class PackageDependencyPolicyTests(unittest.TestCase):
                 pins = CHECK.independently_resolve(root, resolved)
 
         self.assertEqual(pins, expected_pins)
+
+    def test_rejects_altered_revision_for_reachable_version_pin(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "Package.swift").write_text(
+                "// synthetic manifest\n",
+                encoding="utf-8",
+            )
+            resolved = root / "Package.resolved"
+            write_resolved(
+                resolved,
+                [pin("direct", {"version": "1.0.0", "revision": "altered-hash"})],
+            )
+            graph = dependency_graph(graph_package("direct"))
+
+            def resolve(command: list[str], **_: object) -> object:
+                if command[:3] == ["git", "ls-remote", "--tags"]:
+                    return mock.Mock(stdout=lightweight_tag("1.0.0", "real-hash"))
+                output = json.dumps(graph) if "show-dependencies" in command else None
+                return mock.Mock(stdout=output)
+
+            with mock.patch.object(CHECK.subprocess, "run", side_effect=resolve):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "resolves to 'real-hash', not committed revision 'altered-hash'",
+                ):
+                    CHECK.independently_resolve(root, resolved)
 
     def test_rejects_stale_pin_outside_forced_dependency_graph(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -348,6 +396,14 @@ class PackageDependencyPolicyTests(unittest.TestCase):
             )
 
             def resolve(command: list[str], **_: object) -> object:
+                if command[:3] == ["git", "ls-remote", "--tags"]:
+                    self.assertNotIn("stale.git", command[3])
+                    revision = (
+                        "direct-hash"
+                        if command[3].endswith("direct.git")
+                        else "transitive-hash"
+                    )
+                    return mock.Mock(stdout=lightweight_tag("1.0.0", revision))
                 output = json.dumps(graph) if "show-dependencies" in command else None
                 return mock.Mock(stdout=output)
 

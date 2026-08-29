@@ -172,6 +172,57 @@ def dependency_graph_identities(graph: Any) -> set[str]:
     return identities
 
 
+def verify_version_revision(identity: str, pin: ResolvedPin) -> None:
+    if pin.kind != "remoteSourceControl":
+        return
+    version = pin.state.get("version")
+    if version is None:
+        return
+    revision = pin.state.get("revision")
+    if not isinstance(version, str) or not version:
+        raise ValueError(f"resolved version for {identity!r} is invalid")
+    if not isinstance(revision, str) or not revision:
+        raise ValueError(
+            f"resolved revision for versioned package {identity!r} is invalid"
+        )
+
+    tag_names = (version, f"v{version}")
+    tag_refs = tuple(f"refs/tags/{tag}" for tag in tag_names)
+    expected_refs = set(tag_refs) | {f"{tag_ref}^{{}}" for tag_ref in tag_refs}
+    result = subprocess.run(
+        ["git", "ls-remote", "--tags", pin.location, *sorted(expected_refs)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    remote_refs: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        fields = line.split("\t")
+        if len(fields) != 2 or fields[1] not in expected_refs or not fields[0]:
+            raise ValueError(f"release tag response for {identity!r} is invalid")
+        remote_refs[fields[1]] = fields[0]
+
+    tag_revisions = {
+        remote_refs.get(f"{tag_ref}^{{}}", remote_refs[tag_ref])
+        for tag_ref in tag_refs
+        if tag_ref in remote_refs
+    }
+    if not tag_revisions:
+        raise ValueError(
+            f"release tag for {identity!r} version {version!r} was not found"
+        )
+    if len(tag_revisions) != 1:
+        raise ValueError(
+            f"release tags for {identity!r} version {version!r} are ambiguous"
+        )
+    tag_revision = tag_revisions.pop()
+    if revision.lower() != tag_revision.lower():
+        raise ValueError(
+            f"release tag for {identity!r} version {version!r} resolves to "
+            f"{tag_revision!r}, not committed revision {revision!r}"
+        )
+
+
 def independently_resolve(
     package_path: Path, resolved_path: Path
 ) -> dict[str, ResolvedPin]:
@@ -222,7 +273,10 @@ def independently_resolve(
             raise ValueError(
                 f"resolved dependency graph contains unpinned packages: {unpinned}"
             )
-        return {identity: pins[identity] for identity in identities}
+        reachable_pins = {identity: pins[identity] for identity in identities}
+        for identity, pin in sorted(reachable_pins.items()):
+            verify_version_revision(identity, pin)
+        return reachable_pins
 
 
 def compare_resolution_graphs(
